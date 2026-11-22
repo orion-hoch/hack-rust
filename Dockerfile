@@ -15,7 +15,7 @@ COPY src ./src
 # instruction lowers the core's clock for about 2 ms, so stray ones outside the parser cost a
 # whole stage its speed. rustc prints a warning for this LLVM-level feature name; that is expected.
 ARG X86_TARGET_CPU=x86-64-v3
-RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=${X86_TARGET_CPU} -C target-feature=+prefer-256-bit"; fi; \
+RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=${X86_TARGET_CPU} -C target-feature=+prefer-256-bit -C llvm-args=--x86-align-branch-boundary=32 -C llvm-args=--x86-align-branch=fused+jcc+jmp+call+ret+indirect -C llvm-args=--x86-pad-max-prefix-size=5"; fi; \
     cargo build --release --locked && \
     cp target/release/engine /engine
 
