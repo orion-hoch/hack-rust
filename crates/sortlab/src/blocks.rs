@@ -46,6 +46,9 @@ fn parts(b: &[u64]) -> Result<(&[u32], &[u64]), Error> {
 /// How a person is cut: the network up to `MAX` events (0 = never), slots above.
 trait Cut {
     const MAX: usize;
+    /// The block loops below may use 256-bit AVX2 loads and stores (the caller has AVX-512F,
+    /// which implies AVX2).
+    const VEC: bool;
     /// # Safety
     /// 1 <= ts.len() <= MAX, ts < 2^31, room in `out.start` / `out.events` for ts.len() + 64 more.
     unsafe fn net(ts: &[u32], out: &mut Out);
@@ -54,6 +57,7 @@ trait Cut {
 struct SlotsOnly;
 impl Cut for SlotsOnly {
     const MAX: usize = 0;
+    const VEC: bool = false;
     #[inline(always)]
     unsafe fn net(_: &[u32], _: &mut Out) {}
 }
@@ -63,11 +67,120 @@ struct NetCut<L>(core::marker::PhantomData<L>);
 #[cfg(target_arch = "x86_64")]
 impl<L: net::Lanes> Cut for NetCut<L> {
     const MAX: usize = net::MAX_N;
+    const VEC: bool = true;
     #[inline(always)]
     unsafe fn net(ts: &[u32], out: &mut Out) {
         // SAFETY: the caller's contract, and L's features (the target-feature entry points)
         unsafe { net::person_net_inl::<L>(ts, out, core::ptr::null_mut()) }
     }
+}
+
+/// Appends `e >> 1` of every event of one block to `ts`; true when some event has the purch bit.
+///
+/// # Safety
+/// With `C::VEC`, AVX2 present.
+#[inline(always)]
+unsafe fn shift_into<C: Cut>(ev: &[u32], ts: &mut Vec<u32>) -> bool {
+    let n = ev.len();
+    ts.reserve(n);
+    let len = ts.len();
+    let src = ev.as_ptr();
+    // SAFETY: room for n more was reserved; every write below is to dst[i], i < n, and every
+    // read is ev[i], i < n (the overlapping last vector covers [n - 8, n) with n >= 8).
+    unsafe {
+        let dst = ts.as_mut_ptr().add(len);
+        let any;
+        #[cfg(target_arch = "x86_64")]
+        if C::VEC && n >= 8 {
+            use core::arch::x86_64::*;
+            let mut acc = _mm256_setzero_si256();
+            let mut i = 0usize;
+            while i + 8 <= n {
+                let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
+                acc = _mm256_or_si256(acc, v);
+                _mm256_storeu_si256(dst.add(i) as *mut __m256i, _mm256_srli_epi32::<1>(v));
+                i += 8;
+            }
+            if i < n {
+                // the last 8 once more: the same values are written again
+                let v = _mm256_loadu_si256(src.add(n - 8) as *const __m256i);
+                acc = _mm256_or_si256(acc, v);
+                _mm256_storeu_si256(dst.add(n - 8) as *mut __m256i, _mm256_srli_epi32::<1>(v));
+            }
+            any = _mm256_testz_si256(acc, _mm256_set1_epi32(1)) == 0;
+            ts.set_len(len + n);
+            return any;
+        }
+        let mut bits = 0u32;
+        for i in 0..n {
+            let e = *src.add(i);
+            bits |= e;
+            *dst.add(i) = e >> 1;
+        }
+        any = bits & 1 != 0;
+        ts.set_len(len + n);
+        any
+    }
+}
+
+/// The purchases of one block, in event order: each one's session (the last session of `starts`
+/// starting at or before it, as an index from `s0`) and payload. False when the block's purch
+/// bits and payload words do not pair up one to one (nothing is appended then).
+///
+/// # Safety
+/// With `C::VEC`, AVX2 present.
+#[inline(always)]
+unsafe fn buys<C: Cut>(ev: &[u32], pay: &[u64], s0: usize, starts: &[u32], bs: &mut Vec<u32>, bp: &mut Vec<u32>) -> bool {
+    let (n, m) = (ev.len(), pay.len());
+    bs.reserve(m);
+    bp.reserve(m);
+    let src = ev.as_ptr();
+    let mut k = 0usize;
+    // SAFETY: reads are ev[j], j < n, and pay[k], k < m (checked before each use); writes go to
+    // the m reserved entries past each vector's length, index k < m.
+    unsafe {
+        let (dbs, dbp) = (bs.as_mut_ptr().add(bs.len()), bp.as_mut_ptr().add(bp.len()));
+        let mut one = |j: usize, k: &mut usize| -> bool {
+            if *k == m {
+                return false;
+            }
+            let t = *src.add(j) >> 1;
+            *dbs.add(*k) = (s0 + starts.partition_point(|&s| s <= t) - 1) as u32;
+            *dbp.add(*k) = *pay.get_unchecked(*k) as u32;
+            *k += 1;
+            true
+        };
+        let mut i = 0usize;
+        #[cfg(target_arch = "x86_64")]
+        if C::VEC {
+            use core::arch::x86_64::*;
+            while i + 8 <= n {
+                let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
+                // bit 0 of each event into its lane's sign bit, then one bit per lane
+                let mut mk = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_slli_epi32::<31>(v))) as u32;
+                while mk != 0 {
+                    let j = i + mk.trailing_zeros() as usize;
+                    mk &= mk - 1;
+                    if !one(j, &mut k) {
+                        return false;
+                    }
+                }
+                i += 8;
+            }
+        }
+        while i < n {
+            if *src.add(i) & 1 != 0 && !one(i, &mut k) {
+                return false;
+            }
+            i += 1;
+        }
+        if k != m {
+            return false;
+        }
+        bs.set_len(bs.len() + m);
+        bp.set_len(bp.len() + m);
+    }
+    true
 }
 
 /// Sessions of one partition from person blocks: `out.persons` = 0..np, and per purchase (person,
@@ -129,29 +242,33 @@ unsafe fn blocks_partition<C: Cut>(pb: &PersonBlocks, sc: &mut Scratch, out: &mu
         return Err(Error::BlockShape);
     }
     // room for every session at once (sessions <= events) plus the network's store slack
+    // (an upper bound from the block lengths alone: at most two events per word after the two
+    // header words; the headers themselves are read, and checked, once per person below)
     let mut total = 0usize;
     for b in pb.ev {
-        total += (*b.first().ok_or(Error::BlockShape)? & 0xFF_FFFF) as usize;
+        total += 2 * b.len();
     }
     out.persons.extend(0..np as u32);
     out.sess_end.reserve(np);
     out.start.reserve(total + 64);
     out.events.reserve(total + 64);
     let mut ts = core::mem::take(&mut sc.grouped);
+    // the person's blocks that hold payloads, parsed once (most persons have none)
+    let mut paid: Vec<(&[u32], &[u64])> = Vec::new();
     let mut res = Ok(());
     'person: for k in 0..np {
         let blocks = &pb.ev[pb.ev_at[k] as usize..pb.ev_at[k + 1] as usize];
         ts.clear();
+        paid.clear();
         for b in blocks {
             match parts(b) {
                 Ok((ev, pay)) => {
-                    let mut bits = 0u32;
-                    ts.extend(ev.iter().map(|&e| {
-                        bits |= e;
-                        e >> 1
-                    }));
-                    // a purch bit in a block without payloads
-                    if pay.is_empty() && bits & 1 != 0 {
+                    // SAFETY: C's features (AVX-512F implies AVX2 where C::VEC).
+                    let purch = unsafe { shift_into::<C>(ev, &mut ts) };
+                    if !pay.is_empty() {
+                        paid.push((ev, pay));
+                    } else if purch {
+                        // a purch bit in a block without payloads
                         res = Err(Error::BlockShape);
                         break 'person;
                     }
@@ -173,28 +290,10 @@ unsafe fn blocks_partition<C: Cut>(pb: &PersonBlocks, sc: &mut Scratch, out: &mu
             }
         }
         // purchases: each is one of the person's events, so it lies in the last session starting
-        // at or before it
-        let starts = &out.start[s0..];
-        for b in blocks {
-            let (ev, pay) = parts(b).unwrap_or((&[], &[]));
-            if pay.is_empty() {
-                // no purchase in this block (a purch bit without payloads was refused above)
-                continue;
-            }
-            let mut k = 0usize;
-            for &e in ev {
-                if e & 1 != 0 {
-                    let Some(&p) = pay.get(k) else {
-                        res = Err(Error::BlockShape);
-                        break 'person;
-                    };
-                    let t = e >> 1;
-                    out.buy_session.push((s0 + starts.partition_point(|&s| s <= t) - 1) as u32);
-                    out.buy_pay.push(p as u32);
-                    k += 1;
-                }
-            }
-            if k != pay.len() {
+        // at or before it (blocks in the person's order, events in block order, as before)
+        for &(ev, pay) in &paid {
+            // SAFETY: C's features (AVX-512F implies AVX2 where C::VEC).
+            if !unsafe { buys::<C>(ev, pay, s0, &out.start[s0..], &mut out.buy_session, &mut out.buy_pay) } {
                 res = Err(Error::BlockShape);
                 break 'person;
             }

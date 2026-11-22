@@ -535,6 +535,67 @@ unsafe fn wrec(st: &mut State, h: &mut Hot, t: &WideTab, a: u64, b: u64, kind: u
     true
 }
 
+/// The wide stream of one piece from word *i on, whole records only (`*i` ends at the first one cut by
+/// the piece end): `wrec` with the Hot pointers and the table held in locals for the whole piece.
+/// false: stopped at a user not in the table yet (the record at *i, whole).
+///
+/// # Safety
+/// As `wrec`; *i <= c.len().
+#[inline(always)]
+unsafe fn wfast(c: &[u64], i: &mut usize, h: &mut Hot, t: &WideTab) -> bool {
+    let n = c.len();
+    let cp = c.as_ptr();
+    let (wt, bits, mask, base) = (t.wt, t.bits, t.mask, t.base);
+    let (cnt, nbuy) = (h.cnt, h.nbuy);
+    let (mut idxp, mut evp, mut bvp, mut bip) = (h.idx, h.ev, h.bval, h.bidx);
+    let mut j = *i;
+    let mut miss = false;
+    // SAFETY: the caller's contract; j + 4 <= n for every word read below.
+    unsafe {
+        while j + 3 <= n {
+            let w = *cp.add(j + 2);
+            let p = (w & 1) as usize;
+            if j + 3 + p > n {
+                break;
+            }
+            let (a, b) = (*cp.add(j), *cp.add(j + 1));
+            let kind = w >> 62;
+            let mut x = wide_hash(a, b, kind, bits);
+            // a miss leaves the loop (no call inside it: nothing spills); the caller inserts
+            let s = loop {
+                let en = &*wt.add(x);
+                if en[0] == a && en[1] == b && en[2] == kind {
+                    break base + (en[3] - 1) as u32;
+                }
+                if en[3] == 0 {
+                    miss = true;
+                    break 0;
+                }
+                x = (x + 1) & mask;
+            };
+            if miss {
+                break;
+            }
+            *cnt.add(s as usize) += 1;
+            *idxp = s;
+            *evp = w as u32;
+            idxp = idxp.add(1);
+            evp = evp.add(1);
+            if p != 0 {
+                *nbuy.add(s as usize) += 1;
+                *bvp = *cp.add(j + 3);
+                *bip = s;
+                bvp = bvp.add(1);
+                bip = bip.add(1);
+            }
+            j += 3 + p;
+        }
+    }
+    (h.idx, h.ev, h.bval, h.bidx) = (idxp, evp, bvp, bip);
+    *i = j;
+    !miss
+}
+
 /// P1 for one user partition: blocks into `out`.
 pub fn part<O: Out>(inp: &In, st: &mut State, out: &mut O) -> Result<(), Error> {
     if inp.rbits >= 32 || inp.rbits < 8 {
@@ -673,12 +734,11 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
                     }
                 }
             }
-            while i + 3 <= n {
+            // SAFETY: as above; i <= n.
+            while !unsafe { wfast(c, &mut i, &mut h, &wt) } {
+                // a new wide user: this record through the inserting path
                 let w = c[i + 2];
-                let len = if w & 1 != 0 { 4 } else { 3 };
-                if i + len > n {
-                    break;
-                }
+                let len = 3 + (w & 1) as usize;
                 let pay = if len == 4 { c[i + 3] } else { 0 };
                 // SAFETY: as above.
                 if !unsafe { wrec(st, &mut h, &wt, c[i], c[i + 1], w >> 62, w as u32, pay) } {
@@ -744,8 +804,19 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         }
         for c in inp.wclicks {
             for r in c.iter() {
-                let s = st.wide_slot(r[0], r[1], r[2] >> 62, false);
-                let s = if s == EMPTY { dummy } else { s as usize };
+                let (a, b, kind) = (r[0], r[1], r[2] >> 62);
+                let mut x = wide_hash(a, b, kind, wt.bits);
+                // SAFETY: x is masked below the table's length.
+                let s = loop {
+                    let en = unsafe { &*wt.wt.add(x) };
+                    if en[0] == a && en[1] == b && en[2] == kind {
+                        break wt.base as usize + (en[3] - 1) as usize;
+                    }
+                    if en[3] == 0 {
+                        break dummy;
+                    }
+                    x = (x + 1) & wt.mask;
+                };
                 // SAFETY: as above.
                 unsafe {
                     *nck.add(s) += 1;
