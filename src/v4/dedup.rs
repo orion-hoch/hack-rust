@@ -118,7 +118,7 @@ static DEAD: [Unit; 3] = [[0; 2]; 3];
 /// One worker's reusable state.
 #[derive(Default)]
 pub struct Tables {
-    fm: Vec<[u64; 2]>,
+    fm: Vec<Pair>,
     /// Addresses of the colliding records, per lane (written for every record, kept when the
     /// bit collided).
     cp: Vec<usize>,
@@ -211,17 +211,24 @@ fn put(o: &mut Out, q: usize, words: &[u64]) {
     }
 }
 
+/// The pre-filter: pairs of 32-bit words [seen, again], 2^(64 - wsh) of them. A key hash's
+/// product with FH names its pair by its top 64 - wsh bits and its bit by its low five (the low
+/// bits of an odd multiple are a permutation of the key's low bits; the top bits mix all of
+/// them): one shift for the pair, and the bit number is the product as it is (a shift count
+/// is taken modulo 32).
+type Pair = [u32; 2];
+
 /// Sets the [seen, again] pair of key hash `hk`.
 ///
 /// # Safety
-/// `fp` holds at least `2^(64 - fsh) / 64` word pairs.
+/// `fp` holds at least `2^(64 - wsh)` pairs.
 #[inline(always)]
-unsafe fn mark(fp: *mut [u64; 2], fsh: u32, hk: u64) {
-    let k = (hk.wrapping_mul(FH) >> fsh) as usize;
-    // SAFETY: k < 2^(64 - fsh), so k >> 6 is inside (caller).
+unsafe fn mark(fp: *mut Pair, wsh: u32, hk: u64) {
+    let k = hk.wrapping_mul(FH);
+    // SAFETY: k >> wsh < 2^(64 - wsh) is inside (caller).
     unsafe {
-        let wd = fp.add(k >> 6);
-        let bit = 1u64 << (k & 63);
+        let wd = fp.add((k >> wsh) as usize);
+        let bit = 1u32 << (k as u32 & 31);
         (*wd)[1] |= (*wd)[0] & bit;
         (*wd)[0] |= bit;
     }
@@ -232,10 +239,10 @@ unsafe fn mark(fp: *mut [u64; 2], fsh: u32, hk: u64) {
 /// # Safety
 /// As `mark`.
 #[inline(always)]
-unsafe fn again(fp: *const [u64; 2], fsh: u32, hk: u64) -> u64 {
-    let k = (hk.wrapping_mul(FH) >> fsh) as usize;
+unsafe fn again(fp: *const Pair, wsh: u32, hk: u64) -> u64 {
+    let k = hk.wrapping_mul(FH);
     // SAFETY: as in mark.
-    unsafe { ((*fp.add(k >> 6))[1] >> (k & 63)) & 1 }
+    unsafe { u64::from(((*fp.add((k >> wsh) as usize))[1] >> (k as u32 & 31)) & 1) }
 }
 
 /// Pass 1 over plain units: one load, a multiply, a bit pair.
@@ -243,10 +250,10 @@ unsafe fn again(fp: *const [u64; 2], fsh: u32, hk: u64) -> u64 {
 /// # Safety
 /// As `mark`.
 #[inline(never)]
-unsafe fn mark_plain(c: &[Unit], fp: *mut [u64; 2], fsh: u32) {
+unsafe fn mark_plain(c: &[Unit], fp: *mut Pair, wsh: u32) {
     for u in c {
         // SAFETY: the caller's bound.
-        unsafe { mark(fp, fsh, u[0] & M32) };
+        unsafe { mark(fp, wsh, u[0] & M32) };
     }
 }
 
@@ -255,7 +262,7 @@ unsafe fn mark_plain(c: &[Unit], fp: *mut [u64; 2], fsh: u32) {
 /// # Safety
 /// As `mark`.
 #[inline(never)]
-unsafe fn mark_rare(c: &[Unit], fp: *mut [u64; 2], fsh: u32) {
+unsafe fn mark_rare(c: &[Unit], fp: *mut Pair, wsh: u32) {
     let mut u = c.as_ptr();
     // SAFETY: one past the end of `c`; records never cross a chunk, so the walk ends there.
     let end = unsafe { u.add(c.len()) };
@@ -267,17 +274,16 @@ unsafe fn mark_rare(c: &[Unit], fp: *mut [u64; 2], fsh: u32) {
         unsafe {
             while u < end && n < 16 {
                 let (a, b, k) = rkey(u);
-                let h = key_hash(a, b, k).wrapping_mul(FH) >> fsh;
+                let h = key_hash(a, b, k).wrapping_mul(FH);
                 ks[n] = h;
                 #[cfg(target_arch = "x86_64")]
-                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(fp.add((h >> 6) as usize) as *const i8);
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(fp.add((h >> wsh) as usize) as *const i8);
                 n += 1;
                 u = rnext(u);
             }
             for &k in &ks[..n] {
-                let k = k as usize;
-                let wd = fp.add(k >> 6);
-                let bit = 1u64 << (k & 63);
+                let wd = fp.add((k >> wsh) as usize);
+                let bit = 1u32 << (k as u32 & 31);
                 (*wd)[1] |= (*wd)[0] & bit;
                 (*wd)[0] |= bit;
             }
@@ -323,15 +329,43 @@ unsafe fn stage_plain(stage: *mut u64, fill: *mut u32, short: &mut Out, rsh: u32
 
 /// Pass 2 over plain units, without a data-dependent branch but a full staging line: every
 /// unit's address is stored at `cw` and kept (cw + 1) when its bit collided; every unit's output
-/// word is staged and kept when it is the only copy and alive. The inner loop makes no call (a
-/// full line leaves it, is flushed, and the walk resumes), so its state stays in registers.
-/// Returns the next `cw`.
+/// word is staged and kept when it is the only copy and alive. Returns the next `cw`.
 ///
 /// # Safety
 /// As `mark`; `cw` has room for `c.len()` addresses.
 #[inline(never)]
-unsafe fn emit_plain(c: &[Unit], fp: *const [u64; 2], fsh: u32, out: &mut Out2, mut cw: *mut usize) -> *mut usize {
+unsafe fn emit_plain(c: &[Unit], fp: *const Pair, wsh: u32, out: &mut Out2, cw: *mut usize) -> *mut usize {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+    // SAFETY: the caller's contract; the target has the instructions the loops use.
+    unsafe {
+        match out.b2 {
+            8 => return plain_b8(c, fp, wsh, out, cw),
+            9 => return plain_b9(c, fp, wsh, out, cw),
+            10 => return plain_b10(c, fp, wsh, out, cw),
+            11 => return plain_b11(c, fp, wsh, out, cw),
+            12 => return plain_b12(c, fp, wsh, out, cw),
+            13 => return plain_b13(c, fp, wsh, out, cw),
+            _ => {}
+        }
+    }
+    // SAFETY: the caller's contract.
+    unsafe { emit_plain_any(c, fp, wsh, out, cw) }
+}
+
+/// `emit_plain` for any b2 from 8 to 13, in Rust (the reference for the assembly loops below).
+///
+/// # Safety
+/// As `emit_plain`.
+#[inline(never)]
+unsafe fn emit_plain_any(c: &[Unit], fp: *const Pair, wsh: u32, out: &mut Out2, mut cw: *mut usize) -> *mut usize {
     let rsh = 40 - out.b2;
+    assert!((27..=32).contains(&rsh));
+    // q is the top b2 bits of mu, whose top 7 bits are w bits 55-61 and whose low 33 are w1 bits
+    // 31-63: the 7 bits moved up by 33 - rsh, over the bits of w1 above 31 + rsh.
+    let (sa, sb) = (33 - rsh, 31 + rsh);
+    // The output word ru << 32 | ts << 1 is w1 << 1 under a mask: ts (bits 0-30) lands on bits
+    // 1-31 and mu's low bits on bit 32 up, of which ru is the low rsh (rsh <= 32).
+    let wm = (low_bits(u64::MAX, rsh) << 32) | 0xffff_fffe;
     let (stage, fill, _) = out.short.raw_parts();
     let mut u = c.as_ptr();
     // SAFETY: one past the end of `c`.
@@ -343,22 +377,21 @@ unsafe fn emit_plain(c: &[Unit], fp: *const [u64; 2], fsh: u32, out: &mut Out2, 
             // 2^40) and the fill count below 8 (see `Out::raw_parts`).
             unsafe {
                 let (w, w1) = ((*u)[0], (*u)[1]);
-                let ag = again(fp, fsh, w & M32);
+                let ag = again(fp, wsh, w & M32);
                 *(cw as *mut *const Unit) = u;
                 cw = cw.add(ag as usize);
                 // The only copy, alive (surv is bit 62; bit 63 is clear in this lane).
-                let keep = (ag ^ 1) & (w >> 62);
-                let mu = (((w >> 55) & 0x7f) << 33) | (w1 >> 31);
-                let q = mu >> rsh;
-                let word = ((mu ^ (q << rsh)) << 32) | ((w1 & TS) << 1);
-                let f = fill.add(q as usize);
+                let keep = (w >> 62) & !ag;
+                let q = ((((w >> 55) & 0x7f) << sa) | (w1 >> sb)) as usize;
+                let word = (w1 << 1) & wm;
+                let f = fill.add(q);
                 let n = *f as usize;
-                *stage.add(q as usize * 8 + n) = word;
+                *stage.add(q * 8 + n) = word;
                 let n = n + keep as usize;
                 u = u.add(1);
                 if n == 8 {
                     *f = 0;
-                    full = q as usize;
+                    full = q;
                     break;
                 }
                 *f = n as u32;
@@ -372,6 +405,134 @@ unsafe fn emit_plain(c: &[Unit], fp: *const [u64; 2], fsh: u32, out: &mut Out2, 
     }
 }
 
+/// `emit_plain_any` for one b2, in assembly (the compiler's version of this loop spends 39
+/// instructions a unit and keeps three of its values on the stack; this one spends 26 with
+/// everything in registers, and a full line is written out inside the loop). `$sa` = b2 - 7:
+/// - the pair and the bit of the unit's key from one multiply (as `again`);
+/// - q, the top b2 bits of mu, is one double shift: mu's top 7 bits (w bits 55-61, by pext)
+///   shifted left by b2 - 7 with the top b2 - 7 bits of w1 coming in below them;
+/// - the output word is w1 << (b2 - 7) >> (b2 - 8): w1 << 1 with the bits above ru cleared;
+/// - the word goes to slot 8 q + n of the staging lines and the count is kept when the unit is
+///   the only copy and alive (`andn` of the again bit and bit 62);
+/// - the eighth word of a line: the count goes back to 0 and the line is copied to its chunk
+///   with two 32-byte non-temporal stores, as `Out::flush_line` does; when the chunk is at its
+///   end the loop leaves with q and `flush_line` opens the next one.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+macro_rules! plain_loop {
+    ($name:ident, $sa:expr) => {
+        /// # Safety
+        /// As `emit_plain`, for this b2.
+        #[inline(never)]
+        unsafe fn $name(c: &[Unit], fp: *const Pair, wsh: u32, out: &mut Out2, mut cw: *mut usize) -> *mut usize {
+            debug_assert!(out.b2 == $sa + 7);
+            let (stage, fill, _) = out.short.raw_parts();
+            let (cur, end_of) = out.short.raw_fronts();
+            // What the loop reads from memory: the multiplier, pext's mask, the chunk fronts.
+            let cx: [u64; 4] = [FH, 0x7f << 55, cur as u64, end_of as u64];
+            let mut u = c.as_ptr();
+            // SAFETY: one past the end of `c`.
+            let end = unsafe { u.add(c.len()) };
+            loop {
+                let q: usize;
+                // SAFETY: as `emit_plain_any`: u stays below end, the pair index below
+                // 2^(64 - wsh), q below 2^b2, the count below 8; a line is copied only to a
+                // chunk line below its chunk's end (lines and chunks are 64-byte aligned).
+                unsafe {
+                    core::arch::asm!(
+                        "cmp {u}, {end}",
+                        "je 6f",
+                        ".p2align 4",
+                        "2:",
+                        "mov {a}, qword ptr [{u}]",
+                        "mov {c}, qword ptr [{u} + 8]",
+                        "mov {b:e}, {a:e}",
+                        "imul {b}, qword ptr [{cx}]",
+                        "shrx {d}, {b}, {wsh}",
+                        "shrx {b:e}, dword ptr [{fp} + {d}*8 + 4], {b:e}",
+                        "and {b:e}, 1",
+                        "mov qword ptr [{cw}], {u}",
+                        "lea {cw}, [{cw} + {b}*8]",
+                        "mov {d}, {a}",
+                        "shr {d}, 62",
+                        "andn {b:e}, {b:e}, {d:e}",
+                        "pext {a}, {a}, qword ptr [{cx} + 8]",
+                        "shld {a}, {c}, {sa}",
+                        "shl {c}, {sa}",
+                        "shr {c}, {sr}",
+                        "add {u}, 16",
+                        "mov {d:e}, dword ptr [{fill} + {a}*4]",
+                        "add {b:e}, {d:e}",
+                        "lea {d}, [{d} + {a}*8]",
+                        "mov qword ptr [{stage} + {d}*8], {c}",
+                        "cmp {b:e}, 8",
+                        "je 3f",
+                        "mov dword ptr [{fill} + {a}*4], {b:e}",
+                        "cmp {u}, {end}",
+                        "jne 2b",
+                        "jmp 6f",
+                        // Line q is full.
+                        "3:",
+                        "mov dword ptr [{fill} + {a}*4], 0",
+                        "mov {d}, qword ptr [{cx} + 16]",
+                        "mov {b}, qword ptr [{d} + {a}*8]",
+                        "mov {c}, qword ptr [{cx} + 24]",
+                        "cmp {b}, qword ptr [{c} + {a}*8]",
+                        "je 5f",
+                        "lea {c}, [{b} + 64]",
+                        "mov qword ptr [{d} + {a}*8], {c}",
+                        "shl {a}, 6",
+                        "vmovdqa ymm0, ymmword ptr [{stage} + {a}]",
+                        "vmovdqa ymm1, ymmword ptr [{stage} + {a} + 32]",
+                        "vmovntdq ymmword ptr [{b}], ymm0",
+                        "vmovntdq ymmword ptr [{b} + 32], ymm1",
+                        "cmp {u}, {end}",
+                        "jne 2b",
+                        "6:",
+                        "mov {a}, -1",
+                        "5:",
+                        "vzeroupper",
+                        u = inout(reg) u,
+                        end = in(reg) end,
+                        fp = in(reg) fp,
+                        wsh = in(reg) u64::from(wsh),
+                        cw = inout(reg) cw,
+                        cx = in(reg) cx.as_ptr(),
+                        fill = in(reg) fill,
+                        stage = in(reg) stage,
+                        a = out(reg) q,
+                        b = out(reg) _,
+                        c = out(reg) _,
+                        d = out(reg) _,
+                        sa = const $sa,
+                        sr = const $sa - 1,
+                        out("ymm0") _,
+                        out("ymm1") _,
+                        options(nostack),
+                    );
+                }
+                if q == usize::MAX {
+                    return cw;
+                }
+                // SAFETY: line q holds eight words and its count is back to 0.
+                unsafe { out.short.flush_line(q) };
+            }
+        }
+    };
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+plain_loop!(plain_b8, 1);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+plain_loop!(plain_b9, 2);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+plain_loop!(plain_b10, 3);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+plain_loop!(plain_b11, 4);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+plain_loop!(plain_b12, 5);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+plain_loop!(plain_b13, 6);
+
 /// Pass 2 over rare records, without a data-dependent branch but the record size: each record's
 /// address goes to `cw` (kept when its bit collided), to `sw` (kept when it is the only copy,
 /// alive, with a SHORT user) and to `ww` (the same with a wide user). Returns the three next
@@ -380,7 +541,7 @@ unsafe fn emit_plain(c: &[Unit], fp: *const [u64; 2], fsh: u32, out: &mut Out2, 
 /// # Safety
 /// As `mark`; each pointer has room for `c.len() / 2` addresses.
 #[inline(never)]
-unsafe fn sort_rare(c: &[Unit], fp: *const [u64; 2], fsh: u32, mut cw: *mut usize, mut sw: *mut usize, mut ww: *mut usize) -> (*mut usize, *mut usize, *mut usize) {
+unsafe fn sort_rare(c: &[Unit], fp: *const Pair, wsh: u32, mut cw: *mut usize, mut sw: *mut usize, mut ww: *mut usize) -> (*mut usize, *mut usize, *mut usize) {
     let mut u = c.as_ptr();
     // SAFETY: as in mark_rare.
     let end = unsafe { u.add(c.len()) };
@@ -389,7 +550,7 @@ unsafe fn sort_rare(c: &[Unit], fp: *const [u64; 2], fsh: u32, mut cw: *mut usiz
         unsafe {
             let h = (*u)[0];
             let (a, b, k) = rkey(u);
-            let ag = again(fp, fsh, key_hash(a, b, k));
+            let ag = again(fp, wsh, key_hash(a, b, k));
             let at = u as usize;
             let keep = (ag ^ 1) & (h >> 27) & 1;
             let wide = u64::from((h >> 25) & 3 != 0);
@@ -420,16 +581,16 @@ pub fn partition(plain: &[&[Unit]], rare: &[&[Unit]], t: &mut Tables, out: &mut 
     let np: usize = plain.iter().map(|c| c.len()).sum();
     let nr: usize = rare.iter().map(|c| c.len()).sum();
     let fbits = ((np + nr) * 16).next_power_of_two().clamp(1 << 12, 1 << 20).trailing_zeros();
-    let fsh = 64 - fbits;
+    let wsh = 64 - (fbits - 5);
     t.fm.clear();
-    t.fm.resize(1 << (fbits - 6), [0; 2]);
+    t.fm.resize(1 << (fbits - 5), [0; 2]);
     let fp = t.fm.as_mut_ptr();
-    // Pass 1: every key of both lanes. SAFETY (both passes): fm holds 2^fbits / 64 pairs.
+    // Pass 1: every key of both lanes. SAFETY (both passes): fm holds 2^(64 - wsh) pairs.
     for c in plain {
-        unsafe { mark_plain(c, fp, fsh) };
+        unsafe { mark_plain(c, fp, wsh) };
     }
     for c in rare {
-        unsafe { mark_rare(c, fp, fsh) };
+        unsafe { mark_rare(c, fp, wsh) };
     }
     // Pass 2: the only copies straight out; the others' addresses for the table.
     t.cp.clear();
@@ -437,7 +598,7 @@ pub fn partition(plain: &[&[Unit]], rare: &[&[Unit]], t: &mut Tables, out: &mut 
     let mut cw = t.cp.as_mut_ptr();
     for c in plain {
         // SAFETY: cp has room for np addresses, and the chunks hold np units.
-        cw = unsafe { emit_plain(c, fp, fsh, out, cw) };
+        cw = unsafe { emit_plain(c, fp, wsh, out, cw) };
     }
     // SAFETY: as written by emit_plain.
     unsafe { written(&mut t.cp, cw) };
@@ -449,7 +610,7 @@ pub fn partition(plain: &[&[Unit]], rare: &[&[Unit]], t: &mut Tables, out: &mut 
     let (mut cw, mut sw, mut ww) = (t.cr.as_mut_ptr(), t.rs.as_mut_ptr(), t.rw.as_mut_ptr());
     for c in rare {
         // SAFETY: each list has room for nr / 2 addresses, and the chunks hold at most that many records.
-        (cw, sw, ww) = unsafe { sort_rare(c, fp, fsh, cw, sw, ww) };
+        (cw, sw, ww) = unsafe { sort_rare(c, fp, wsh, cw, sw, ww) };
     }
     // SAFETY: as written by sort_rare.
     unsafe {

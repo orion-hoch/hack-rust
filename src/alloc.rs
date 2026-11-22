@@ -146,6 +146,11 @@ const PAGE: usize = 4096;
 const CLASS_MAX: usize = 8 << 10;
 /// Largest size served from spans (runs of whole pages); above it, blocks are their own mappings.
 const SMALL_MAX: usize = 1 << 18;
+/// Largest size served from spans. Blocks from SMALL_MAX to here were their own mappings on 4 KB
+/// pages (under HUGE no huge-page advice): at 20M events 139 mmaps, 89 mremaps and about 18K page
+/// faults, none of it reused across sizes. In the span chunks they sit on huge pages and a freed
+/// span serves any size.
+const SPAN_MAX: usize = 2 << 20;
 /// Span chunks: 64 MiB, aligned to their size; page 0 holds the chunk's free-span bitmaps.
 const SPAN_CHUNK: usize = 64 << 20;
 const CPAGES: usize = SPAN_CHUNK / PAGE;
@@ -623,7 +628,7 @@ impl Spans {
         loop {
             // smallest non-empty exact list of at least n pages, else first fit among longer spans
             let mut found: *mut FreeSpan = null_mut();
-            let mask = self.nonempty >> (n - 1);
+            let mask = if n <= SPAN_LISTS { self.nonempty >> (n - 1) } else { 0 };
             if mask != 0 {
                 found = self.lists[n + mask.trailing_zeros() as usize];
             } else {
@@ -775,7 +780,7 @@ impl Alloc {
         if size <= CLASS_MAX {
             // SAFETY: class_of(size) < NCLASS.
             (with_heap(|h| unsafe { h.alloc(class_of(size)) }), false)
-        } else if size <= SMALL_MAX {
+        } else if size <= SPAN_MAX {
             (span_alloc(size), false)
         } else {
             large_alloc(size)
@@ -791,7 +796,7 @@ impl Alloc {
         if size <= CLASS_MAX {
             // SAFETY: p came from raw_alloc(size).
             with_heap(|h| unsafe { h.free(p, class_of(size)) })
-        } else if size <= SMALL_MAX {
+        } else if size <= SPAN_MAX {
             span_free(p, size)
         } else {
             large_free(p, size)
@@ -804,7 +809,7 @@ impl Alloc {
     /// dedup builder measured 27K faults in one stage). alloc and free decide alike from the layout.
     #[inline(always)]
     fn direct(l: Layout) -> bool {
-        l.align() <= PAGE && l.size() > SMALL_MAX
+        l.align() <= PAGE && l.size() > SPAN_MAX
     }
 
     unsafe fn aligned_alloc(l: Layout, zero: bool) -> *mut u8 {
@@ -892,11 +897,11 @@ unsafe impl GlobalAlloc for Alloc {
                 if co == cn || with_heap(|h| h.resize_top(p, class_size(co), class_size(cn))) {
                     return p;
                 }
-            } else if old > CLASS_MAX && old <= SMALL_MAX && new_size > CLASS_MAX && new_size <= SMALL_MAX {
+            } else if old > CLASS_MAX && old <= SPAN_MAX && new_size > CLASS_MAX && new_size <= SPAN_MAX {
                 if span_resize(p, old, new_size) {
                     return p;
                 }
-            } else if old > SMALL_MAX && new_size > SMALL_MAX {
+            } else if old > SPAN_MAX && new_size > SPAN_MAX {
                 let q = large_realloc(p, old, new_size);
                 if !q.is_null() {
                     return q;

@@ -979,35 +979,389 @@ fn single_core<F: FnMut(u64, u64) -> Ordering, W: Fn(usize) -> u64>(
     Ok(())
 }
 
-/// Room for `more` clicks (and the sentinel) after the `n` already written; returns the new room.
+/// The per-person click buffers of `walk_blocks`.
+#[derive(Default)]
+struct KeyBufs {
+    /// Keys `tc << 32 | index << 12 | campaign` of the person at hand, and the sentinel.
+    kb: Vec<u64>,
+    /// The click words (campaign << 52 | locator), by key index: read only by a credited tie
+    /// group with several campaigns (a re-read of the blocks instead cost 1.5G instructions at
+    /// 20M events: the ties are in the persons with tens of thousands of clicks).
+    cw: Vec<u64>,
+    /// Per key position: the session that moved the credit pointer past it.
+    lo: Vec<u32>,
+    /// Distribution sort: its output and its counts.
+    tmp: Vec<u64>,
+    cnt: Vec<u32>,
+    dropped: u64,
+}
+
+/// Room for `need` keys and the sentinel.
 #[cold]
 #[inline(never)]
-fn grow_person(kb: &mut Vec<u64>, cw: &mut Vec<u64>, lo: &mut Vec<u32>, n: usize, more: usize) -> usize {
-    // SAFETY: the caller wrote entries 0..n of both.
-    unsafe {
-        kb.set_len(n);
-        cw.set_len(n);
+fn grow_person(kv: &mut KeyBufs, need: usize) {
+    kv.kb.clear();
+    kv.kb.reserve(need + 1);
+    kv.cw.clear();
+    kv.cw.reserve(need + 1);
+    kv.lo.clear();
+    kv.lo.reserve(need + 1);
+}
+
+/// The click keys of one person, sorted, with the sentinel after them: (keys, count). A count of
+/// usize::MAX: a block is malformed, a campaign is not below `lim`, or there are over 2^20 clicks.
+/// On its own (not inlined) so that the loops keep their few values in registers.
+#[inline(never)]
+fn person_keys(blocks: &[&[u64]], kv: &mut KeyBufs, lim: u64) -> (*mut u64, usize) {
+    const BAD: (*mut u64, usize) = (core::ptr::null_mut(), usize::MAX);
+    let mut need = 0usize;
+    for blk in blocks {
+        let c = (blk.first().copied().unwrap_or(0) & 0xFF_FFFF) as usize;
+        if blk.len() < 2 + 2 * c {
+            return BAD;
+        }
+        need += c;
     }
-    kb.reserve(more + 1);
-    cw.reserve(more + 1);
-    let cap = kb.capacity().min(cw.capacity());
-    lo.clear();
-    lo.reserve(cap);
-    cap
+    if need > 1 << 20 {
+        return BAD;
+    }
+    if kv.kb.capacity() <= need || kv.cw.capacity() <= need || kv.lo.capacity() <= need {
+        grow_person(kv, need);
+    }
+    let (kw, cww) = (kv.kb.as_mut_ptr(), kv.cw.as_mut_ptr());
+    let mut n = 0usize;
+    let mut dropped = 0u64;
+    for blk in blocks {
+        let c = (blk[0] & 0xFF_FFFF) as usize;
+        // SAFETY: 2 + 2 * c <= blk.len() (checked above), so the words of the c clicks are in
+        // the block; n < need < the room of kb and cw.
+        unsafe {
+            let mut q = blk.as_ptr().add(2);
+            for _ in 0..c {
+                let (w0, tc) = (*q, *q.add(1));
+                q = q.add(2);
+                let camp = w0 >> 52;
+                if camp >= lim {
+                    return BAD;
+                }
+                if tc > TS_MAX {
+                    // after every session start (starts are below 2^31 - base): credits and
+                    // assists nothing
+                    dropped += 1;
+                    continue;
+                }
+                *kw.add(n) = (tc << 32) | ((n as u64) << 12) | camp;
+                *cww.add(n) = w0;
+                n += 1;
+            }
+        }
+    }
+    kv.dropped += dropped;
+    let mut ks = kw;
+    // SAFETY: entries 0..n were written above, and entry n is within the room (of kb, and of tmp
+    // when the distribution sort moved the keys there).
+    unsafe {
+        if n <= 24 {
+            for i in 1..n {
+                let x = *kw.add(i);
+                let mut j = i;
+                while j > 0 && *kw.add(j - 1) > x {
+                    *kw.add(j) = *kw.add(j - 1);
+                    j -= 1;
+                }
+                *kw.add(j) = x;
+            }
+        } else if sort_keys_big(kw, n, &mut kv.tmp, &mut kv.cnt) {
+            ks = kv.tmp.as_mut_ptr();
+        }
+        // above every bound the pointers are compared with
+        *ks.add(n) = u64::MAX;
+    }
+    (ks, n)
+}
+
+/// What the per-person loops of `walk_blocks` share: raw pointers into `out`, the rows, the
+/// scratch and the cells, and the parameters.
+struct Bx {
+    starts: *const u32,
+    evs: *const u32,
+    revs: *const u64,
+    rd: *mut u32,
+    rs: *mut u32,
+    re: *mut u32,
+    rr: *mut u64,
+    row_of: *mut u32,
+    /// Per row of a person with clicks: [end session, day * campaigns].
+    rinfo: *mut [u32; 2],
+    upto: *mut u32,
+    hot: *mut [u32; 2],
+    buy: *mut [u64; 2],
+    shift: u32,
+    days: usize,
+    cn: usize,
+    org: usize,
+    base: i64,
+}
+
+/// Rows and organic cells of the sessions s0..s1 of a person without clicks, after row `r`
+/// (rows are summed in place: the sessions, events and revenue slots start at 0). Returns the
+/// person's last row, and false when a day is out of range.
+///
+/// # Safety
+/// s0 < s1 <= the length of start, events, sess_rev and row_of; the row slots r + 1.. have room
+/// for one row per session; the cells hold days * campaigns entries and organic < campaigns.
+#[inline(never)]
+unsafe fn person_organic(x: &Bx, s0: usize, s1: usize, mut r: usize) -> (usize, bool) {
+    let mut prev = u32::MAX;
+    for s in s0..s1 {
+        // SAFETY: the contract (r grows by one per session at most; day < days is checked).
+        unsafe {
+            // start < 2^31 and day_shift < DAY, so the sum fits in u32
+            let day = (*x.starts.add(s) + x.shift) / DAY;
+            if day as usize >= x.days {
+                return (r, false);
+            }
+            r = r.wrapping_add((day != prev) as usize);
+            prev = day;
+            let rev = *x.revs.add(s);
+            *x.rd.add(r) = day;
+            *x.rs.add(r) += 1;
+            *x.re.add(r) += *x.evs.add(s);
+            *x.rr.add(r) += rev;
+            *x.row_of.add(s) = r as u32;
+            let cell = day as usize * x.cn + x.org;
+            (*x.hot.add(cell))[0] += 1;
+            if rev > 0 {
+                let b = &mut *x.buy.add(cell);
+                b[0] += 1;
+                b[1] += rev;
+            }
+        }
+    }
+    (r, true)
+}
+
+/// A person with clicks: its rows (as `person_organic`, plus each row's end session and day
+/// cell base), then one pass over its sessions with two pointers into the sorted keys `ks[..n]`
+/// that only grow: cp = clicks at or before the start, ap = clicks more than REACH before it. The
+/// credit is click cp - 1 when cp > ap. A click assists the sessions from the one that moved cp
+/// past it (`low`) to the one that moves ap past it (or the person's last): the range is added
+/// when ap passes, in click order, per campaign from `upto` on (session indices grow across the
+/// partition's persons, so `upto` needs no stamp), split by rows.
+///
+/// # Safety
+/// As `person_organic`; `ks[..n]` sorted keys of campaigns below `x.cn`, `ks[n]` = u64::MAX;
+/// `low` has room for n and `cww[..n]` holds the click words by key index; `upto` holds `x.cn` entries, none above s0; `rinfo` has room like the
+/// rows.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+unsafe fn person_clicks<F: FnMut(u64, u64) -> Ordering>(
+    x: &Bx,
+    ks: *const u64,
+    low: *mut u32,
+    cww: *const u64,
+    s0: usize,
+    s1: usize,
+    mut r: usize,
+    tie: &mut F,
+    ties: &mut [u64; 2],
+) -> (usize, bool) {
+    const LM: u64 = (1 << 52) - 1;
+    const CM: u64 = 0xfff;
+    let reach = REACH as u64;
+    let mut prev = u32::MAX;
+    for s in s0..s1 {
+        // SAFETY: the contract (r grows by one per session at most; day < days is checked).
+        unsafe {
+            let day = (*x.starts.add(s) + x.shift) / DAY;
+            if day as usize >= x.days {
+                return (r, false);
+            }
+            r = r.wrapping_add((day != prev) as usize);
+            prev = day;
+            *x.rd.add(r) = day;
+            *x.rs.add(r) += 1;
+            *x.re.add(r) += *x.evs.add(s);
+            *x.rr.add(r) += *x.revs.add(s);
+            *x.row_of.add(s) = r as u32;
+            *x.rinfo.add(r) = [s as u32 + 1, (day as usize * x.cn) as u32];
+        }
+    }
+    let (starts, revs, row_of, rinfo, upto, hot, rs) = (x.starts, x.revs, x.row_of, x.rinfo, x.upto, x.hot, x.rs as *const u32);
+    let base = x.base;
+    // The assists of click $j, whose sessions end before $hi: [max(low, upto), hi) by rows.
+    // SAFETY (both uses): j < cp <= n; low[j] was written when cp passed j; campaign < campaigns;
+    // from < hi <= s1, sessions of this person, whose rows (row_of, rinfo, sessions) are written;
+    // the row holding session hi - 1 ends at hi or later, which ends the loop inside the person's
+    // rows, and a row after the first has a row before it.
+    macro_rules! range {
+        ($j:expr, $hi:expr) => {{
+            let (j, hi): (usize, usize) = ($j, $hi);
+            let c = (*ks.add(j) & CM) as usize;
+            let u = upto.add(c);
+            let from = (*low.add(j)).max(*u) as usize;
+            *u = hi as u32;
+            if from < hi {
+                // the campaign's assist counter of day cell base dc: hc[2 * dc]
+                let hc = (hot as *mut u32).add(2 * c + 1);
+                let mut ri = rinfo.add(*row_of.add(from) as usize);
+                // first row: from `from` to the row's end, or to hi
+                let [e, dc] = *ri;
+                let e = (e as usize).min(hi);
+                *hc.add(2 * dc as usize) += (e - from) as u32;
+                if e < hi {
+                    // whole rows (their session counts are final: the rows were written above),
+                    // then the row that holds session hi - 1, from its first session
+                    ri = ri.add(1);
+                    let mut rsp = rs.add(ri.offset_from(rinfo) as usize);
+                    while ((*ri)[0] as usize) < hi {
+                        *hc.add(2 * (*ri)[1] as usize) += *rsp;
+                        ri = ri.add(1);
+                        rsp = rsp.add(1);
+                    }
+                    *hc.add(2 * (*ri)[1] as usize) += hi as u32 - (*ri.sub(1))[0];
+                }
+            }
+        }};
+    }
+    let (mut cp, mut ap) = (0usize, 0usize);
+    let (mut memo_g, mut memo_c) = (usize::MAX, 0usize);
+    for s in s0..s1 {
+        // SAFETY: see `range`; cp, ap <= n, as ks[n] is the sentinel above every bound; ap <= cp
+        // (a click more than REACH before the start is before it); cp - 1 and cp - 2 are read
+        // only when cp - ap >= 1 and 2; day < days and campaign < campaigns: the cell is in range.
+        unsafe {
+            // start - base < 2^32 (start < 2^31, base > -2^31)
+            let at = (i64::from(*starts.add(s)) - base) as u64;
+            let b1 = (at + 1) << 32;
+            while *ks.add(cp) < b1 {
+                *low.add(cp) = s as u32;
+                cp += 1;
+            }
+            let b2 = at.saturating_sub(reach) << 32;
+            while *ks.add(ap) < b2 {
+                range!(ap, s);
+                ap += 1;
+            }
+            // credit: the last click at or before the start, if it is still in reach
+            let mut camp = x.org;
+            if cp > ap {
+                let k = *ks.add(cp - 1);
+                camp = (k & CM) as usize;
+                if cp - ap >= 2 && (*ks.add(cp - 2) ^ k) >> 32 == 0 {
+                    // a ts tie: the smallest click_id of the group (equal ids: the later)
+                    let mut g = cp - 1;
+                    while g > 0 && (*ks.add(g - 1) ^ k) >> 32 == 0 {
+                        g -= 1;
+                    }
+                    if g == memo_g {
+                        camp = memo_c;
+                    } else {
+                        let mut mixed = false;
+                        for i in g..cp {
+                            mixed |= (*ks.add(i) & CM) as usize != camp;
+                        }
+                        if mixed {
+                            ties[0] += 1;
+                            let mut best = g;
+                            for i in g + 1..cp {
+                                ties[1] += 1;
+                                let (lb, li) = (((*ks.add(best) >> 12) & 0xF_FFFF) as usize, ((*ks.add(i) >> 12) & 0xF_FFFF) as usize);
+                                if tie(*cww.add(lb) & LM, *cww.add(li) & LM) != Ordering::Less {
+                                    best = i;
+                                }
+                            }
+                            camp = (*ks.add(best) & CM) as usize;
+                        }
+                        memo_g = g;
+                        memo_c = camp;
+                    }
+                }
+            }
+            let cell = (*rinfo.add(*row_of.add(s) as usize))[1] as usize + camp;
+            (*hot.add(cell))[0] += 1;
+            let rev = *revs.add(s);
+            if rev > 0 {
+                let b = &mut *x.buy.add(cell);
+                b[0] += 1;
+                b[1] += rev;
+            }
+        }
+    }
+    // the clicks still in reach of the last session assist up to it
+    for j in ap..cp {
+        // SAFETY: see `range`.
+        unsafe {
+            range!(j, s1);
+        }
+    }
+    (r, true)
+}
+
+/// Sorts the `n` keys at `kw` (n > 24, distinct, `tc << 32 | ..` with tc below 2^32) ascending:
+/// one distribution by the top bits of the time into about n / 2 buckets (clicks are spread over
+/// the click window, so a bucket holds a few keys), then one insertion pass over the nearly
+/// sorted result. Returns true when the sorted keys are in `tmp[..n]` (room for n + 1), false when
+/// they were sorted in place (a bucket above 24 keys: the comparison sort, so no input is slow).
+///
+/// # Safety
+/// `kw[..n]` is initialised and writable; n > 24.
+#[inline(never)]
+unsafe fn sort_keys_big(kw: *mut u64, n: usize, tmp: &mut Vec<u64>, cnt: &mut Vec<u32>) -> bool {
+    let b = (usize::BITS - (n - 1).leading_zeros() - 1).min(14);
+    let nb = 1usize << b;
+    let sh = 64 - b;
+    cnt.clear();
+    cnt.resize(nb, 0);
+    let c = cnt.as_mut_ptr();
+    // SAFETY: key >> sh < nb; the prefix sums place each key below n; tmp has room for n + 1.
+    unsafe {
+        for i in 0..n {
+            *c.add((*kw.add(i) >> sh) as usize) += 1;
+        }
+        let (mut sum, mut mx) = (0u32, 0u32);
+        for i in 0..nb {
+            let x = *c.add(i);
+            *c.add(i) = sum;
+            sum += x;
+            mx = mx.max(x);
+        }
+        if mx > 24 {
+            core::slice::from_raw_parts_mut(kw, n).sort_unstable();
+            return false;
+        }
+        if tmp.capacity() < n + 1 {
+            tmp.clear();
+            tmp.reserve(n + 1);
+        }
+        let t = tmp.as_mut_ptr();
+        for i in 0..n {
+            let x = *kw.add(i);
+            let at = c.add((x >> sh) as usize);
+            *t.add(*at as usize) = x;
+            *at += 1;
+        }
+        for i in 1..n {
+            let x = *t.add(i);
+            let mut j = i;
+            while j > 0 && *t.add(j - 1) > x {
+                *t.add(j) = *t.add(j - 1);
+                j -= 1;
+            }
+            *t.add(j) = x;
+        }
+    }
+    true
 }
 
 /// `walk` for v4 person blocks (`PersonBlocks`, after `sessions_blocks` on the same `out`):
 /// clicks straight from the click blocks (person k = the block's person index, no lookup),
 /// purchases from `out.buy_pay`. Err: the caller falls back (v3).
 ///
-/// One person at a time, one pass over its sessions. A person without clicks: rows and the
-/// organic cell. A person with clicks: its keys `tc << 32 | index << 12 | campaign` (index = order
-/// in its blocks, so the order is (ts, index) as before) sorted in a small buffer that stays in
-/// L1, then per session the row, and two pointers that only grow: cp = clicks at or before the
-/// start, ap = clicks more than REACH before it. The credit is click cp - 1 when cp > ap. A click
-/// assists the sessions from the one that moved cp past it to the one that moves ap past it (or
-/// the person's last): the range is added when ap passes, in click order, per campaign from
-/// `upto` on (session indices grow across the partition's persons, so `upto` needs no stamp).
+/// One person at a time, in three small loops that each keep their values in registers
+/// (`person_keys`, `person_organic`, `person_clicks`): a person without sessions skips its
+/// clicks, a person without clicks takes its rows and the organic cell, a person with both sorts
+/// its keys in a buffer that stays in L1 and walks its sessions once.
 #[allow(clippy::too_many_arguments)]
 pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
     pb: &PersonBlocks,
@@ -1023,6 +1377,7 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
     let np = out.persons.len();
     let ns = out.start.len();
     let cn = prm.campaigns;
+    // organic is the last campaign cell (as P2 lays them out): one compare validates a click
     if pb.ev_at.len() != np + 1
         || pb.ck_at.len() != np + 1
         || out.sess_end.len() != np
@@ -1030,7 +1385,7 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
         || out.buy_pay.len() != out.buy_session.len()
         || hot.len() != prm.days * cn
         || buy.len() != prm.days * cn
-        || prm.organic as usize >= cn
+        || prm.organic as usize + 1 != cn
         || prm.days * cn > u32::MAX as usize
         || ns >= u32::MAX as usize
     {
@@ -1041,289 +1396,104 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
     }
     let pay = &out.buy_pay;
     purchases_by_session(pay.len(), |j| pay[j], out, ws)?;
-    // one row per session at most: the rows are written through raw pointers
+    // one row per session at most; sessions, events and revenue are summed in place from 0
     rows.day.reserve(ns);
-    rows.sessions.reserve(ns);
-    rows.events.reserve(ns);
-    rows.revenue.reserve(ns);
+    rows.sessions.resize(ns, 0);
+    rows.events.resize(ns, 0);
+    rows.revenue.resize(ns, 0);
     rows.row_end.reserve(np);
     ws.row_info.clear();
     ws.row_info.reserve(ns);
     ws.upto.clear();
     ws.upto.resize(cn, 0);
-    let (mut kb, mut cw, mut lo) = (core::mem::take(&mut ws.ka), core::mem::take(&mut ws.cw), core::mem::take(&mut ws.last_at));
-    let res = blocks_core(pb, prm, tie, ws, out, hot, buy, rows, &mut kb, &mut cw, &mut lo);
-    kb.clear();
-    cw.clear();
-    lo.clear();
-    ws.ka = kb;
-    ws.cw = cw;
-    ws.last_at = lo;
-    let nr = res?;
-    // SAFETY: blocks_core wrote rows 0..nr of each (nr <= ns, the reserved room).
-    unsafe {
-        rows.day.set_len(nr);
-        rows.sessions.set_len(nr);
-        rows.events.set_len(nr);
-        rows.revenue.set_len(nr);
-    }
-    rows.top.resize(nr, NO_TOP);
-    top_categories(|j| pay[j], ws, out, rows);
-    Ok(())
-}
-
-/// The persons of `walk_blocks`; returns the number of rows written.
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn blocks_core<F: FnMut(u64, u64) -> Ordering>(
-    pb: &PersonBlocks,
-    prm: &Params,
-    tie: &mut F,
-    ws: &mut WalkScratch,
-    out: &Out,
-    hot: &mut [[u32; 2]],
-    buy: &mut [[u64; 2]],
-    rows: &mut Rows,
-    kb: &mut Vec<u64>,
-    cw: &mut Vec<u64>,
-    lo: &mut Vec<u32>,
-) -> Result<usize, Error> {
-    const LM: u64 = (1 << 52) - 1;
-    const CM: u64 = 0xfff;
-    let np = out.persons.len();
-    let ns = out.start.len();
-    let cn = prm.campaigns;
-    let (cn64, org) = (cn as u64, prm.organic as usize);
-    let (base, shift, days) = (prm.base, prm.day_shift, prm.days);
-    let reach = REACH as u64;
-    kb.clear();
-    cw.clear();
-    lo.clear();
-    let mut cap = kb.capacity().min(cw.capacity()).min(lo.capacity());
-    let (mut kw, mut cww, mut low) = (kb.as_mut_ptr(), cw.as_mut_ptr(), lo.as_mut_ptr());
-    let (starts, evs, revs) = (out.start.as_ptr(), out.events.as_ptr(), ws.sess_rev.as_ptr());
-    let (rd, rs, re, rr) = (rows.day.as_mut_ptr(), rows.sessions.as_mut_ptr(), rows.events.as_mut_ptr(), rows.revenue.as_mut_ptr());
-    let (rinfo, row_of, upto) = (ws.row_info.as_mut_ptr(), ws.row_of.as_mut_ptr(), ws.upto.as_mut_ptr());
-    let (hotp, buyp) = (hot.as_mut_ptr(), buy.as_mut_ptr());
-    let (mut kept, mut dropped, mut tie_groups, mut tie_calls) = (0u64, 0u64, 0u64, 0u64);
-    // current row (rows are written in place: each session rewrites its row with the running
-    // sums, a new day moves to the next slot first)
+    let mut kv = KeyBufs { kb: core::mem::take(&mut ws.ka), cw: core::mem::take(&mut ws.cw), lo: core::mem::take(&mut ws.last_at), tmp: core::mem::take(&mut ws.kb), cnt: core::mem::take(&mut ws.cidx), dropped: 0 };
+    let x = Bx {
+        starts: out.start.as_ptr(),
+        evs: out.events.as_ptr(),
+        revs: ws.sess_rev.as_ptr(),
+        rd: rows.day.as_mut_ptr(),
+        rs: rows.sessions.as_mut_ptr(),
+        re: rows.events.as_mut_ptr(),
+        rr: rows.revenue.as_mut_ptr(),
+        row_of: ws.row_of.as_mut_ptr(),
+        rinfo: ws.row_info.as_mut_ptr(),
+        upto: ws.upto.as_mut_ptr(),
+        hot: hot.as_mut_ptr(),
+        buy: buy.as_mut_ptr(),
+        shift: prm.day_shift,
+        days: prm.days,
+        cn,
+        org: prm.organic as usize,
+        base: prm.base,
+    };
+    let mut ties = [0u64; 2];
+    let mut kept = 0u64;
+    let mut res = Ok(());
+    // current row
     let mut r = usize::MAX;
     let mut s0 = 0usize;
     for p in 0..np {
         let s1 = out.sess_end[p] as usize;
         if s1 < s0 || s1 > ns {
-            return Err(Error::WalkInput);
+            res = Err(Error::WalkInput);
+            break;
         }
-        let (c0, c1) = (pb.ck_at[p] as usize, pb.ck_at[p + 1] as usize);
-        let mut n = 0usize;
-        // the person's click keys (clicks of a person without sessions credit and assist nothing)
-        if s1 > s0 && c1 > c0 {
-            for blk in pb.ck.get(c0..c1).ok_or(Error::WalkInput)? {
-                let c = (blk.first().copied().unwrap_or(0) & 0xFF_FFFF) as usize;
-                if blk.len() < 2 + 2 * c || n + c > 1 << 20 {
-                    return Err(Error::WalkInput);
+        if s1 > s0 {
+            let (c0, c1) = (pb.ck_at[p] as usize, pb.ck_at[p + 1] as usize);
+            let mut n = 0usize;
+            let mut ks = core::ptr::null_mut();
+            if c1 > c0 {
+                let Some(blocks) = pb.ck.get(c0..c1) else {
+                    res = Err(Error::WalkInput);
+                    break;
+                };
+                (ks, n) = person_keys(blocks, &mut kv, prm.organic as u64);
+                if n == usize::MAX {
+                    res = Err(Error::WalkInput);
+                    break;
                 }
-                if n + c + 1 > cap {
-                    cap = grow_person(kb, cw, lo, n, c);
-                    kw = kb.as_mut_ptr();
-                    cww = cw.as_mut_ptr();
-                    low = lo.as_mut_ptr();
-                }
-                // SAFETY: 2 + 2 * c <= blk.len() (checked above), so the words of the c clicks
-                // are in the block; n + c + 1 <= cap, the room of kb and cw.
-                unsafe {
-                    let mut q = blk.as_ptr().add(2);
-                    for _ in 0..c {
-                        let (w0, tc) = (*q, *q.add(1));
-                        q = q.add(2);
-                        let camp = w0 >> 52;
-                        if camp >= cn64 || camp == org as u64 {
-                            return Err(Error::BadCampaign(n));
-                        }
-                        if tc > TS_MAX {
-                            // after every session start (starts are below 2^31 - base): credits
-                            // and assists nothing
-                            dropped += 1;
-                            continue;
-                        }
-                        *kw.add(n) = (tc << 32) | ((n as u64) << 12) | camp;
-                        *cww.add(n) = w0;
-                        n += 1;
-                    }
-                }
+                kept += n as u64;
             }
-            // SAFETY: entries 0..n were written above, and entry n is within the room.
-            unsafe {
-                if n <= 24 {
-                    for i in 1..n {
-                        let x = *kw.add(i);
-                        let mut j = i;
-                        while j > 0 && *kw.add(j - 1) > x {
-                            *kw.add(j) = *kw.add(j - 1);
-                            j -= 1;
-                        }
-                        *kw.add(j) = x;
-                    }
+            // SAFETY: s0 < s1 <= ns, the length of start, events, sess_rev and row_of; the rows
+            // (and row_info) have room for ns, one per session; the cells hold days * campaigns
+            // entries; person_keys gave sorted keys of campaigns below organic with the sentinel,
+            // room in `lo` for them and their words in `cw`; upto holds campaigns entries, none above s0 (cleared
+            // above, then set to session indices of earlier persons only).
+            let (r1, ok) = unsafe {
+                if n == 0 {
+                    person_organic(&x, s0, s1, r)
                 } else {
-                    core::slice::from_raw_parts_mut(kw, n).sort_unstable();
+                    person_clicks(&x, ks, kv.lo.as_mut_ptr(), kv.cw.as_ptr(), s0, s1, r, tie, &mut ties)
                 }
-                // above every bound the pointers are compared with
-                *kw.add(n) = u64::MAX;
+            };
+            if !ok {
+                res = Err(Error::DayOutOfRange(s0));
+                break;
             }
-            kept += n as u64;
-        }
-        let mut prev = u32::MAX;
-        let (mut ds, mut de, mut dr) = (0u32, 0u32, 0u64);
-        // The row of session $s: (start, day * campaigns, revenue).
-        // SAFETY (both uses): s < ns, the length of start, events, sess_rev and row_of; r <= s
-        // (one row per session at most, r starts at -1), within the reserved room of the rows.
-        macro_rules! row {
-            ($s:expr) => {{
-                let s: usize = $s;
-                let start = *starts.add(s);
-                // start < 2^31 and day_shift < DAY, so the sum fits in u32
-                let day = (start + shift) / DAY;
-                if day as usize >= days {
-                    return Err(Error::DayOutOfRange(s));
-                }
-                let new = day != prev;
-                prev = day;
-                r = r.wrapping_add(new as usize);
-                let (ev, rev) = (*evs.add(s), *revs.add(s));
-                ds = if new { 1 } else { ds + 1 };
-                de = if new { ev } else { de + ev };
-                dr = if new { rev } else { dr + rev };
-                *rd.add(r) = day;
-                *rs.add(r) = ds;
-                *re.add(r) = de;
-                *rr.add(r) = dr;
-                *row_of.add(s) = r as u32;
-                (start, day as usize * cn, rev)
-            }};
-        }
-        if n == 0 {
-            for s in s0..s1 {
-                // SAFETY: see `row`; day < days and organic < campaigns, so the cell is in range.
-                unsafe {
-                    let (_, dc, rev) = row!(s);
-                    let cell = dc + org;
-                    (*hotp.add(cell))[0] += 1;
-                    if rev > 0 {
-                        let b = &mut *buyp.add(cell);
-                        b[0] += 1;
-                        b[1] += rev;
-                    }
-                }
-            }
-        } else {
-            // The assists of click $j, whose sessions end before $hi: [max(lo, upto), hi) by rows.
-            // SAFETY (both uses): j < cp <= n; lo[j] was written when cp passed j; campaign <
-            // campaigns (checked when the key was made); from < hi <= s + 1, sessions whose rows
-            // (row_of, rinfo) are written; the row holding session hi - 1 ends at hi or later,
-            // which ends the loop inside the person's rows.
-            macro_rules! range {
-                ($j:expr, $hi:expr) => {{
-                    let (j, hi): (usize, usize) = ($j, $hi);
-                    let c = (*kw.add(j) & CM) as usize;
-                    let u = upto.add(c);
-                    let from = (*low.add(j)).max(*u) as usize;
-                    *u = hi as u32;
-                    if from < hi {
-                        let mut a = from;
-                        let mut ri = rinfo.add(*row_of.add(from) as usize);
-                        loop {
-                            let [e, dc] = *ri;
-                            let e = (e as usize).min(hi);
-                            (*hotp.add(dc as usize + c))[1] += (e - a) as u32;
-                            a = e;
-                            ri = ri.add(1);
-                            if e >= hi {
-                                break;
-                            }
-                        }
-                    }
-                }};
-            }
-            let (mut cp, mut ap) = (0usize, 0usize);
-            let (mut memo_g, mut memo_c) = (usize::MAX, 0usize);
-            for s in s0..s1 {
-                // SAFETY: see `row` and `range`; cp, ap <= n, as kw[n] is the sentinel above
-                // every bound; ap <= cp (a click more than REACH before the start is before it);
-                // cp - 1 and cp - 2 are read only when cp - ap >= 1 and 2; the cell is in range.
-                unsafe {
-                    let (start, dc, rev) = row!(s);
-                    *rinfo.add(r) = [s as u32 + 1, dc as u32];
-                    // start - base < 2^32 (start < 2^31, base > -2^31)
-                    let at = (i64::from(start) - base) as u64;
-                    let b1 = (at + 1) << 32;
-                    while *kw.add(cp) < b1 {
-                        *low.add(cp) = s as u32;
-                        cp += 1;
-                    }
-                    let b2 = at.saturating_sub(reach) << 32;
-                    while *kw.add(ap) < b2 {
-                        range!(ap, s);
-                        ap += 1;
-                    }
-                    // credit: the last click at or before the start, if it is still in reach
-                    let mut camp = org;
-                    if cp > ap {
-                        let x = *kw.add(cp - 1);
-                        camp = (x & CM) as usize;
-                        if cp - ap >= 2 && (*kw.add(cp - 2) ^ x) >> 32 == 0 {
-                            // a ts tie: the smallest click_id of the group (equal ids: the later)
-                            let mut g = cp - 1;
-                            while g > 0 && (*kw.add(g - 1) ^ x) >> 32 == 0 {
-                                g -= 1;
-                            }
-                            if g == memo_g {
-                                camp = memo_c;
-                            } else {
-                                let mut mixed = false;
-                                for i in g..cp {
-                                    mixed |= (*kw.add(i) & CM) as usize != camp;
-                                }
-                                if mixed {
-                                    tie_groups += 1;
-                                    let mut best = g;
-                                    for i in g + 1..cp {
-                                        tie_calls += 1;
-                                        let (lb, li) = (((*kw.add(best) >> 12) & 0xF_FFFF) as usize, ((*kw.add(i) >> 12) & 0xF_FFFF) as usize);
-                                        if tie(*cww.add(lb) & LM, *cww.add(li) & LM) != Ordering::Less {
-                                            best = i;
-                                        }
-                                    }
-                                    camp = (*kw.add(best) & CM) as usize;
-                                }
-                                memo_g = g;
-                                memo_c = camp;
-                            }
-                        }
-                    }
-                    let cell = dc + camp;
-                    (*hotp.add(cell))[0] += 1;
-                    if rev > 0 {
-                        let b = &mut *buyp.add(cell);
-                        b[0] += 1;
-                        b[1] += rev;
-                    }
-                }
-            }
-            // the clicks still in reach of the last session assist up to it
-            for j in ap..cp {
-                // SAFETY: see `range`.
-                unsafe {
-                    range!(j, s1);
-                }
-            }
+            r = r1;
         }
         rows.row_end.push(r.wrapping_add(1) as u32);
         s0 = s1;
     }
     ws.stats.clicks_kept += kept;
-    ws.stats.clicks_dropped += dropped;
-    ws.stats.tie_groups += tie_groups;
-    ws.stats.tie_calls += tie_calls;
-    Ok(r.wrapping_add(1))
+    ws.stats.clicks_dropped += kv.dropped;
+    ws.stats.tie_groups += ties[0];
+    ws.stats.tie_calls += ties[1];
+    ws.ka = kv.kb;
+    ws.cw = kv.cw;
+    ws.last_at = kv.lo;
+    ws.kb = kv.tmp;
+    ws.cidx = kv.cnt;
+    res?;
+    let nr = r.wrapping_add(1);
+    // SAFETY: the loops wrote the day of rows 0..nr (nr <= ns, the reserved room).
+    unsafe {
+        rows.day.set_len(nr);
+    }
+    rows.sessions.truncate(nr);
+    rows.events.truncate(nr);
+    rows.revenue.truncate(nr);
+    rows.top.resize(nr, NO_TOP);
+    top_categories(|j| pay[j], ws, out, rows);
+    Ok(())
 }

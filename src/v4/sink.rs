@@ -179,6 +179,26 @@ impl<'a> Sink for EvSink<'a, '_> {
     }
 }
 
+/// a * b per 64-bit lane as two 256-bit multiplies. A 512-bit vpmullq is a HEAVY 512-bit
+/// instruction: on Skylake-X and Cascade Lake it asks the core for its lowest clock licence
+/// (the scorer measured a build whose parser used 512-bit multiplies 0.037 s slower at equal
+/// output), and the parser's own batches avoid it for that reason. Written with asm so the
+/// compiler cannot merge the halves back into one 512-bit multiply.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx512vl")]
+#[inline]
+unsafe fn mullo64_halves(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__m512i) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::*;
+    unsafe {
+        let (al, ah) = (_mm512_castsi512_si256(a), _mm512_extracti64x4_epi64::<1>(a));
+        let (bl, bh) = (_mm512_castsi512_si256(b), _mm512_extracti64x4_epi64::<1>(b));
+        let (rl, rh): (__m256i, __m256i);
+        std::arch::asm!("vpmullq {r}, {x}, {y}", r = lateout(ymm_reg) rl, x = in(ymm_reg) al, y = in(ymm_reg) bl, options(pure, nomem, nostack, preserves_flags));
+        std::arch::asm!("vpmullq {r}, {x}, {y}", r = lateout(ymm_reg) rh, x = in(ymm_reg) ah, y = in(ymm_reg) bh, options(pure, nomem, nostack, preserves_flags));
+        _mm512_inserti64x4::<1>(_mm512_castsi256_si512(rl), rh)
+    }
+}
+
 impl<'a> EvSink<'a, '_> {
     /// One batch with AVX-512. Every lane's plain unit, and every lane's rare record (header,
     /// second word, event key, user key, partition, form), is built in zmm registers for the 8
@@ -214,10 +234,10 @@ impl<'a> EvSink<'a, '_> {
         unsafe {
             let c = _mm512_set1_epi64(super::keys::MIX_C as i64);
             let m40 = _mm512_set1_epi64(super::keys::M40 as i64);
-            let x = _mm512_and_si512(_mm512_mullo_epi64(_mm512_loadu_si512(b.ev_a.as_ptr() as *const _), c), m40);
+            let x = _mm512_and_si512(mullo64_halves(_mm512_loadu_si512(b.ev_a.as_ptr() as *const _), c), m40);
             let me = _mm512_xor_si512(x, _mm512_srli_epi64::<20>(x));
             let ua = _mm512_loadu_si512(b.user_a.as_ptr() as *const _);
-            let y = _mm512_and_si512(_mm512_mullo_epi64(ua, c), m40);
+            let y = _mm512_and_si512(mullo64_halves(ua, c), m40);
             let mu = _mm512_xor_si512(y, _mm512_srli_epi64::<20>(y));
             let ing = _mm512_cvtepu32_epi64(_mm256_loadu_si256(b.ingest.as_ptr() as *const __m256i));
             let ts = _mm512_maskz_mov_epi64(live, _mm512_cvtepu32_epi64(_mm256_loadu_si256(b.ts.as_ptr() as *const __m256i)));
@@ -261,7 +281,7 @@ impl<'a> EvSink<'a, '_> {
                 let s1a = _mm512_mask_mov_epi64(ea, fa, uxa);
                 let s1b = _mm512_mask_mov_epi64(eb, fa, uxb);
                 // Partition: SHORT event the top bits of mix40, LONG the top bits of long_hash.
-                let lh = _mm512_mullo_epi64(_mm512_xor_si512(ea, _mm512_rol_epi64::<29>(eb)), _mm512_set1_epi64(super::keys::LONG_C as i64));
+                let lh = mullo64_halves(_mm512_xor_si512(ea, _mm512_rol_epi64::<29>(eb)), _mm512_set1_epi64(super::keys::LONG_C as i64));
                 let pl = _mm512_srl_epi64(lh, _mm_cvtsi32_si128(64 - self.b1 as i32));
                 _mm512_storeu_si512(rpart.as_mut_ptr() as *mut _, _mm512_slli_epi64::<4>(_mm512_mask_mov_epi64(ps, elong, pl)));
                 _mm512_storeu_si512(r0.as_mut_ptr() as *mut _, _mm512_permutex2var_epi64(h, i0, rw1));

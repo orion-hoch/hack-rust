@@ -45,11 +45,31 @@ pub fn init(expected_peak: usize) -> bool {
     if READY.load(Ordering::Acquire) {
         return true;
     }
-    let ok = REG.init(RESERVE, Huge::Auto(expected_peak)).is_ok()
+    // Huge pages by rt's verdict for the whole peak. When the verdict is no only because the free
+    // 2 MB blocks and the free memory are short of the WHOLE peak, the region still takes huge
+    // pages for 80% of the blocks that are free now (less a quarter of the peak, left to the
+    // allocator), under the stall guard, and 4 KB pages after that. It used to take none: at
+    // f60v5 on box 1 (blocks 2.4 GB, MemFree 5.3 GB) that was 544K page faults against 98K and
+    // 27.7G cycles against 25.0G. RT_TIGHT=<MB> forces this mode with that limit (measurements;
+    // 0 = no huge pages).
+    let v = rt::arena::huge_verdict(expected_peak);
+    let limit = match std::env::var("RT_TIGHT").ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(mb) => Some(mb << 20),
+        None if !v.use_huge && v.enabled != b'n' && v.free_2m > 0 => Some(((v.free_2m as usize) * (2 << 20) / 5 * 4).saturating_sub(expected_peak / 4)),
+        None => None,
+    };
+    let huge = match limit {
+        Some(b) => if b > 0 { Huge::On } else { Huge::Off },
+        None => if v.use_huge { Huge::On } else { Huge::Off },
+    };
+    let ok = REG.init(RESERVE, huge).is_ok()
         && B8K.attach(&REG, 8 << 10).is_ok()
         && B2K.attach(&REG, 2 << 10).is_ok()
         && B256.attach(&REG, 256).is_ok()
         && B2M.attach(&REG, 2 << 20).is_ok();
+    if let Some(b) = limit.filter(|&b| b > 0) {
+        REG.set_huge_limit(b);
+    }
     READY.store(ok, Ordering::Release);
     ok
 }

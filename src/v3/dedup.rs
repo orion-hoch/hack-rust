@@ -358,6 +358,16 @@ impl Out {
         (self.stage.as_mut_ptr().cast::<u64>(), self.fill.as_mut_ptr(), self.mask)
     }
 
+    /// Every partition's next output line and the end of its chunk (two arrays of line addresses),
+    /// for a caller that writes `flush_line` out itself: when partition q's two are different it
+    /// copies q's staging line to the first with non-temporal stores and moves the first on by
+    /// 64 bytes; when they are equal (both null at first) it calls `flush_line(q)`, which opens
+    /// the next chunk. The arrays never move.
+    #[inline(always)]
+    pub(crate) fn raw_fronts(&mut self) -> (*mut *mut u8, *const *mut u8) {
+        (self.cur.as_mut_ptr().cast(), self.end.as_ptr().cast())
+    }
+
     /// Flushes partition q's full staging line (see `raw_parts`).
     ///
     /// # Safety

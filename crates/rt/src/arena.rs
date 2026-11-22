@@ -80,6 +80,9 @@ pub struct Region {
     slow: AtomicU32,
     /// compact_stall at `init` (u64::MAX: unreadable).
     stall0: core::sync::atomic::AtomicU64,
+    /// Limited mode (`set_huge_limit`): fresh bytes that may still be huge pages, and its switch.
+    limit: AtomicUsize,
+    guard: AtomicU32,
 }
 
 unsafe impl Sync for Region {}
@@ -113,6 +116,31 @@ impl Region {
             stalled: AtomicU32::new(0),
             slow: AtomicU32::new(0),
             stall0: core::sync::atomic::AtomicU64::new(u64::MAX),
+            limit: AtomicUsize::new(usize::MAX),
+            guard: AtomicU32::new(0),
+        }
+    }
+
+    /// Limited mode, for a machine whose free 2 MB blocks do not cover the whole peak: fresh
+    /// memory is huge only for the next `bytes`, then 4 KB pages; and every fresh take faults its
+    /// first 2 MB at once, timed, with `prefault`'s stall guard (a slow fault while the kernel's
+    /// compact_stall counter rose ends huge pages for the region).
+    pub fn set_huge_limit(&self, bytes: usize) {
+        self.limit.store(bytes, Relaxed);
+        self.guard.store(1, Release);
+    }
+
+    #[cold]
+    fn limited_fresh(&self, p: usize, bytes: usize) {
+        if self.limit.fetch_update(Relaxed, Relaxed, |b| b.checked_sub(bytes)).is_err() {
+            self.stop_huge();
+            return;
+        }
+        let t0 = sys::mono_ns();
+        // Fresh memory is zero: writing a zero changes nothing the taker can see.
+        unsafe { core::ptr::write_volatile(p as *mut u8, 0) };
+        if sys::mono_ns() - t0 > STALL_NS && self.slow_fault_is_compaction() {
+            self.stop_huge();
         }
     }
 
@@ -202,8 +230,12 @@ impl Region {
                 if off + bytes > self.cap() {
                     crate::fail::fail(b"arena: region exhausted");
                 }
-                if self.huge.load(Relaxed) == 1 && self.stalled.load(Relaxed) == 0 && !take_huge(bytes) {
-                    self.stop_huge();
+                if self.huge.load(Relaxed) == 1 && self.stalled.load(Relaxed) == 0 {
+                    if !take_huge(bytes) {
+                        self.stop_huge();
+                    } else if self.guard.load(Relaxed) != 0 {
+                        self.limited_fresh(base + off, bytes);
+                    }
                 }
                 base + off
             }
