@@ -71,6 +71,8 @@ pub enum Error {
 pub struct State {
     /// The direct table, 2^k entries: the user's id (home slot of ru = its top k bits); 0 = empty.
     tab: Vec<u32>,
+    /// The table is all empty: the last pass cleared its own slots (while it was still in cache).
+    clean: bool,
     /// Per user id (dense, in insertion order; id 0 is the spare user of the clicks that hit no
     /// user, its key EMPTY), three 8-byte arrays, each the only one its pass touches at random:
     /// `ua`: key | cnt << 32 (a wide user's key is EMPTY), after the layout the event cursor;
@@ -79,6 +81,8 @@ pub struct State {
     ua: Vec<u64>,
     ub: Vec<u64>,
     uc: Vec<u64>,
+    /// Per SHORT user id: its slot in the direct table (written at insert, read once to empty it).
+    us: Vec<u32>,
     /// The next free id.
     next: usize,
     nwide: u32,
@@ -124,9 +128,11 @@ impl State {
     pub fn new() -> Self {
         State {
             tab: Vec::new(),
+            clean: false,
             ua: Vec::new(),
             ub: Vec::new(),
             uc: Vec::new(),
+            us: Vec::new(),
             next: 1,
             nwide: 0,
             wt: Vec::new(),
@@ -154,19 +160,35 @@ impl State {
         self.wpos.clear();
         self.nwide = 0;
         let ds = 1usize << k;
-        // The whole direct table in one sequential fill (4 bytes a slot): no per-user clearing
-        // of sparse arrays, and the table is in cache for the inserts that follow.
-        self.tab.clear();
-        self.tab.reserve(ds);
-        // SAFETY: ds entries reserved; zero bytes are a valid u32.
-        unsafe {
-            core::ptr::write_bytes(self.tab.as_mut_ptr(), 0, ds);
-            self.tab.set_len(ds);
+        // The direct table is empty already when the last pass ran to its end (it clears the
+        // slots it used right after its last lookup, while they are in cache: a fill here runs
+        // over lines long evicted, about 21 cycles a line). It keeps its largest size (a pass
+        // uses the first 2^k slots), so a change of k costs nothing; a pass that stopped early
+        // leaves it to be filled whole.
+        // A larger table is taken new and zeroed (fresh memory is zero without a touch: only
+        // the lines a pass uses are ever faulted in), never grown by a copy.
+        if self.tab.len() < ds {
+            self.tab = vec![0u32; ds];
+        } else if !self.clean {
+            self.tab.fill(0);
         }
+        self.clean = false;
+        // Room for `cap` ids, not filled: an id's words are written when it is taken (ua and
+        // uc by every insert, ub by the links and by the layout before pass 2 reads it), and a
+        // fill would touch every page of arrays whose front alone is used.
+        // Taken new with a quarter to spare when too small (nothing is kept across passes, so
+        // no copy, which would touch all of the old and the new arrays).
         if self.ua.len() < cap {
-            self.ua.resize(cap, 0);
-            self.ub.resize(cap, 0);
-            self.uc.resize(cap, 0);
+            let n = cap + cap / 4;
+            for v in [&mut self.ua, &mut self.ub, &mut self.uc] {
+                *v = Vec::with_capacity(n);
+                // SAFETY: capacity n; u64 has no invalid bit pattern and no id's word is read
+                // before it is written.
+                unsafe { v.set_len(n) };
+            }
+            self.us = Vec::with_capacity(n);
+            // SAFETY: as above (us[id] is written by the insert of a SHORT id).
+            unsafe { self.us.set_len(n) };
         }
         self.ua[0] = u64::from(EMPTY);
         self.ub[0] = 0;
@@ -223,7 +245,7 @@ impl State {
 }
 
 /// The hot loop's state: raw pointers into tables reserved for the whole pass (nothing
-/// reallocates them during it). The first six fields are read by the asm at fixed offsets.
+/// reallocates them during it). The first seven fields are read by the asm at fixed offsets.
 #[repr(C)]
 struct Hot {
     /// The next free user id (advances).
@@ -236,6 +258,8 @@ struct Hot {
     /// The next purchase's payload and user id (advance).
     bval: *mut u64, // 32
     bidx: *mut u32, // 40
+    /// us: the slot per id.
+    us: *mut u32,   // 48
     tab: *mut u32,
     /// ua: key | cnt << 32 per id.
     ua: *mut u64,
@@ -320,6 +344,8 @@ unsafe fn hot(c: &[u64], i: usize, h: &mut Hot) -> Stop {
             "mov dword ptr [{tab} + 4*{s}], {id:e}",
             "mov {ru:e}, {ru:e}",
             "mov qword ptr [{ua} + 8*{id}], {ru}",
+            "mov {ru}, qword ptr [{ctx} + 48]",
+            "mov dword ptr [{ru} + 4*{id}], {s:e}",
             "mov {s}, qword ptr [{ctx} + 16]",
             "mov qword ptr [{s} + 8*{id}], 0",
             "lea {s}, [{id} + 1]",
@@ -401,6 +427,7 @@ unsafe fn hot(c: &[u64], mut i: usize, h: &mut Hot) -> Stop {
                     *h.tab.add(s) = id as u32;
                     *h.ua.add(id) = u64::from(ru);
                     *h.uc.add(id) = 0;
+                    *h.us.add(id) = s as u32;
                     h.next += 1;
                     if h.next > h.lim {
                         return Stop::Full;
@@ -551,7 +578,7 @@ pub fn part<O: Out>(inp: &In, st: &mut State, out: &mut O) -> Result<(), Error> 
     // users: the linked ones plus about one per 8 survivor words (about 13 events a user at
     // p20v5); load at most 1/2, or the pass runs again with a table twice the size
     let est = inp.link_ru.len() + n_surv / 8 + 64;
-    let mut k = (2 * est).next_power_of_two().trailing_zeros().clamp(8, 22).min(inp.rbits);
+    let mut k = (4 * est).next_power_of_two().trailing_zeros().clamp(8, 22).min(inp.rbits);
     // wide slots: one per wide USER (clicks only look up). Linked ones are known; the others are
     // estimated at 1 per 24 words of the wide stream (about 13 events a user; p20v5 has about 88
     // wide users a partition), and a pass that runs out runs again with twice as many.
@@ -600,7 +627,7 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     let rbits = inp.rbits;
     let own = u64::from(q) << rbits;
     let tab = st.tab.as_mut_ptr();
-    let (ua, ub, uc) = (st.ua.as_mut_ptr(), st.ub.as_mut_ptr(), st.uc.as_mut_ptr());
+    let (ua, ub, uc, us) = (st.ua.as_mut_ptr(), st.ub.as_mut_ptr(), st.uc.as_mut_ptr(), st.us.as_mut_ptr());
     // links first: their person keys (a representative's is its own key)
     let mut next = 1usize;
     for (&ru, &pk) in inp.link_ru.iter().zip(inp.link_pk) {
@@ -618,6 +645,7 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
                     *ua.add(next) = u64::from(ru);
                     *ub.add(next) = pk;
                     *uc.add(next) = 0;
+                    *us.add(next) = s as u32;
                     next += 1;
                     break;
                 }
@@ -659,6 +687,7 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         mask: mask as u64,
         bval: st.bval.as_mut_ptr(),
         bidx: st.bidx.as_mut_ptr(),
+        us,
         tab,
         ua,
         idx: st.idx.as_mut_ptr(),
@@ -810,6 +839,15 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         // SAFETY: entries 0..j written above.
         unsafe { st.cidx.set_len(j) };
     }
+    // The direct table's last lookup is done: every SHORT user's slot (kept at its insert) is
+    // emptied now, while the table is in cache, so the next partition starts without a fill.
+    for (lo, hi) in [(1, a_end), (b_end, c_end)] {
+        for id in lo..hi {
+            // SAFETY: id < hi <= the ids taken; us[id] is the slot its insert wrote, < 2^k.
+            unsafe { *tab.add(*us.add(id) as usize) = 0 };
+        }
+    }
+    st.clean = true;
     // the clicks of no user here: counted on user 0
     let nmiss = st.uc[0] as u32 as usize;
     // layout: blocks in the homes, headers, cursors. The users are walked in id order (dense).
@@ -817,6 +855,8 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     // back to back. Anything unusual (a count past 2^24, a home out of range, blocks over one
     // chunk) and every wide user go to `layout_one`, the general path.
     let nb_homes = 40 - rbits;
+    let mut scratch = [0u64; 4];
+    let sp = scratch.as_mut_ptr();
     for (lo, hi, linked) in [(1, a_end, true), (b_end, c_end, false)] {
         for id in lo..hi {
             // SAFETY: id < hi <= the ids taken; a block has the words asked for.
@@ -838,23 +878,28 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
                         let p = out.block(home, pw + cw);
                         // every line of the two blocks is wanted for writing by pass 2: asked
                         // for here, it arrives while the layout goes on (a store that misses in
-                        // pass 2 waits in the store buffer instead)
-                        want(p, pw + cw);
+                        // pass 2 waits in the store buffer instead). Five lines without a loop
+                        // (a block of 32 words or less, whatever its start in a line); the loop's
+                        // exit was a mispredict per user.
+                        want5(p);
+                        if pw + cw > 32 {
+                            want(p.add(32), pw + cw - 32);
+                        }
                         let wide = pk >> 63;
-                        if ne != 0 {
-                            *p = ne as u64 | (nb as u64) << 24 | wide << 63;
-                            *p.add(1) = pk;
-                            // the odd event's pad (for an even count pass 2 overwrites both halves)
-                            *p.add(1 + ew) = 0xFFFF_FFFF_0000_0000;
-                            *ua.add(id) = p.add(2) as u64;
-                            *ub.add(id) = p.add(2 + ew) as u64;
-                        }
-                        if nc != 0 {
-                            let cb = p.add(pw);
-                            *cb = nc as u64 | 1 << 62 | wide << 63;
-                            *cb.add(1) = pk;
-                            *uc.add(id) = cb.add(2) as u64;
-                        }
+                        // No branch on "has events" or "has clicks" (a coin toss per user): a
+                        // header that is not there is written to the scratch words instead, and
+                        // its user's cursor (never read) points there.
+                        let pb = pick(ne != 0, p, sp);
+                        *pb = ne as u64 | (nb as u64) << 24 | wide << 63;
+                        *pb.add(1) = pk;
+                        // the odd event's pad (for an even count pass 2 overwrites both halves)
+                        *pb.add(1 + ew) = 0xFFFF_FFFF_0000_0000;
+                        *ua.add(id) = pb.add(2) as u64;
+                        *ub.add(id) = pb.add(2 + ew) as u64;
+                        let cb = pick(nc != 0, p.add(pw), sp);
+                        *cb = nc as u64 | 1 << 62 | wide << 63;
+                        *cb.add(1) = pk;
+                        *uc.add(id) = cb.add(2) as u64;
                     }
                 }
             }
@@ -939,6 +984,34 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     }
     split(st, out);
     Ok(Pass::Done)
+}
+
+/// a if c, else b, without a branch.
+#[inline(always)]
+fn pick(c: bool, a: *mut u64, b: *mut u64) -> *mut u64 {
+    let m = (c as usize).wrapping_neg();
+    ((a as usize & m) | (b as usize & !m)) as *mut u64
+}
+
+/// Asks for the five cache lines from the one that holds p, for writing.
+#[inline(always)]
+fn want5(p: *mut u64) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch reads and writes nothing, mapped or not (prefetchw is a no-op where
+    // unsupported).
+    unsafe {
+        core::arch::asm!(
+            "prefetchw byte ptr [{0}]",
+            "prefetchw byte ptr [{0} + 64]",
+            "prefetchw byte ptr [{0} + 128]",
+            "prefetchw byte ptr [{0} + 192]",
+            "prefetchw byte ptr [{0} + 256]",
+            in(reg) p,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
 }
 
 /// Asks for the cache lines of the n words at p, for writing.

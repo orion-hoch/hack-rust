@@ -435,8 +435,24 @@ unsafe impl Sync for LargeLists {}
 static LARGE: LargeLists = LargeLists(UnsafeCell::new([null_mut(); NBUCKET]));
 static LARGE_LOCK: SpinLock = SpinLock::new();
 
+/// Once the engine's region is reserved, large blocks are contiguous takes from it (whole 2 MiB
+/// chunks) and go back to its free list: a freed block then serves the block classes' next
+/// chunks and any later large block of any size, instead of waiting for a request of its own
+/// power of two while fresh memory is faulted beside it (measured at f60v5: 200 MiB of freed link
+/// arrays idle from the middle of the parse on, and 17 fresh mappings in the person stage).
+/// Blocks mapped before that stay as they are; `in_region` tells the two apart by address.
+#[inline]
+fn in_region(p: *mut u8) -> bool {
+    let r = &crate::v3::mem::REG;
+    let b = r.base();
+    b != 0 && (p as usize).wrapping_sub(b) < r.cap()
+}
+
 /// A large block for `size` bytes, and whether it is fresh (all zero).
 fn large_alloc(size: usize) -> (*mut u8, bool) {
+    if crate::v3::mem::ready() {
+        return crate::v3::mem::REG.take_tell(size);
+    }
     let b = bucket(size);
     if STATS {
         use core::sync::atomic::Ordering::Relaxed;
@@ -470,6 +486,13 @@ fn large_alloc(size: usize) -> (*mut u8, bool) {
 }
 
 fn large_free(p: *mut u8, size: usize) {
+    if in_region(p) {
+        // The region's free list holds 1,024 ranges; past 900 the block is kept out of it (lost).
+        if rt::arena::free_ranges(&crate::v3::mem::REG) < 900 {
+            crate::v3::mem::REG.give(p, size);
+        }
+        return;
+    }
     let b = bucket(size);
     if STATS {
         use core::sync::atomic::Ordering::Relaxed;
@@ -497,6 +520,10 @@ fn large_free(p: *mut u8, size: usize) {
 /// Grows or shrinks a large block: in place within its bucket, else by mremap (pages move, no
 /// copy). Null if the kernel refuses.
 fn large_realloc(p: *mut u8, old: usize, new: usize) -> *mut u8 {
+    if in_region(p) {
+        // In place within its 2 MiB chunks, else the caller allocates, copies and frees.
+        return if old.div_ceil(HUGE) == new.div_ceil(HUGE) { p } else { null_mut() };
+    }
     let (bo, bn) = (bucket(old), bucket(new));
     if bo == bn {
         return p;

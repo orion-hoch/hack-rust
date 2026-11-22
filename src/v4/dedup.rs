@@ -23,13 +23,13 @@
 use super::keys::long_hash;
 use super::sink::{EventBins, RARE_BIG, RARE_EXT};
 use super::{Cx, Stage};
-use crate::v3::dedup::Out;
+use crate::v3::dedup::{FILL0, Out};
 
 const M23: u64 = (1 << 23) - 1;
 const M32: u64 = 0xffff_ffff;
 const TS: u64 = 0x7fff_ffff;
 /// The pre-filter's multiplier (unrelated to mix40's MIX_C, as RECORDS-V4 section 1 requires).
-const FH: u64 = 0x9e37_79b9_7f4a_7c15;
+const FH: u32 = 0x9e37_79b1;
 /// The exact table's multiplier (another one again: the table holds keys whose FH bits collided).
 const TH: u64 = 0xc2b2_ae3d_27d4_eb4f;
 
@@ -126,6 +126,8 @@ pub struct Tables {
     /// Addresses of the rare records that are the only copy and alive: SHORT users, wide users.
     rs: Vec<usize>,
     rw: Vec<usize>,
+    /// The rare records' key products, in walk order (pass 1 writes them, pass 2 reads them).
+    rh: Vec<u32>,
     cd: Vec<Cd>,
     slots: Vec<u32>,
 }
@@ -168,7 +170,7 @@ impl Out2 {
         unsafe {
             let f = fill.add(q);
             let line = stage.add(q * 8);
-            let mut n = *f as usize;
+            let mut n = (*f & 7) as usize;
             *line.add(n) = word;
             n += 1;
             if n == 8 {
@@ -181,7 +183,7 @@ impl Out2 {
                 self.short.flush_line(q);
                 n = 0;
             }
-            *f = n as u32;
+            *f = FILL0 + n as u32;
         }
     }
 
@@ -221,7 +223,7 @@ fn put(o: &mut Out, q: usize, words: &[u64]) {
     // SAFETY: q is below the partition count; the fill count stays below 8 (see raw_parts).
     unsafe {
         let f = fill.add(q);
-        let mut n = *f as usize;
+        let mut n = (*f & 7) as usize;
         for &w in words {
             *stage.add(q * 8 + n) = w;
             n += 1;
@@ -230,88 +232,126 @@ fn put(o: &mut Out, q: usize, words: &[u64]) {
                 n = 0;
             }
         }
-        *f = n as u32;
+        *f = FILL0 + n as u32;
     }
 }
 
-/// The pre-filter: pairs of 32-bit words [seen, again], 2^(64 - wsh) of them. A key hash's
-/// product with FH names its pair by its top 64 - wsh bits and its bit by its low five (the low
+/// The pre-filter: pairs of 32-bit words [seen, again], 2^(32 - wsh) of them. A key's 32-bit
+/// product with FH names its pair by its top 32 - wsh bits and its bit by its low five (the low
 /// bits of an odd multiple are a permutation of the key's low bits; the top bits mix all of
 /// them): one shift for the pair, and the bit number is the product as it is (a shift count
-/// is taken modulo 32).
+/// is taken modulo 32). A plain unit's key is 32 bits (one multiply by an immediate, straight
+/// from the unit); a rare record's key hash is folded to 32 bits first (`product`), which
+/// leaves a SHORT key as it is, so both lanes name the same bit for the same key.
 type Pair = [u32; 2];
 
-/// Sets the [seen, again] pair of key hash `hk`.
+/// The product of key hash `hk` (see `Pair`).
+#[inline(always)]
+fn product(hk: u64) -> u32 {
+    ((hk ^ (hk >> 32)) as u32).wrapping_mul(FH)
+}
+
+/// Sets the [seen, again] pair of product `k`.
 ///
 /// # Safety
-/// `fp` holds at least `2^(64 - wsh)` pairs.
+/// `fp` holds at least `2^(32 - wsh)` pairs.
 #[inline(always)]
-unsafe fn mark(fp: *mut Pair, wsh: u32, hk: u64) {
-    let k = hk.wrapping_mul(FH);
-    // SAFETY: k >> wsh < 2^(64 - wsh) is inside (caller).
+unsafe fn mark(fp: *mut Pair, wsh: u32, k: u32) {
+    // SAFETY: k >> wsh < 2^(32 - wsh) is inside (caller).
     unsafe {
         let wd = fp.add((k >> wsh) as usize);
-        let bit = 1u32 << (k as u32 & 31);
+        let bit = 1u32 << (k & 31);
         (*wd)[1] |= (*wd)[0] & bit;
         (*wd)[0] |= bit;
     }
 }
 
-/// The "again" bit (0 or 1) of key hash `hk`.
+/// The "again" bit (0 or 1) of product `k`.
 ///
 /// # Safety
 /// As `mark`.
 #[inline(always)]
-unsafe fn again(fp: *const Pair, wsh: u32, hk: u64) -> u64 {
-    let k = hk.wrapping_mul(FH);
+unsafe fn again(fp: *const Pair, wsh: u32, k: u32) -> u64 {
     // SAFETY: as in mark.
-    unsafe { u64::from(((*fp.add((k >> wsh) as usize))[1] >> (k as u32 & 31)) & 1) }
+    unsafe { u64::from(((*fp.add((k >> wsh) as usize))[1] >> (k & 31)) & 1) }
 }
 
-/// Pass 1 over plain units: one load, a multiply, a bit pair.
+/// Asks for the cache line at `p` (a hint: never faults, whatever the address).
+#[inline(always)]
+fn fetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p as *const i8)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+/// Pass 1 over plain units: one load, a multiply, a bit pair. This pass is the first to read
+/// the partition's chunks since the sink wrote them (they are out of every cache), and each
+/// chunk is 8 KB somewhere else, so the hardware's stream detection starts again on every
+/// one: each line of units (4) asks for the same line of the NEXT chunk, at `next`.
 ///
 /// # Safety
 /// As `mark`.
 #[inline(never)]
-unsafe fn mark_plain(c: &[Unit], fp: *mut Pair, wsh: u32) {
-    for u in c {
+unsafe fn mark_plain(c: &[Unit], next: *const Unit, fp: *mut Pair, wsh: u32) {
+    let mut q = c.chunks_exact(4);
+    let mut nx = next;
+    for g in &mut q {
+        fetch(nx);
+        nx = nx.wrapping_add(4);
+        for u in g {
+            // SAFETY: the caller's bound.
+            unsafe { mark(fp, wsh, (u[0] as u32).wrapping_mul(FH)) };
+        }
+    }
+    for u in q.remainder() {
         // SAFETY: the caller's bound.
-        unsafe { mark(fp, wsh, u[0] & M32) };
+        unsafe { mark(fp, wsh, (u[0] as u32).wrapping_mul(FH)) };
     }
 }
 
-/// Pass 1 over rare records.
+/// Pass 1 over rare records. Each record's key product (its pair and bit, see `mark`) is left
+/// at `rh`, one per record in walk order, so pass 2 reads it back instead of decoding the key
+/// and multiplying again. Returns the next `rh`.
 ///
 /// # Safety
-/// As `mark`.
+/// As `mark`; `rh` has room for one product per record of `c`.
 #[inline(never)]
-unsafe fn mark_rare(c: &[Unit], fp: *mut Pair, wsh: u32) {
+unsafe fn mark_rare(c: &[Unit], next: *const Unit, fp: *mut Pair, wsh: u32, mut rh: *mut u32) -> *mut u32 {
+    // As in `mark_plain`: the next chunk's lines are asked for while this one is walked (16
+    // records are 512 to 768 bytes; 12 lines a batch cover them).
+    let mut nx = next;
     let mut u = c.as_ptr();
     // SAFETY: one past the end of `c`; records never cross a chunk, so the walk ends there.
     let end = unsafe { u.add(c.len()) };
     // Walk 16 records ahead of the bit updates, prefetching each one's bitmap word.
-    let mut ks = [0u64; 16];
     while u < end {
         let mut n = 0;
+        for l in 0..12 {
+            fetch(nx.wrapping_add(4 * l));
+        }
+        nx = nx.wrapping_add(48);
         // SAFETY: u is a record of this chunk; the caller's bound.
         unsafe {
             while u < end && n < 16 {
                 let (a, b, k) = rkey(u);
-                let h = key_hash(a, b, k).wrapping_mul(FH);
-                ks[n] = h;
+                let h = product(key_hash(a, b, k));
+                *rh.add(n) = h;
                 #[cfg(target_arch = "x86_64")]
                 core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(fp.add((h >> wsh) as usize) as *const i8);
                 n += 1;
                 u = rnext(u);
             }
-            for &k in &ks[..n] {
-                let wd = fp.add((k >> wsh) as usize);
-                let bit = 1u32 << (k as u32 & 31);
-                (*wd)[1] |= (*wd)[0] & bit;
-                (*wd)[0] |= bit;
+            for i in 0..n {
+                mark(fp, wsh, *rh.add(i));
             }
+            rh = rh.add(n);
         }
     }
+    rh
 }
 
 /// x below 2^n (BMI2 bzhi where the target has it).
@@ -338,14 +378,14 @@ unsafe fn stage_plain(stage: *mut u64, fill: *mut u32, short: &mut Out, rsh: u32
     // below 8 (see `Out::raw_parts`), so the slot is inside q's line.
     unsafe {
         let f = fill.add(q);
-        let n = *f as usize;
+        let n = (*f & 7) as usize;
         *stage.add(q * 8 + n) = word;
         let n = n + keep as usize;
         if n == 8 {
-            *f = 0;
+            *f = FILL0;
             short.flush_line(q);
         } else {
-            *f = n as u32;
+            *f = FILL0 + n as u32;
         }
     }
 }
@@ -361,13 +401,24 @@ unsafe fn emit_plain(c: &[Unit], fp: *const Pair, wsh: u32, out: &mut Out2, cw: 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
     // SAFETY: the caller's contract; the target has the instructions the loops use.
     unsafe {
-        match out.b2 {
-            8 => return plain_b8(c, fp, wsh, out, cw),
-            9 => return plain_b9(c, fp, wsh, out, cw),
-            10 => return plain_b10(c, fp, wsh, out, cw),
-            11 => return plain_b11(c, fp, wsh, out, cw),
-            12 => return plain_b12(c, fp, wsh, out, cw),
-            13 => return plain_b13(c, fp, wsh, out, cw),
+        // pext and pdep are one micro-operation each on every CPU with AVX-512 (Intel from
+        // Skylake-X, AMD from Zen 4) and microcode of up to hundreds of cycles on AMD before
+        // Zen 3 (measured on Zen 2: the whole run 14.18G -> 18.80G cycles with one pdep a
+        // unit). The detection is cached by std: one load per chunk.
+        let fast = std::arch::is_x86_feature_detected!("avx512f");
+        match (out.b2, fast) {
+            (8, true) => return plain_b8x(c, fp, wsh, out, cw),
+            (9, true) => return plain_b9x(c, fp, wsh, out, cw),
+            (10, true) => return plain_b10x(c, fp, wsh, out, cw),
+            (11, true) => return plain_b11x(c, fp, wsh, out, cw),
+            (12, true) => return plain_b12x(c, fp, wsh, out, cw),
+            (13, true) => return plain_b13x(c, fp, wsh, out, cw),
+            (8, false) => return plain_b8(c, fp, wsh, out, cw),
+            (9, false) => return plain_b9(c, fp, wsh, out, cw),
+            (10, false) => return plain_b10(c, fp, wsh, out, cw),
+            (11, false) => return plain_b11(c, fp, wsh, out, cw),
+            (12, false) => return plain_b12(c, fp, wsh, out, cw),
+            (13, false) => return plain_b13(c, fp, wsh, out, cw),
             _ => {}
         }
     }
@@ -400,7 +451,7 @@ unsafe fn emit_plain_any(c: &[Unit], fp: *const Pair, wsh: u32, out: &mut Out2, 
             // 2^40) and the fill count below 8 (see `Out::raw_parts`).
             unsafe {
                 let (w, w1) = ((*u)[0], (*u)[1]);
-                let ag = again(fp, wsh, w & M32);
+                let ag = again(fp, wsh, (w as u32).wrapping_mul(FH));
                 *(cw as *mut *const Unit) = u;
                 cw = cw.add(ag as usize);
                 // The only copy, alive (surv is bit 62; bit 63 is clear in this lane).
@@ -408,16 +459,16 @@ unsafe fn emit_plain_any(c: &[Unit], fp: *const Pair, wsh: u32, out: &mut Out2, 
                 let q = ((((w >> 55) & 0x7f) << sa) | (w1 >> sb)) as usize;
                 let word = (w1 << 1) & wm;
                 let f = fill.add(q);
-                let n = *f as usize;
+                let n = (*f & 7) as usize;
                 *stage.add(q * 8 + n) = word;
                 let n = n + keep as usize;
                 u = u.add(1);
                 if n == 8 {
-                    *f = 0;
+                    *f = FILL0;
                     full = q;
                     break;
                 }
-                *f = n as u32;
+                *f = FILL0 + n as u32;
             }
         }
         if full == usize::MAX {
@@ -429,20 +480,25 @@ unsafe fn emit_plain_any(c: &[Unit], fp: *const Pair, wsh: u32, out: &mut Out2, 
 }
 
 /// `emit_plain_any` for one b2, in assembly (the compiler's version of this loop spends 39
-/// instructions a unit and keeps three of its values on the stack; this one spends 26 with
-/// everything in registers, and a full line is written out inside the loop). `$sa` = b2 - 7:
+/// instructions a unit and keeps three of its values on the stack; this one spends 22, or 26
+/// without pext and pdep, with everything in registers, and a full line is written out inside
+/// the loop). `$sa` = b2 - 7; `$qw` are the instructions that turn w (in a) into q and w1 (in
+/// c) into the output word, `$ops` their constants (see `plain_loops`):
 /// - the pair and the bit of the unit's key from one multiply (as `again`);
-/// - q, the top b2 bits of mu, is one double shift: mu's top 7 bits (w bits 55-61, by pext)
-///   shifted left by b2 - 7 with the top b2 - 7 bits of w1 coming in below them;
-/// - the output word is w1 << (b2 - 7) >> (b2 - 8): w1 << 1 with the bits above ru cleared;
+/// - q, the top b2 bits of mu: mu's top 7 bits (w bits 55-61) shifted left by b2 - 7 with the
+///   top b2 - 7 bits of w1 below them (pext and one double shift; or two shifts, a mask and an
+///   or);
+/// - the output word is w1 << 1 without the bits above ru (pdep on bits 1 to 31 + rsh; or
+///   w1 << (b2 - 7) >> (b2 - 8));
 /// - the word goes to slot 8 q + n of the staging lines and the count is kept when the unit is
-///   the only copy and alive (`andn` of the again bit and bit 62);
-/// - the eighth word of a line: the count goes back to 0 and the line is copied to its chunk
+///   the only copy and alive (`andn` of the again bit and bit 62); counts are stored minus 8
+///   (`FILL0`), so the add that keeps the eighth word sets the zero flag;
+/// - the eighth word of a line: the count goes back to -8 and the line is copied to its chunk
 ///   with two 32-byte non-temporal stores, as `Out::flush_line` does; when the chunk is at its
 ///   end the loop leaves with q and `flush_line` opens the next one.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
 macro_rules! plain_loop {
-    ($name:ident, $sa:expr) => {
+    ($name:ident, $sa:expr, [$($qw:literal),*], [$($ops:tt)*]) => {
         /// # Safety
         /// As `emit_plain`, for this b2.
         #[inline(never)]
@@ -450,15 +506,16 @@ macro_rules! plain_loop {
             debug_assert!(out.b2 == $sa + 7);
             let (stage, fill, _) = out.short.raw_parts();
             let (cur, end_of) = out.short.raw_fronts();
-            // What the loop reads from memory: the multiplier, pext's mask, the chunk fronts.
-            let cx: [u64; 4] = [FH, 0x7f << 55, cur as u64, end_of as u64];
+            // What the loop reads from memory: (free), pext's mask, the chunk fronts, and
+            // pdep's mask: the output word's bits 1 to 31 + rsh, where rsh = 33 - $sa.
+            let cx: [u64; 5] = [0, 0x7f << 55, cur as u64, end_of as u64, (low_bits(u64::MAX, 33 - $sa) << 32) | 0xffff_fffe];
             let mut u = c.as_ptr();
             // SAFETY: one past the end of `c`.
             let end = unsafe { u.add(c.len()) };
             loop {
                 let q: usize;
                 // SAFETY: as `emit_plain_any`: u stays below end, the pair index below
-                // 2^(64 - wsh), q below 2^b2, the count below 8; a line is copied only to a
+                // 2^(32 - wsh), q below 2^b2, the count below 8; a line is copied only to a
                 // chunk line below its chunk's end (lines and chunks are 64-byte aligned).
                 unsafe {
                     core::arch::asm!(
@@ -468,34 +525,28 @@ macro_rules! plain_loop {
                         "2:",
                         "mov {a}, qword ptr [{u}]",
                         "mov {c}, qword ptr [{u} + 8]",
-                        "mov {b:e}, {a:e}",
-                        "imul {b}, qword ptr [{cx}]",
-                        "shrx {d}, {b}, {wsh}",
+                        "imul {b:e}, {a:e}, {fh}",
+                        "shrx {d:e}, {b:e}, {wsh:e}",
                         "shrx {b:e}, dword ptr [{fp} + {d}*8 + 4], {b:e}",
                         "and {b:e}, 1",
                         "mov qword ptr [{cw}], {u}",
                         "lea {cw}, [{cw} + {b}*8]",
-                        "mov {d}, {a}",
-                        "shr {d}, 62",
+                        "shrx {d}, {a}, {s62}",
                         "andn {b:e}, {b:e}, {d:e}",
-                        "pext {a}, {a}, qword ptr [{cx} + 8]",
-                        "shld {a}, {c}, {sa}",
-                        "shl {c}, {sa}",
-                        "shr {c}, {sr}",
+                        $($qw,)*
                         "add {u}, 16",
-                        "mov {d:e}, dword ptr [{fill} + {a}*4]",
+                        "movsxd {d}, dword ptr [{fill} + {a}*4]",
                         "add {b:e}, {d:e}",
                         "lea {d}, [{d} + {a}*8]",
-                        "mov qword ptr [{stage} + {d}*8], {c}",
-                        "cmp {b:e}, 8",
-                        "je 3f",
+                        "mov qword ptr [{stage} + {d}*8 + 64], {c}",
+                        "jz 3f",
                         "mov dword ptr [{fill} + {a}*4], {b:e}",
                         "cmp {u}, {end}",
                         "jne 2b",
                         "jmp 6f",
                         // Line q is full.
                         "3:",
-                        "mov dword ptr [{fill} + {a}*4], 0",
+                        "mov dword ptr [{fill} + {a}*4], -8",
                         "mov {d}, qword ptr [{cx} + 16]",
                         "mov {b}, qword ptr [{d} + {a}*8]",
                         "mov {c}, qword ptr [{cx} + 24]",
@@ -526,8 +577,9 @@ macro_rules! plain_loop {
                         b = out(reg) _,
                         c = out(reg) _,
                         d = out(reg) _,
-                        sa = const $sa,
-                        sr = const $sa - 1,
+                        s62 = in(reg) 62u64,
+                        fh = const FH as i32,
+                        $($ops)*
                         out("ymm0") _,
                         out("ymm1") _,
                         options(nostack),
@@ -543,28 +595,50 @@ macro_rules! plain_loop {
     };
 }
 
+/// The two loops of one b2: `$fast` with pext and pdep (chosen when AVX-512 is detected: see
+/// `emit_plain`), `$slow` with plain shifts for every other CPU.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
-plain_loop!(plain_b8, 1);
+macro_rules! plain_loops {
+    ($fast:ident, $slow:ident, $sa:expr) => {
+        plain_loop!(
+            $fast,
+            $sa,
+            ["pext {a}, {a}, qword ptr [{cx} + 8]", "shld {a}, {c}, {sa}", "pdep {c}, {c}, qword ptr [{cx} + 32]"],
+            [sa = const $sa,]
+        );
+        plain_loop!(
+            $slow,
+            $sa,
+            ["shr {a}, {s55}", "and {a}, {m7}", "mov {d}, {c}", "shr {d}, {sb}", "or {a}, {d}", "shl {c}, {sa}", "shr {c}, {sr}"],
+            [s55 = const 55 - $sa, m7 = const 0x7f << $sa, sb = const 64 - $sa, sa = const $sa, sr = const $sa - 1,]
+        );
+    };
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
-plain_loop!(plain_b9, 2);
+plain_loops!(plain_b8x, plain_b8, 1);
 #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
-plain_loop!(plain_b10, 3);
+plain_loops!(plain_b9x, plain_b9, 2);
 #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
-plain_loop!(plain_b11, 4);
+plain_loops!(plain_b10x, plain_b10, 3);
 #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
-plain_loop!(plain_b12, 5);
+plain_loops!(plain_b11x, plain_b11, 4);
 #[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
-plain_loop!(plain_b13, 6);
+plain_loops!(plain_b12x, plain_b12, 5);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx", target_feature = "bmi1", target_feature = "bmi2"))]
+plain_loops!(plain_b13x, plain_b13, 6);
 
 /// Pass 2 over rare records, without a data-dependent branch but the record size: each record's
 /// address goes to `cw` (kept when its bit collided), to `sw` (kept when it is the only copy,
-/// alive, with a SHORT user) and to `ww` (the same with a wide user). Returns the three next
+/// alive, with a SHORT user) and to `ww` (the same with a wide user). The record's key product
+/// is read from `rh`, where `mark_rare` left it. Returns the next `rh` and the three next
 /// pointers.
 ///
 /// # Safety
-/// As `mark`; each pointer has room for `c.len() / 2` addresses.
+/// As `mark`; each pointer has room for `c.len() / 2` addresses; `rh` holds one product per
+/// record of `c`.
 #[inline(never)]
-unsafe fn sort_rare(c: &[Unit], fp: *const Pair, wsh: u32, mut cw: *mut usize, mut sw: *mut usize, mut ww: *mut usize) -> (*mut usize, *mut usize, *mut usize) {
+unsafe fn sort_rare(c: &[Unit], fp: *const Pair, wsh: u32, mut rh: *const u32, mut cw: *mut usize, mut sw: *mut usize, mut ww: *mut usize) -> (*const u32, *mut usize, *mut usize, *mut usize) {
     let mut u = c.as_ptr();
     // SAFETY: as in mark_rare.
     let end = unsafe { u.add(c.len()) };
@@ -572,8 +646,8 @@ unsafe fn sort_rare(c: &[Unit], fp: *const Pair, wsh: u32, mut cw: *mut usize, m
         // SAFETY: u is a record of this chunk; the caller's bounds.
         unsafe {
             let h = (*u)[0];
-            let (a, b, k) = rkey(u);
-            let ag = again(fp, wsh, key_hash(a, b, k));
+            let ag = again(fp, wsh, *rh);
+            rh = rh.add(1);
             let at = u as usize;
             let keep = (ag ^ 1) & (h >> 27) & 1;
             let wide = u64::from((h >> 25) & 3 != 0);
@@ -586,7 +660,7 @@ unsafe fn sort_rare(c: &[Unit], fp: *const Pair, wsh: u32, mut cw: *mut usize, m
             u = rnext(u);
         }
     }
-    (cw, sw, ww)
+    (rh, cw, sw, ww)
 }
 
 /// Sets `v`'s length to the addresses written up to `end`.
@@ -604,16 +678,24 @@ pub fn partition(plain: &[&[Unit]], rare: &[&[Unit]], t: &mut Tables, out: &mut 
     let np: usize = plain.iter().map(|c| c.len()).sum();
     let nr: usize = rare.iter().map(|c| c.len()).sum();
     let fbits = ((np + nr) * 16).next_power_of_two().clamp(1 << 12, 1 << 20).trailing_zeros();
-    let wsh = 64 - (fbits - 5);
+    let wsh = 32 - (fbits - 5);
     t.fm.clear();
     t.fm.resize(1 << (fbits - 5), [0; 2]);
     let fp = t.fm.as_mut_ptr();
-    // Pass 1: every key of both lanes. SAFETY (both passes): fm holds 2^(64 - wsh) pairs.
-    for c in plain {
-        unsafe { mark_plain(c, fp, wsh) };
+    // Pass 1: every key of both lanes. SAFETY (both passes): fm holds 2^(32 - wsh) pairs.
+    for (i, c) in plain.iter().enumerate() {
+        let next = plain.get(i + 1).unwrap_or(c).as_ptr();
+        unsafe { mark_plain(c, next, fp, wsh) };
     }
-    for c in rare {
-        unsafe { mark_rare(c, fp, wsh) };
+    // A rare record is at least 2 units: at most nr / 2 key products (written and read through
+    // the pointer only; the vector's length stays 0).
+    t.rh.clear();
+    t.rh.reserve(nr / 2);
+    let mut rh = t.rh.as_mut_ptr();
+    for (i, c) in rare.iter().enumerate() {
+        let next = rare.get(i + 1).unwrap_or(c).as_ptr();
+        // SAFETY: rh has room for nr / 2 products, and the chunks hold at most that many records.
+        rh = unsafe { mark_rare(c, next, fp, wsh, rh) };
     }
     // Pass 2: the only copies straight out; the others' addresses for the table.
     t.cp.clear();
@@ -631,10 +713,13 @@ pub fn partition(plain: &[&[Unit]], rare: &[&[Unit]], t: &mut Tables, out: &mut 
         v.reserve(nr / 2);
     }
     let (mut cw, mut sw, mut ww) = (t.cr.as_mut_ptr(), t.rs.as_mut_ptr(), t.rw.as_mut_ptr());
+    let mut rh = t.rh.as_ptr();
     for c in rare {
-        // SAFETY: each list has room for nr / 2 addresses, and the chunks hold at most that many records.
-        (cw, sw, ww) = unsafe { sort_rare(c, fp, wsh, cw, sw, ww) };
+        // SAFETY: each list has room for nr / 2 addresses, and the chunks hold at most that many
+        // records; rh holds the products of the same records in the same order (pass 1).
+        (rh, cw, sw, ww) = unsafe { sort_rare(c, fp, wsh, rh, cw, sw, ww) };
     }
+    let _ = rh;
     // SAFETY: as written by sort_rare.
     unsafe {
         written(&mut t.cr, cw);
@@ -654,12 +739,17 @@ pub fn partition(plain: &[&[Unit]], rare: &[&[Unit]], t: &mut Tables, out: &mut 
     // The exact table on the colliding records: key, ingest and address of each, plain first.
     let cd = &mut t.cd;
     cd.clear();
-    for &at in &t.cp {
-        // SAFETY: a plain unit's address in this partition's chunks.
-        let w = unsafe { (*(at as *const Unit))[0] };
-        cd.push(Cd { a: w & M32, b: 0, ki: ((w >> 32) & M23) * 1000 + ING_BIAS, at });
+    cd.reserve(t.cp.len() + t.cr.len());
+    let ncp = t.cp.len();
+    for (i, &at) in t.cp.iter().enumerate() {
+        // SAFETY: a plain unit's address in this partition's chunks; slot i < ncp is reserved.
+        unsafe {
+            let w = (*(at as *const Unit))[0];
+            cd.as_mut_ptr().add(i).write(Cd { a: w & M32, b: 0, ki: ((w >> 32) & M23) * 1000 + ING_BIAS, at });
+        }
     }
-    let ncp = cd.len();
+    // SAFETY: the first ncp entries were written above, within the reservation.
+    unsafe { cd.set_len(ncp) };
     for &at in &t.cr {
         // SAFETY: a rare record's address in this partition's chunks.
         let u = at as *const Unit;
@@ -681,28 +771,33 @@ pub fn partition(plain: &[&[Unit]], rare: &[&[Unit]], t: &mut Tables, out: &mut 
     slots.resize(1 << tbits, 0);
     let mask = (1usize << tbits) - 1;
     let dead = DEAD.as_ptr() as usize;
+    let (sp, cp) = (slots.as_mut_ptr(), cd.as_mut_ptr());
     for i in 0..m {
-        let e = cd[i];
-        let hk = key_hash(e.a, e.b, e.ki >> 62);
-        let mut s = (hk.wrapping_mul(TH) >> (64 - tbits)) as usize;
-        loop {
-            let c = slots[s] as usize;
-            if c == 0 {
-                slots[s] = (i + 1) as u32;
-                break;
+        // SAFETY: i < m = cd.len(); s <= mask < slots.len(); a slot holds 0 or an index + 1 of
+        // an earlier entry (<= i < m).
+        unsafe {
+            let e = cp.add(i);
+            let (ea, eb, eki) = ((*e).a, (*e).b, (*e).ki);
+            let hk = key_hash(ea, eb, eki >> 62);
+            let mut s = (hk.wrapping_mul(TH) >> (64 - tbits)) as usize;
+            loop {
+                let c = *sp.add(s) as usize;
+                if c == 0 {
+                    *sp.add(s) = (i + 1) as u32;
+                    break;
+                }
+                let o = cp.add(c - 1);
+                if (*o).a == ea && (*o).b == eb && (*o).ki >> 62 == eki >> 62 {
+                    // The smaller ingest wins (equal: identical copies, the one in place
+                    // stays); the loser's address becomes DEAD.
+                    let wins = (eki & M62) < ((*o).ki & M62);
+                    *sp.add(s) = if wins { (i + 1) as u32 } else { c as u32 };
+                    (*if wins { o } else { e }).at = dead;
+                    break;
+                }
+                // Terminates: at most half the slots are used.
+                s = (s + 1) & mask;
             }
-            let o = cd[c - 1];
-            if o.a == e.a && o.b == e.b && o.ki >> 62 == e.ki >> 62 {
-                // The smaller ingest wins (equal: identical copies, the one in place stays);
-                // the loser's address becomes DEAD.
-                let wins = (e.ki & M62) < (o.ki & M62);
-                slots[s] = if wins { (i + 1) as u32 } else { c as u32 };
-                let lose = if wins { c - 1 } else { i };
-                cd[lose].at = dead;
-                break;
-            }
-            // Terminates: at most half the slots are used.
-            s = (s + 1) & mask;
         }
     }
     // The winners, in record order (a loser reads as dead).

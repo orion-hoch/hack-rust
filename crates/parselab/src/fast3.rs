@@ -83,28 +83,6 @@ unsafe fn c64(x: u64) -> __m512i {
     _mm512_set1_epi64(x as i64)
 }
 
-/// Lane l of the result: element 7l + j of the 64 u32 in z0..z3.
-#[inline(always)]
-unsafe fn column(z: &[__m512i; 4], j: u32) -> __m256i {
-    // No std::array::from_fn in kernels: with two instantiations LLVM once left it as a call.
-    let mut idx = [0i32; 16];
-    for (l, x) in idx.iter_mut().enumerate().take(8) {
-        *x = (7 * l as i32 + j as i32) & 31;
-    }
-    let iv = unsafe { _mm512_loadu_si512(idx.as_ptr() as *const __m512i) };
-    let lo = _mm512_permutex2var_epi32(z[0], iv, z[1]);
-    let hi = _mm512_permutex2var_epi32(z[2], iv, z[3]);
-    // Lanes whose element is >= 32 come from z2/z3.
-    let mut m: u16 = 0;
-    for l in 0..8 {
-        if 7 * l + j >= 32 {
-            m |= 1 << l;
-        }
-    }
-    _mm512_castsi512_si256(_mm512_mask_blend_epi32(m, lo, hi))
-}
-
-
 /// The 512-bit multiplies, optionally done as two 256-bit halves (`S`), so the zmm path uses no
 /// heavy 512-bit instruction: on Skylake-SP/Cascade Lake those set the lowest clock license, while
 /// light 512-bit work (loads, compares, shuffles, adds) runs at the 256-bit-heavy license.
@@ -210,14 +188,13 @@ unsafe fn mullo64<const S: bool>(a: __m512i, b: __m512i) -> __m512i {
     split2::<S>(a, b, |x, y| _mm512_mullo_epi64(x, y), |x, y| mullo64_256(x, y))
 }
 
-/// 8 base-36 IDs: (value or NONE40), from the 8 bytes ending at each ID's end, its digit count
-/// k (as i64, may be <= 0) and whether its prefix byte matched.
+/// 8 base-36 IDs: (value or NONE40), from the 8 bytes ending at each ID's end, the field's
+/// length (prefix + k digits, as i64, any value) and whether its prefix byte matched.
 #[inline(always)]
-unsafe fn ids<const S: bool>(w: __m512i, k: __m512i, prefix_ok: __mmask8) -> __m512i {
-    let one = _mm512_set1_epi64(1);
-    let eight = _mm512_set1_epi64(8);
-    let kc = _mm512_max_epi64(one, _mm512_min_epi64(k, eight));
-    let sh = _mm512_slli_epi64::<3>(_mm512_sub_epi64(eight, kc));
+unsafe fn ids<const S: bool>(w: __m512i, len: __m512i, prefix_ok: __mmask8) -> __m512i {
+    // Keep the last k = len - 1 bytes: shift 8 * (8 - k). No clamp: for k outside 1..=8 the
+    // shift count is out of range (the lane becomes all '0') and k_ok rejects the lane.
+    let sh = _mm512_slli_epi64::<3>(_mm512_sub_epi64(_mm512_set1_epi64(9), len));
     let keep = _mm512_sllv_epi64(_mm512_set1_epi64(-1), sh);
     let c30 = unsafe { c64(0x3030_3030_3030_3030) };
     let w = _mm512_ternarylogic_epi64::<0xCA>(keep, w, c30);
@@ -240,11 +217,12 @@ unsafe fn ids<const S: bool>(w: __m512i, k: __m512i, prefix_ok: __mmask8) -> __m
             },
         )
     };
-    let first = _mm512_and_si512(_mm512_srlv_epi64(v, sh), _mm512_set1_epi64(0xFF));
-    let first_ok = _mm512_cmpneq_epi64_mask(first, _mm512_setzero_si512()) | _mm512_cmpeq_epi64_mask(k, one);
-    let k_ok = _mm512_cmpge_epi64_mask(k, one) & _mm512_cmple_epi64_mask(k, eight);
-    let small = _mm512_cmple_epu64_mask(value, _mm512_set1_epi64(MASK40 as i64));
-    let good = all & prefix_ok & first_ok & k_ok & small;
+    // Canonical (first digit nonzero unless k == 1) and at most 40 bits: 36^(k-1) <= value (0 for
+    // k == 1) <= MASK40, the lower bound looked up by len & 7 (len 2..=9 for k 1..=8).
+    let low = _mm512_permutexvar_epi64(len, _mm512_setr_epi64(2_176_782_336, 78_364_164_096, 0, 36, 1296, 46_656, 1_679_616, 60_466_176));
+    let k_ok = _mm512_cmplt_epu64_mask(_mm512_sub_epi64(len, _mm512_set1_epi64(2)), _mm512_set1_epi64(8));
+    let in_range = _mm512_cmpge_epu64_mask(value, low) & _mm512_cmple_epu64_mask(value, _mm512_set1_epi64(MASK40 as i64));
+    let good = all & prefix_ok & k_ok & in_range;
     _mm512_mask_blend_epi64(good, _mm512_set1_epi64(-1), value)
 }
 
@@ -262,12 +240,12 @@ unsafe fn byte_at(v: __m512i, i: u32) -> __m512i {
 }
 
 /// `YYYY-MM-DD` over hi (bytes 0..8) and mid (bytes 0..2): (day * 86400 relative to
-/// window_start's day, valid and in the table). No digit decode: the low bits of the characters
+/// window_start's day, valid and in the table, byte 2 of mid is `T`). No digit decode: the low bits of the characters
 /// pick a slot of `Dates::ent` (byte sums, no multiply) and the text is compared with the one date
 /// that lives there, so it is valid exactly when it is the text of a table date. Other lanes get
 /// BAD_DAY * 86400, as the multiply of the old day table's BAD_DAY gave.
 #[inline(always)]
-unsafe fn date(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m512i, __mmask8) {
+unsafe fn date(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m512i, __mmask8, __mmask8) {
     unsafe {
         // Y4 bit -> 0x40 of byte 3, M1 bit -> 0x80 of byte 5, M2 nibble -> 0x3C of byte 6; the
         // byte sum is slot bits 2..8, and D1 (bits 0..2) and D2 (bits 8..12) come from mid as is.
@@ -277,10 +255,13 @@ unsafe fn date(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m512i, __mmask8) 
         let e = _mm512_i64gather_epi64::<8>(idx, dates.ent_ptr() as *const i64);
         // Expected bytes 0..8: the slot's year, then `-0x-3x-` up to the slot bits.
         let want = _mm512_ternarylogic_epi64::<0xEA>(e, c64(0xFFFF_FFFF), c64(0x2D30_302D_0000_0000));
-        let ok = _mm512_testn_epi64_mask(_mm512_xor_si512(hi, want), c64(0xFFF0_FEFF_FFFF_FFFF))
-            & _mm512_cmpeq_epi64_mask(_mm512_and_si512(mid, c64(0xF0FC)), c64(0x3030));
+        // mid against `3x3xT`: the day digits' high bits (part of the date), and the `T` after them
+        // as a separate result (it is not part of what selects the day).
+        let xm = _mm512_xor_si512(mid, c64(0x0054_3030));
+        let ok = _mm512_testn_epi64_mask(_mm512_xor_si512(hi, want), c64(0xFFF0_FEFF_FFFF_FFFF)) & _mm512_testn_epi64_mask(xm, c64(0xF0FC));
+        let t_ok = _mm512_testn_epi64_mask(xm, c64(0x00FF_0000));
         let day_s = _mm512_mask_srai_epi64::<32>(_mm512_set1_epi64(BAD_DAY as i64 * 86_400), ok, e);
-        (day_s, ok)
+        (day_s, ok, t_ok)
     }
 }
 
@@ -296,22 +277,20 @@ unsafe fn times1000(x: __m512i) -> __m512i {
 /// `HH:MM:SS` in t (8 bytes): (seconds of day, ok). Lane-wise copy of `fast::hms`.
 #[inline(always)]
 unsafe fn hms<const S: bool>(t: __m512i) -> (__m512i, __mmask8) {
-    let colons = _mm512_cmpeq_epi64_mask(
-        _mm512_and_si512(t, unsafe { c64(0x0000_FF00_00FF_0000) }),
-        unsafe { c64(0x0000_3A00_003A_0000) },
-    );
-    let x = _mm512_and_si512(_mm512_xor_si512(t, unsafe { c64(0x3030_3030_3030_3030) }), unsafe { c64(0xFFFF_00FF_FF00_FFFF) });
-    let dig = unsafe { digits_ok(x, u64::MAX) };
+    // y: 0 at the colons and the digit values elsewhere, when the text is well formed. Two tests
+    // decide it: nothing but low nibbles (colons: nothing at all), and no digit above its limit
+    // (H 2 9, M 5 9, S 5 9: digit + (15 - limit) stays below 16). Minutes and seconds are then at
+    // most 59; the hour needs its own compare.
+    let y = _mm512_xor_si512(t, unsafe { c64(0x3030_3A30_303A_3030) });
+    let shape = _mm512_testn_epi64_mask(y, unsafe { c64(0xF0F0_FFF0_F0FF_F0F0) })
+        & _mm512_testn_epi64_mask(_mm512_add_epi8(y, unsafe { c64(0x060A_0006_0A00_060D) }), unsafe { c64(0x1010_0010_1000_1010) });
+    let x = _mm512_and_si512(y, unsafe { c64(0xFFFF_00FF_FF00_FFFF) });
     let v = _mm512_add_epi64(_mm512_add_epi64(opaque::<S>(_mm512_slli_epi64::<3>(x)), _mm512_slli_epi64::<1>(x)), _mm512_srli_epi64::<8>(x));
     let ff = _mm512_set1_epi64(0xFF);
     let h = _mm512_and_si512(v, ff);
     let m = _mm512_and_si512(_mm512_srli_epi64::<24>(v), ff);
     let s = _mm512_and_si512(_mm512_srli_epi64::<48>(v), ff);
-    let ok = colons
-        & dig
-        & _mm512_cmple_epu64_mask(h, _mm512_set1_epi64(23))
-        & _mm512_cmple_epu64_mask(m, _mm512_set1_epi64(59))
-        & _mm512_cmple_epu64_mask(s, _mm512_set1_epi64(59));
+    let ok = shape & _mm512_cmple_epu64_mask(h, _mm512_set1_epi64(23));
     let secs = if S {
         // (h * 60 + m) * 60 + s, each * 60 as (x << 6) - (x << 2): light work, no split.
         let hm = _mm512_add_epi64(times60(h), m);
@@ -348,9 +327,11 @@ unsafe fn dec8<const S: bool>(w: __m512i) -> (__m512i, __mmask8) {
 #[inline(always)]
 unsafe fn offset<const S: bool>(o: __m512i) -> (__m512i, __mmask8) {
     let sign = unsafe { byte_at(o, 2) };
-    let colon = _mm512_cmpeq_epi64_mask(unsafe { byte_at(o, 5) }, _mm512_set1_epi64(b':' as i64));
-    let x = _mm512_and_si512(_mm512_xor_si512(o, unsafe { c64(0x3030_3030_3030_3030) }), unsafe { c64(0xFFFF_00FF_FF00_0000) });
-    let dig = unsafe { digits_ok(x, u64::MAX) };
+    // As in `hms`: the colon and the digit limits (H 2 9, M 5 9) in two tests.
+    let y = _mm512_xor_si512(o, unsafe { c64(0x3030_3A30_3000_0000) });
+    let shape = _mm512_testn_epi64_mask(y, unsafe { c64(0xF0F0_FFF0_F000_0000) })
+        & _mm512_testn_epi64_mask(_mm512_add_epi8(y, unsafe { c64(0x060A_0006_0D00_0000) }), unsafe { c64(0x1010_0010_1000_0000) });
+    let x = _mm512_and_si512(y, unsafe { c64(0xFFFF_00FF_FF00_0000) });
     let v = _mm512_add_epi64(_mm512_add_epi64(opaque::<S>(_mm512_slli_epi64::<3>(x)), _mm512_slli_epi64::<1>(x)), _mm512_srli_epi64::<8>(x));
     let ff = _mm512_set1_epi64(0xFF);
     let h = _mm512_and_si512(_mm512_srli_epi64::<24>(v), ff);
@@ -360,22 +341,30 @@ unsafe fn offset<const S: bool>(o: __m512i) -> (__m512i, __mmask8) {
     let plus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'+' as i64));
     let minus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'-' as i64));
     let off = _mm512_mask_sub_epi64(mag, !plus, _mm512_setzero_si512(), mag);
-    let ok = (plus | minus)
-        & colon
-        & dig
-        & _mm512_cmple_epu64_mask(h, _mm512_set1_epi64(23))
-        & _mm512_cmple_epu64_mask(m, _mm512_set1_epi64(59));
+    let ok = (plus | minus) & shape & _mm512_cmple_epu64_mask(h, _mm512_set1_epi64(23));
     (off, ok)
 }
 
-/// LONG keys of the lanes in `lanes` (length 33, prefix matched), one lane at a time: the 32 hex
-/// characters ending at the lane's `ve` (window-relative) as one 256-bit load, to a (first 16
-/// characters) and b (last 16) written to `a[l]` and `b[l]`. Returns the lanes whose 32 characters
-/// are all `0-9a-f`. One lane in eight is LONG: a batch has one such lane on average, and the old
-/// 8-lane decode (three more gathers, four hex8) ran for every batch that had any.
+/// The LONG lanes of one ID field merged into its key vectors: (a, b, long lanes). `x` is the SHORT
+/// decode (a lane of length 33 is never SHORT: `ids` takes at most 8 characters). One lane at a
+/// time: the 32 hex characters ending at the lane's `ve` (window-relative) as one 256-bit load, to
+/// a (first 16 characters) and b (last 16), each put into its lane of the key vectors by a masked
+/// broadcast when all 32 are `0-9a-f`. One lane in eight is LONG: a batch has one such lane on
+/// average, and the old 8-lane decode (three more gathers, four hex8) ran for every batch that
+/// had any.
+///
+/// The keys go register to register. Writing them to a stack array and loading the array as one
+/// vector cost more than the whole decode: a 64-byte load cannot be forwarded from 8-byte stores
+/// (it waits for them to retire), and that one load was a quarter of ev_batch's cycles.
 #[inline(always)]
-unsafe fn long_lanes(wbase: *const u8, ve: __m256i, lanes: __mmask8, a: *mut u64, b: *mut u64) -> __mmask8 {
+unsafe fn with_long(wbase: *const u8, ve: __m256i, len: __m512i, pre_ok: __mmask8, x: __m512i) -> (__m512i, __m512i, __mmask8) {
     unsafe {
+        let lanes = _mm512_cmpeq_epi64_mask(len, _mm512_set1_epi64(33)) & pre_ok;
+        let (mut a, mut b) = (x, _mm512_setzero_si512());
+        if lanes == 0 {
+            return (a, b, 0);
+        }
+        // One 32-byte store, then 4-byte loads inside it: those forward.
         let mut ends = [0u32; 8];
         _mm256_storeu_si256(ends.as_mut_ptr() as *mut __m256i, ve);
         let swap = _mm_set_epi8(8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7);
@@ -392,27 +381,12 @@ unsafe fn long_lanes(wbase: *const u8, ve: __m256i, lanes: __mmask8, a: *mut u64
             let val = _mm256_mask_add_epi8(d, letter, t, _mm256_set1_epi8(10));
             // nibble pairs [16, 1] -> 16 bytes, then each half byte-reversed: character 0 most significant
             let bytes = _mm_shuffle_epi8(_mm256_cvtepi16_epi8(_mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0110))), swap);
-            *a.add(l) = _mm_cvtsi128_si64(bytes) as u64;
-            *b.add(l) = _mm_extract_epi64::<1>(bytes) as u64;
-            long |= (((digit | letter) == u32::MAX) as u32) << l;
+            let k = (((digit | letter) == u32::MAX) as u32) << l;
+            a = _mm512_mask_broadcastq_epi64(a, k as u8, bytes);
+            b = _mm512_mask_broadcastq_epi64(b, k as u8, _mm_unpackhi_epi64(bytes, bytes));
+            long |= k;
         }
-        long as u8
-    }
-}
-
-/// The LONG lanes of one ID field merged into its key vectors: (a, b, long lanes). `x` is the SHORT
-/// decode (a lane of length 33 is never SHORT: `ids` takes at most 8 characters).
-#[inline(always)]
-unsafe fn with_long(wbase: *const u8, ve: __m256i, len: __m512i, pre_ok: __mmask8, x: __m512i) -> (__m512i, __m512i, __mmask8) {
-    unsafe {
-        let lanes = _mm512_cmpeq_epi64_mask(len, _mm512_set1_epi64(33)) & pre_ok;
-        if lanes == 0 {
-            return (x, _mm512_setzero_si512(), 0);
-        }
-        let mut a = std::mem::MaybeUninit::<[u64; 8]>::uninit();
-        let mut b = std::mem::MaybeUninit::<[u64; 8]>::uninit();
-        let long = long_lanes(wbase, ve, lanes, a.as_mut_ptr() as *mut u64, b.as_mut_ptr() as *mut u64);
-        (_mm512_mask_loadu_epi64(x, long, a.as_ptr() as *const i64), _mm512_maskz_loadu_epi64(long, b.as_ptr() as *const i64), long)
+        (a, b, long as u8)
     }
 }
 
@@ -467,6 +441,24 @@ unsafe fn dword_bytes(base: *const u8, idx: __m256i) -> __m256i {
     unsafe { _mm256_i32gather_epi32::<1>(base as *const i32, idx) }
 }
 
+// v - m (or v + m) in the lanes of k, else v, as one masked instruction: as intrinsics LLVM turns
+// the masked add of a constant into a mask-to-vector conversion and an add.
+macro_rules! asm_mask32 {
+    ($name:ident, $ins:literal) => {
+        #[target_feature(enable = "avx512f,avx512vl")]
+        #[inline]
+        unsafe fn $name(v: __m256i, k: __mmask8, m: __m256i) -> __m256i {
+            let mut r = v;
+            unsafe {
+                std::arch::asm!(concat!($ins, " {r}{{{k}}}, {r}, {m}"), r = inout(ymm_reg) r, k = in(kreg) k, m = in(ymm_reg) m, options(pure, nomem, nostack, preserves_flags));
+            }
+            r
+        }
+    };
+}
+asm_mask32!(mask_sub32, "vpsubd");
+asm_mask32!(mask_add32, "vpaddd");
+
 /// Separator positions of 8 lines at stride `nf` (from k0), window-relative, and the line
 /// starts and quote-adjusted value bounds of every field. The entries are pure positions; the
 /// quote flag before field j of lane l is bit NF * l + j of the quote window from k0 (one load
@@ -475,41 +467,66 @@ unsafe fn dword_bytes(base: *const u8, idx: __m256i) -> __m256i {
 unsafe fn bounds<const NF: usize>(sc: &Scratch, k0: usize) -> ([__m256i; NF], [__m256i; NF], __m256i, [__m256i; NF]) {
     unsafe {
         let sp = sc.sep_ptr().add(k0);
-        let z = [
-            _mm512_loadu_si512(sp as *const __m512i),
-            _mm512_loadu_si512(sp.add(16) as *const __m512i),
-            _mm512_loadu_si512(sp.add(32) as *const __m512i),
-            _mm512_loadu_si512(sp.add(48) as *const __m512i),
-        ];
         let mut sep = [_mm256_setzero_si256(); NF];
-        for (j, r) in sep.iter_mut().enumerate() {
-            *r = if NF == 7 {
-                column(&z, j as u32)
-            } else {
+        if NF == 7 {
+            // Four loads of two whole lines each (14 entries; 2 spare). One permute per pair of
+            // loads puts lines (0,1,4,5) and (2,3,6,7) of four columns side by side as 64-bit
+            // halves, and a 64-bit unpack joins them into two whole columns (low and high 256 bits).
+            let r = [
+                _mm512_loadu_si512(sp as *const __m512i),
+                _mm512_loadu_si512(sp.add(14) as *const __m512i),
+                _mm512_loadu_si512(sp.add(28) as *const __m512i),
+                _mm512_loadu_si512(sp.add(42) as *const __m512i),
+            ];
+            let ia = _mm512_setr_epi32(0, 7, 1, 8, 16, 23, 17, 24, 2, 9, 3, 10, 18, 25, 19, 26);
+            let ib = _mm512_setr_epi32(4, 11, 5, 12, 20, 27, 21, 28, 6, 13, 6, 13, 22, 29, 22, 29);
+            let (pa, qa) = (_mm512_permutex2var_epi32(r[0], ia, r[2]), _mm512_permutex2var_epi32(r[1], ia, r[3]));
+            let (pb, qb) = (_mm512_permutex2var_epi32(r[0], ib, r[2]), _mm512_permutex2var_epi32(r[1], ib, r[3]));
+            let (c02, c13) = (_mm512_unpacklo_epi64(pa, qa), _mm512_unpackhi_epi64(pa, qa));
+            let (c46, c5) = (_mm512_unpacklo_epi64(pb, qb), _mm512_unpackhi_epi64(pb, qb));
+            let cols = [
+                _mm512_castsi512_si256(c02),
+                _mm512_castsi512_si256(c13),
+                _mm512_extracti64x4_epi64::<1>(c02),
+                _mm512_extracti64x4_epi64::<1>(c13),
+                _mm512_castsi512_si256(c46),
+                _mm512_castsi512_si256(c5),
+                _mm512_extracti64x4_epi64::<1>(c46),
+            ];
+            for (j, c) in sep.iter_mut().enumerate() {
+                *c = cols[j];
+            }
+        } else {
+            let z0 = _mm512_loadu_si512(sp as *const __m512i);
+            let z1 = _mm512_loadu_si512(sp.add(16) as *const __m512i);
+            for (j, c) in sep.iter_mut().enumerate() {
                 let mut idx = [0i32; 16];
                 for (l, x) in idx.iter_mut().enumerate().take(8) {
                     *x = (NF * l + j) as i32;
                 }
                 let iv = _mm512_loadu_si512(idx.as_ptr() as *const __m512i);
-                _mm512_castsi512_si256(_mm512_permutex2var_epi32(z[0], iv, z[1]))
-            };
+                *c = _mm512_castsi512_si256(_mm512_permutex2var_epi32(z0, iv, z1));
+            }
         }
         // The separator before each line's field 0: the previous line's newline (lane l - 1), or
         // for lane 0 the entry before k0 (the window start when k0 == 0).
         let prev_pos = if k0 == 0 { -1i32 } else { *sp.sub(1) as i32 };
-        let qw = sc.q_window(k0);
-        let lanes: u64 = if NF == 7 { 0x0002_0408_1020_4081 } else { 0x1111_1111 };
+        // Lane l's NF quote flags in the low bits of 32-bit lane l: one test per field, and the
+        // value bounds are one masked add each.
+        let n = NF as i64;
+        let qv = _mm512_srlv_epi64(_mm512_set1_epi64(sc.q_window(k0) as i64), _mm512_setr_epi64(0, n, 2 * n, 3 * n, 4 * n, 5 * n, 6 * n, 7 * n));
+        let ql = _mm512_cvtepi64_epi32(qv);
         let rot = _mm256_setr_epi32(7, 0, 1, 2, 3, 4, 5, 6);
         let shifted = _mm256_permutexvar_epi32(rot, sep[NF - 1]);
-        let ls = _mm256_add_epi32(_mm256_mask_set1_epi32(shifted, 1, prev_pos), _mm256_set1_epi32(1));
-        let one = _mm256_set1_epi32(1);
+        let m1 = _mm256_set1_epi32(-1);
+        let ls = _mm256_sub_epi32(_mm256_mask_set1_epi32(shifted, 1, prev_pos), m1);
         let mut vs = [_mm256_setzero_si256(); NF];
         let mut ve = [_mm256_setzero_si256(); NF];
         for j in 0..NF {
-            let q = _pext_u64(qw, lanes << j) as u8;
-            let s = if j == 0 { ls } else { _mm256_add_epi32(sep[j - 1], one) };
-            vs[j] = _mm256_mask_add_epi32(s, q, s, one);
-            ve[j] = _mm256_mask_sub_epi32(sep[j], q, sep[j], one);
+            let q = _mm256_test_epi32_mask(ql, _mm256_set1_epi32(1 << j));
+            let s = if j == 0 { ls } else { _mm256_sub_epi32(sep[j - 1], m1) };
+            vs[j] = mask_sub32(s, q, m1);
+            ve[j] = mask_add32(sep[j], q, m1);
         }
         (vs, ve, ls, sep)
     }
@@ -562,13 +579,21 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         // IDs: SHORT from the 8 bytes ending at the end, LONG from the 32 ending there.
         let w_e = gather64(wbase, _mm256_sub_epi32(ve[0], eight));
         let w_u = gather64(wbase, _mm256_sub_epi32(ve[1], eight));
-        let pe = _mm256_cmpeq_epi32_mask(_mm256_and_si256(dword_bytes(wbase, vs[0]), ff32), _mm256_set1_epi32(b'e' as i32));
-        let pu = _mm256_cmpeq_epi32_mask(_mm256_and_si256(dword_bytes(wbase, vs[1]), ff32), _mm256_set1_epi32(b'u' as i32));
-        let x_e = ids::<S>(w_e, _mm512_sub_epi64(len[0], one64), pe);
-        let x_u = ids::<S>(w_u, _mm512_sub_epi64(len[1], one64), pu);
+        // Both prefix bytes in one 16-lane gather.
+        let pg = _mm512_i32gather_epi32::<1>(_mm512_inserti64x4::<1>(_mm512_castsi256_si512(vs[0]), vs[1]), wbase as *const i32);
+        let pk = _mm512_cmpeq_epi32_mask(
+            _mm512_and_si512(pg, _mm512_set1_epi32(0xFF)),
+            _mm512_inserti64x4::<1>(_mm512_set1_epi32(b'e' as i32), _mm256_set1_epi32(b'u' as i32)),
+        );
+        let (pe, pu) = (pk as u8, (pk >> 8) as u8);
+        // Order matters for the instruction count: the LONG branch between the two decodes ends
+        // the block, so each decode's constants are single-use memory operands instead of one
+        // register load each shared by both.
+        let x_e = ids::<S>(w_e, len[0], pe);
         let e_short = _mm512_cmpneq_epi64_mask(x_e, _mm512_set1_epi64(-1));
-        let u_short = _mm512_cmpneq_epi64_mask(x_u, _mm512_set1_epi64(-1));
         let (e_a, e_b, e_long) = with_long(wbase, ve[0], len[0], pe, x_e);
+        let x_u = ids::<S>(w_u, len[1], pu);
+        let u_short = _mm512_cmpneq_epi64_mask(x_u, _mm512_set1_epi64(-1));
         let (u_a, u_b, u_long) = with_long(wbase, ve[1], len[1], pu, x_u);
         let ev_ok = e_short | e_long;
         let user_ok = u_short | u_long;
@@ -577,8 +602,7 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let t_mid = gather64(wbase, _mm256_add_epi32(vs[2], eight));
         let t_16 = gather64(wbase, _mm256_add_epi32(vs[2], _mm256_set1_epi32(16)));
         let t_17 = gather64(wbase, _mm256_add_epi32(vs[2], _mm256_set1_epi32(17)));
-        let (day_s, date_ok) = date(dates, t_hi, t_mid);
-        let t_ok = _mm512_cmpeq_epi64_mask(byte_at(t_mid, 2), _mm512_set1_epi64(b'T' as i64));
+        let (day_s, date_ok, t_ok) = date(dates, t_hi, t_mid);
         let (secs, hms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(t_mid), _mm512_slli_epi64::<40>(t_16)));
         let z = _mm512_cmpeq_epi64_mask(byte_at(t_16, 3), _mm512_set1_epi64(b'Z' as i64));
         let (off, off_ok) = offset::<S>(t_17);
@@ -598,8 +622,7 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let i_hi = gather64(wbase, vs[3]);
         let i_mid = gather64(wbase, _mm256_add_epi32(vs[3], eight));
         let i_16 = gather64(wbase, _mm256_add_epi32(vs[3], _mm256_set1_epi32(16)));
-        let (iday_s, idate_ok) = date(dates, i_hi, i_mid);
-        let it_ok = _mm512_cmpeq_epi64_mask(byte_at(i_mid, 2), _mm512_set1_epi64(b'T' as i64));
+        let (iday_s, idate_ok, it_ok) = date(dates, i_hi, i_mid);
         let (isecs, ihms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(i_mid), _mm512_slli_epi64::<40>(i_16)));
         let iz = _mm512_cmpeq_epi64_mask(byte_at(i_16, 3), _mm512_set1_epi64(b'Z' as i64));
         let ing_fast = _mm512_cmpeq_epi64_mask(len[3], _mm512_set1_epi64(20)) & idate_ok & it_ok & ihms_ok & iz;
@@ -709,7 +732,7 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         let ff32 = _mm256_set1_epi32(0xFF);
         let w_u = gather64(wbase, _mm256_sub_epi32(ve[1], eight));
         let pu = _mm256_cmpeq_epi32_mask(_mm256_and_si256(dword_bytes(wbase, vs[1]), ff32), _mm256_set1_epi32(b'u' as i32));
-        let x_u = ids::<S>(w_u, _mm512_sub_epi64(len[1], one64), pu);
+        let x_u = ids::<S>(w_u, len[1], pu);
         let u_short = _mm512_cmpneq_epi64_mask(x_u, _mm512_set1_epi64(-1));
         let (u_a, u_b, u_long) = with_long(wbase, ve[1], len[1], pu, x_u);
         let user_ok = u_short | u_long;
@@ -724,8 +747,7 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         let t_mid = gather64(wbase, _mm256_add_epi32(vs[3], eight));
         let t_16 = gather64(wbase, _mm256_add_epi32(vs[3], _mm256_set1_epi32(16)));
         let t_17 = gather64(wbase, _mm256_add_epi32(vs[3], _mm256_set1_epi32(17)));
-        let (day_s, date_ok) = date(dates, t_hi, t_mid);
-        let t_ok = _mm512_cmpeq_epi64_mask(byte_at(t_mid, 2), _mm512_set1_epi64(b'T' as i64));
+        let (day_s, date_ok, t_ok) = date(dates, t_hi, t_mid);
         let (secs, hms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(t_mid), _mm512_slli_epi64::<40>(t_16)));
         let z = _mm512_cmpeq_epi64_mask(byte_at(t_16, 3), _mm512_set1_epi64(b'Z' as i64));
         let (off, off_ok) = offset::<S>(t_17);

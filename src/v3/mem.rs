@@ -33,6 +33,12 @@ const RESERVE: usize = 64 << 30;
 
 static READY: AtomicBool = AtomicBool::new(false);
 
+/// Whether the region is reserved (the allocator then takes its large blocks from it).
+#[inline]
+pub fn ready() -> bool {
+    READY.load(Ordering::Relaxed)
+}
+
 /// Reserves the region and attaches the block classes; huge pages by rt's verdict for
 /// `expected_peak` bytes. Once per process; false if the reservation failed (the run falls back).
 pub fn init(expected_peak: usize) -> bool {
@@ -47,15 +53,16 @@ pub fn init(expected_peak: usize) -> bool {
     }
     // Huge pages by rt's verdict for the whole peak. When the verdict is no only because the free
     // 2 MB blocks and the free memory are short of the WHOLE peak, the region still takes huge
-    // pages for 80% of the blocks that are free now (less a quarter of the peak, left to the
-    // allocator), under the stall guard, and 4 KB pages after that. It used to take none: at
+    // pages for 80% of the blocks that are free now (less an eighth of the peak, left to the
+    // allocator's chunks: its large blocks live in this region), under the stall guard, and 4 KB
+    // pages after that. It used to take none: at
     // f60v5 on box 1 (blocks 2.4 GB, MemFree 5.3 GB) that was 544K page faults against 98K and
     // 27.7G cycles against 25.0G. RT_TIGHT=<MB> forces this mode with that limit (measurements;
     // 0 = no huge pages).
     let v = rt::arena::huge_verdict(expected_peak);
     let limit = match std::env::var("RT_TIGHT").ok().and_then(|s| s.parse::<usize>().ok()) {
         Some(mb) => Some(mb << 20),
-        None if !v.use_huge && v.enabled != b'n' && v.free_2m > 0 => Some(((v.free_2m as usize) * (2 << 20) / 5 * 4).saturating_sub(expected_peak / 4)),
+        None if !v.use_huge && v.enabled != b'n' && v.free_2m > 0 => Some(((v.free_2m as usize) * (2 << 20) / 5 * 4).saturating_sub(expected_peak / 8)),
         None => None,
     };
     let huge = match limit {

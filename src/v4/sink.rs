@@ -199,6 +199,113 @@ unsafe fn mullo64_halves(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__
     }
 }
 
+/// Appends lane k's 16-byte unit to the bin whose front is at byte offset `part[k]` of the
+/// fronts, for every lane k in `lanes`: the front loaded, one 16-byte store, the front advanced
+/// and its next line asked for. In assembly: 12 instructions a lane (the compiler's loop
+/// spends 14). The lanes are taken from a mask with bit 2k for lane k, so the count of
+/// trailing zeros scales to both arrays (times 4 in `part`, times 8 in `units`). A lane whose
+/// chunk is at its end leaves the loop, the next chunk is opened, and the loop takes it again.
+///
+/// # Safety
+/// `part[k] / 16` is below the number of bins for every lane in `lanes`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,bmi1,bmi2")]
+#[inline]
+unsafe fn store_lanes(bins: &mut Bins<[u64; 2]>, lanes: u8, part: &[u64; 8], units: &[[u64; 2]; 8]) {
+    let fs = bins.fronts();
+    let mut m = core::arch::x86_64::_pdep_u32(u32::from(lanes), 0x5555);
+    while m != 0 {
+        // SAFETY: the caller's bound for each front; a front's pointer below its chunk's end has
+        // room for one unit.
+        unsafe {
+            core::arch::asm!(
+                "2:",
+                "tzcnt {k:e}, {m:e}",
+                "mov {o}, qword ptr [{part} + {k}*4]",
+                "vmovdqu xmm0, xmmword ptr [{units} + {k}*8]",
+                "mov {p}, qword ptr [{fs} + {o}]",
+                "cmp {p}, qword ptr [{fs} + {o} + 8]",
+                "je 3f",
+                "vmovdqu xmmword ptr [{p}], xmm0",
+                "add {p}, 16",
+                "mov qword ptr [{fs} + {o}], {p}",
+                "prefetcht0 byte ptr [{p} + 48]",
+                "blsr {m:e}, {m:e}",
+                "jne 2b",
+                "3:",
+                m = inout(reg) m,
+                part = in(reg) part.as_ptr(),
+                units = in(reg) units.as_ptr(),
+                fs = in(reg) fs,
+                k = out(reg) _,
+                o = out(reg) _,
+                p = out(reg) _,
+                out("xmm0") _,
+                options(nostack),
+            );
+        }
+        if m != 0 {
+            // The lowest lane met its chunk's end.
+            let k = (m.trailing_zeros() / 2) as usize;
+            bins.next_chunk(part[k] as usize >> 4);
+        }
+    }
+}
+
+/// As `store_lanes` for records of two units: lane k's `r0[k]` then `r1[k]` go to the bin at
+/// `part[k]`, both inside one chunk (a chunk without room for 32 bytes is closed short first).
+/// 13 instructions a lane (the compiler's loop spends 17).
+///
+/// # Safety
+/// As `store_lanes`; a chunk of `bins` holds at least two units.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,bmi1,bmi2")]
+#[inline]
+unsafe fn store_lanes2(bins: &mut Bins<[u64; 2]>, lanes: u8, part: &[u64; 8], r0: &[[u64; 2]; 8], r1: &[[u64; 2]; 8]) {
+    let fs = bins.fronts();
+    let mut m = core::arch::x86_64::_pdep_u32(u32::from(lanes), 0x5555);
+    while m != 0 {
+        // SAFETY: the caller's bound for each front; the two stores are below the chunk's end
+        // (the pointer + 32 is not above it).
+        unsafe {
+            core::arch::asm!(
+                "2:",
+                "tzcnt {k:e}, {m:e}",
+                "mov {o}, qword ptr [{part} + {k}*4]",
+                "vmovdqu xmm0, xmmword ptr [{r0} + {k}*8]",
+                "vmovdqu xmm1, xmmword ptr [{r1} + {k}*8]",
+                "mov {p}, qword ptr [{fs} + {o}]",
+                "lea {t}, [{p} + 32]",
+                "cmp {t}, qword ptr [{fs} + {o} + 8]",
+                "ja 3f",
+                "vmovdqu xmmword ptr [{p}], xmm0",
+                "vmovdqu xmmword ptr [{p} + 16], xmm1",
+                "mov qword ptr [{fs} + {o}], {t}",
+                "blsr {m:e}, {m:e}",
+                "jne 2b",
+                "3:",
+                m = inout(reg) m,
+                part = in(reg) part.as_ptr(),
+                r0 = in(reg) r0.as_ptr(),
+                r1 = in(reg) r1.as_ptr(),
+                fs = in(reg) fs,
+                k = out(reg) _,
+                o = out(reg) _,
+                p = out(reg) _,
+                t = out(reg) _,
+                out("xmm0") _,
+                out("xmm1") _,
+                options(nostack),
+            );
+        }
+        if m != 0 {
+            // The lowest lane's chunk has no room for the record.
+            let k = (m.trailing_zeros() / 2) as usize;
+            bins.next_chunk_short(part[k] as usize >> 4);
+        }
+    }
+}
+
 impl<'a> EvSink<'a, '_> {
     /// One batch with AVX-512. Every lane's plain unit, and every lane's rare record (header,
     /// second word, event key, user key, partition, form), is built in zmm registers for the 8
@@ -296,49 +403,17 @@ impl<'a> EvSink<'a, '_> {
         // the rare arrays when a lane is rare, and only rare lanes read them).
         let (units, part) = unsafe { (units.assume_init_ref(), part.assume_init_ref()) };
         // The plain lanes: front, store, advance (the chunk-end test is the only branch).
-        let fs = self.s.fronts();
-        let mut m = u32::from(common);
-        while m != 0 {
-            let k = m.trailing_zeros() as usize;
-            // SAFETY: part[k] / 16 < 2^b1, the number of bins; a front's pointer is below its
-            // end after next_chunk.
-            unsafe {
-                let f = (fs as *mut u8).add(part[k] as usize) as *mut [*mut [u64; 2]; 2];
-                let mut p = (*f)[0];
-                if p == (*f)[1] {
-                    self.s.next_chunk(part[k] as usize >> 4);
-                    p = (*f)[0];
-                }
-                p.write(units[k]);
-                (*f)[0] = p.add(1);
-                _mm_prefetch((p as *const i8).wrapping_add(64), _MM_HINT_ET0);
-            }
-            m &= m - 1;
-        }
+        // SAFETY: part[k] / 16 < 2^b1, the number of bins, for every lane.
+        unsafe { store_lanes(&mut self.s, common, part, units) };
         if rare == 0 {
             return;
         }
         // SAFETY: as above.
         let (r0, r1, r2, rpart) = unsafe { (r0.assume_init_ref(), r1.assume_init_ref(), r2.assume_init_ref(), rpart.assume_init_ref()) };
         // The rare lanes: 2 units (forms A and B), then 3 (form C), inside one chunk each.
+        // SAFETY: as above, for the rare bins (a B2K chunk holds 128 units).
+        unsafe { store_lanes2(&mut self.o, rare & !big, rpart, r0, r1) };
         let fo = self.o.fronts();
-        let mut m = u32::from(rare & !big);
-        while m != 0 {
-            let k = m.trailing_zeros() as usize;
-            // SAFETY: as above, for the rare bins (a B2K chunk holds 128 units).
-            unsafe {
-                let f = (fo as *mut u8).add(rpart[k] as usize) as *mut [*mut [u64; 2]; 2];
-                let mut p = (*f)[0];
-                if ((*f)[1] as usize).wrapping_sub(p as usize) < 32 {
-                    self.o.next_chunk_short(rpart[k] as usize >> 4);
-                    p = (*f)[0];
-                }
-                p.write(r0[k]);
-                p.add(1).write(r1[k]);
-                (*f)[0] = p.add(2);
-            }
-            m &= m - 1;
-        }
         let mut m = u32::from(big);
         while m != 0 {
             let k = m.trailing_zeros() as usize;
@@ -612,25 +687,8 @@ impl<'a, 'b> ClickSink<'a, 'b> {
         }
         // SAFETY: every lane of both arrays was written above.
         let (units, part) = unsafe { (units.assume_init_ref(), part.assume_init_ref()) };
-        let fs = self.s.fronts();
-        let mut m = u32::from(short);
-        while m != 0 {
-            let k = m.trailing_zeros() as usize;
-            // SAFETY: part[k] / 16 < 2^b2, the number of bins; a front's pointer is below its
-            // end after next_chunk.
-            unsafe {
-                let f = (fs as *mut u8).add(part[k] as usize) as *mut [*mut [u64; 2]; 2];
-                let mut p = (*f)[0];
-                if p == (*f)[1] {
-                    self.s.next_chunk(part[k] as usize >> 4);
-                    p = (*f)[0];
-                }
-                p.write(units[k]);
-                (*f)[0] = p.add(1);
-                _mm_prefetch((p as *const i8).wrapping_add(64), _MM_HINT_ET0);
-            }
-            m &= m - 1;
-        }
+        // SAFETY: part[k] / 16 < 2^b2, the number of bins, for every lane.
+        unsafe { store_lanes(&mut self.s, short, part, units) };
         let mut m = u32::from(wide);
         while m != 0 {
             let k = m.trailing_zeros() as usize;

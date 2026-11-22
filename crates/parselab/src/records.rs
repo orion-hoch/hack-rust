@@ -49,6 +49,21 @@ pub struct Key {
 #[derive(Clone, Copy, Debug)]
 #[repr(C, align(64))]
 pub struct EvBatch {
+    // Layout: the 64-byte arrays first, so each is exactly one cache line of the 64-aligned
+    // struct. With the 8 header bytes in front, every one of them straddled two lines (a split
+    // store in the decoder and a split load in the sink, per array per batch).
+    pub ev_a: [u64; 8],
+    pub ev_b: [u64; 8],
+    pub user_a: [u64; 8],
+    pub user_b: [u64; 8],
+    /// ms since window_start, < 2^31 (meaningful when surv is set)
+    pub ts: [u32; 8],
+    /// whole seconds since window_start - 30 days, < 2^23 - 1
+    pub ingest: [u32; 8],
+    /// price_cents 1..=10,000,000 (only with purch)
+    pub price: [u32; 8],
+    /// category code (only with purch)
+    pub cat: [u8; 8],
     pub n: u32,
     /// bit i: event_id of lane i is LONG (else SHORT)
     pub ev_long: u8,
@@ -58,18 +73,6 @@ pub struct EvBatch {
     pub surv: u8,
     /// bit i: event_type is purchase (only with surv)
     pub purch: u8,
-    pub ev_a: [u64; 8],
-    pub ev_b: [u64; 8],
-    pub user_a: [u64; 8],
-    pub user_b: [u64; 8],
-    /// ms since window_start, < 2^31 (meaningful when surv is set)
-    pub ts: [u32; 8],
-    /// whole seconds since window_start - 30 days, < 2^23 - 1
-    pub ingest: [u32; 8],
-    /// category code (only with purch)
-    pub cat: [u8; 8],
-    /// price_cents 1..=10,000,000 (only with purch)
-    pub price: [u32; 8],
 }
 
 impl Default for EvBatch {
@@ -141,16 +144,17 @@ impl EvBatch {
 #[derive(Clone, Copy, Debug)]
 #[repr(C, align(64))]
 pub struct ClickBatch {
-    pub n: u32,
-    pub user_long: u8,
+    // The 64-byte arrays first: one cache line each (see `EvBatch`).
     pub user_a: [u64; 8],
     pub user_b: [u64; 8],
+    /// locator of the line (its click_id bytes are read only to break a ts tie)
+    pub loc: [u64; 8],
     /// ms since window_start - 7 days
     pub ts: [u32; 8],
     /// row number in campaigns.csv
     pub campaign: [u16; 8],
-    /// locator of the line (its click_id bytes are read only to break a ts tie)
-    pub loc: [u64; 8],
+    pub n: u32,
+    pub user_long: u8,
 }
 
 impl Default for ClickBatch {

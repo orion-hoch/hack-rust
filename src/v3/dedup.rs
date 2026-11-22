@@ -282,6 +282,11 @@ pub struct Out {
 
 const NO_ARENA: usize = usize::MAX;
 
+/// A fill count is stored as count - 8 (-8 for an empty line, -1 for seven words): its low
+/// three bits are the count, and adding the eighth word brings it to zero, so a loop that adds
+/// to it has the full-line test in the flags of the add.
+pub(crate) const FILL0: u32 = 0u32.wrapping_sub(8);
+
 /// Lines of a bin's first chunk in block-class mode (one 2 KB block).
 const SMALL_LINES: usize = 2048 / 64;
 
@@ -336,7 +341,7 @@ impl Out {
             small: false,
             mask: n - 1,
             stage: vec![Line([0; 8]); n],
-            fill: vec![0; n],
+            fill: vec![FILL0; n],
             cur: vec![std::ptr::null_mut(); n],
             end: vec![std::ptr::null_mut(); n],
             full: (0..n).map(|_| Vec::new()).collect(),
@@ -350,8 +355,9 @@ impl Out {
 
     /// The staging lines (8 words per partition), the fill counts and the partition mask, for a
     /// caller that writes `push` out in its own loop with these held in registers: the next free
-    /// word of partition q is `stage[8 * q + (fill[q] & 7)]`; after storing the eighth word the
-    /// caller zeroes `fill[q]` and calls `flush_line(q)`, otherwise it stores the count plus one.
+    /// word of partition q is `stage[8 * q + (fill[q] & 7)]` (a count is stored minus 8, see
+    /// `FILL0`); after storing the eighth word the caller sets `fill[q]` to `FILL0` and calls
+    /// `flush_line(q)`, otherwise it stores the count plus one.
     /// The pointers stay valid for the life of `self` (the two vectors never grow).
     #[inline(always)]
     pub(crate) fn raw_parts(&mut self) -> (*mut u64, *mut u32, usize) {
@@ -389,10 +395,10 @@ impl Out {
             let c = (*f & 7) as usize;
             *(*self.stage.as_mut_ptr().add(q)).0.as_mut_ptr().add(c) = x;
             if c == 7 {
-                *f = 0;
+                *f = FILL0;
                 self.flush(q);
             } else {
-                *f = c as u32 + 1;
+                *f = FILL0 + c as u32 + 1;
             }
         }
     }
@@ -480,7 +486,7 @@ impl Out {
     /// Writes out the partly filled lines and closes every chunk; call once, after the last push.
     pub fn finish(&mut self) {
         for q in 0..self.cur.len() {
-            let c = self.fill[q] as usize;
+            let c = (self.fill[q] & 7) as usize;
             if c > 0 {
                 if self.cur[q] == self.end[q] {
                     self.refill(q);
@@ -503,7 +509,7 @@ impl Out {
                 self.cur[q] = std::ptr::null_mut();
                 self.end[q] = std::ptr::null_mut();
             }
-            self.fill[q] = 0;
+            self.fill[q] = FILL0;
         }
         #[cfg(target_arch = "x86_64")]
         // SAFETY: a store fence: the non-temporal stores are visible before anything later.
