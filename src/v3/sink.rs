@@ -6,7 +6,8 @@
 //! Record shapes (all u64 words):
 //! - SHORT event [w0, w1]: w0 = key | ingest << 40 | surv << 63; w1 = token | ts << 32 | purch << 63
 //! - LONG event [a, b, w2, w3]: w2 = ingest | surv << 63; w3 as w1 above
-//! - SHORT purchase [w0, buy]: w0 = key | ingest << 40; buy = category | price << 8
+//! - SHORT purchase [w0, buy]: w0 = key | ingest << 40; buy = category | price << 8 (price below
+//!   2^24: a larger one reaching the sink sets `bad`, a fallback, never a wrap)
 //! - LONG purchase [a, b, ingest, buy]
 //! - click [w0, w1]: w0 = token | ts << 32 (ts since window_start - 7 days); w1 = locator (48 bits:
 //!   file 12, offset 36) | campaign << 48
@@ -50,7 +51,13 @@ pub fn part_of(a: u64, b: u64, bits: u32) -> usize {
 /// Lookups are resolved this many records after they start, so the prefetch has time to land.
 const RING: usize = 64;
 
-/// A started lookup and the word its token goes into (the record is already in its bin).
+/// Event lookups prefetch shared: they are mostly hits, and a line taken for writing is taken
+/// away from every other core that reads it. Links and clicks bring most new IDs: for writing.
+const EVENT_PREFETCH_W: bool = false;
+
+/// A started lookup and the word its token goes into (the record is already in its bin: written
+/// at once, its line is still cached when the token is OR-ed in; measured better than holding
+/// whole records here and writing them complete through staged non-temporal lines).
 #[derive(Clone, Copy)]
 struct Pend {
     user: Pending,
@@ -76,6 +83,12 @@ pub struct V3Sink<'a, 'b> {
     pub edges: Bins<u64>,
     pub special: Vec<Special<'a>>,
     pub bad: bool,
+    /// Measurement switch ENGINE_SINK (feature `measure` only; always 0 otherwise): 1 drops event
+    /// batches, 2 skips the token lookups of events, 3 skips their bin writes.
+    mode: u8,
+    mbits: u32,
+    /// Heap word for mode 3's tokens (stays put when the sink moves).
+    scratch: Box<u64>,
     ring: Box<[Pend; RING]>,
     ring_n: usize,
     ring_at: usize,
@@ -104,16 +117,20 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             edges: Bins::with_chunk(1, (events_hint / 20).clamp(1 << 12, 1 << 19), 1 << 13),
             special: Vec::new(),
             bad: false,
+            mode: if cfg!(feature = "measure") { std::env::var("ENGINE_SINK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 },
+            scratch: Box::new(0),
+            mbits: std::env::var("ENGINE_SINK_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(bits).min(bits),
             ring: Box::new([Pend::default(); RING]),
             ring_n: 0,
             ring_at: 0,
         }
     }
 
-    /// Starts a lookup whose token is to be OR-ed into `*at` (bits 0-31) later.
+    /// Starts a lookup whose token is to be OR-ed into `*at` (bits 0-31) later (prefetched for
+    /// writing when `W`).
     #[inline(always)]
-    fn defer(&mut self, user: Pending, at: *mut u64) {
-        let p = Pend { user: self.tok.start_pending(user), at };
+    fn defer<const W: bool>(&mut self, user: Pending, at: *mut u64) {
+        let p = Pend { user: self.tok.start_hint::<W>(user.long, user.a, user.b), at };
         if self.ring_n == RING {
             self.resolve(self.ring_at);
             self.ring[self.ring_at] = p;
@@ -131,7 +148,8 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         if t == NO_TOKEN {
             self.bad = true;
         }
-        // SAFETY: `at` points at a word of a record in this sink's bins; chunks never move.
+        // SAFETY: `at` points at a word of a record in this sink's bins (or at `scratch`); chunks
+        // never move.
         unsafe { *p.at |= u64::from(t) };
     }
 
@@ -154,6 +172,46 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         self.edges.finish();
     }
 
+    /// ENGINE_SINK=1: nothing; 2: records without token lookups; 3: lookups without records
+    /// (tokens OR-ed into a scratch word); 4: only the per-lane field work. ENGINE_SINK_BITS lowers the partition bits of mode 2.
+    #[cold]
+    #[inline(never)]
+    fn events_measure(&mut self, b: &EvBatch) {
+        let n = b.n as usize;
+        if self.mode == 1 {
+            std::hint::black_box(b);
+            return;
+        }
+        let bits = self.mbits;
+        let scratch: *mut u64 = &mut *self.scratch;
+        for k in 0..n {
+            let surv = b.surv >> k & 1 != 0;
+            let ing = u64::from(b.ingest[k]);
+            let w1 = if surv { u64::from(b.ts[k]) << 32 } else { 0 };
+            if self.mode == 4 {
+                // The per-lane work both of the others share: fields, partition, lookup slot.
+                let a = b.ev_a[k];
+                let bb = if b.ev_long >> k & 1 == 0 { 0 } else { b.ev_b[k] };
+                std::hint::black_box((part_of(a, bb, bits), ing, w1, b.user_a[k] ^ b.user_b[k].rotate_left(29)));
+                continue;
+            }
+            if self.mode == 3 {
+                if surv {
+                    let user = Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: 0 };
+                    self.defer::<EVENT_PREFETCH_W>(user, scratch);
+                }
+                continue;
+            }
+            if b.ev_long >> k & 1 == 0 {
+                let a = b.ev_a[k];
+                self.short.push(part_of(a, 0, bits), [a | (ing << 40) | (u64::from(surv) << 63), w1]);
+            } else {
+                let (a, bb) = (b.ev_a[k], b.ev_b[k]);
+                self.long.push(part_of(a, bb, bits), [a, bb, ing | (u64::from(surv) << 63), w1]);
+            }
+        }
+    }
+
     fn user_token(&self, id: &'a [u8]) -> u32 {
         self.tok.token(classify(id, b'u'), id)
     }
@@ -163,13 +221,22 @@ impl<'a> Sink for V3Sink<'a, '_> {
     #[inline]
     fn events(&mut self, b: &EvBatch) {
         let n = b.n as usize;
+        if cfg!(feature = "measure") && self.mode != 0 {
+            return self.events_measure(b);
+        }
         for k in 0..n {
             let surv = b.surv >> k & 1 != 0;
             let purch = surv && b.purch >> k & 1 != 0;
             let ing = u64::from(b.ingest[k]);
             let ts = if surv { u64::from(b.ts[k]) } else { 0 };
             let w1 = (ts << 32) | (u64::from(purch) << 63);
-            let buy = if purch { u64::from(b.cat[k]) | (u64::from(b.price[k]) << 8) } else { 0 };
+            let buy = if purch {
+                // The parser accepts 1 to 10,000,000; anything at 2^24 or above would not fit.
+                self.bad |= b.price[k] >> 24 != 0;
+                u64::from(b.cat[k]) | (u64::from(b.price[k]) << 8)
+            } else {
+                0
+            };
             let at: *mut u64 = if b.ev_long >> k & 1 == 0 {
                 let a = b.ev_a[k];
                 let p = part_of(a, 0, self.bits);
@@ -191,7 +258,8 @@ impl<'a> Sink for V3Sink<'a, '_> {
             };
             if surv {
                 // A dead copy only shadows: its key, ingest and dead bit; no token needed.
-                self.defer(Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: 0 }, at);
+                let user = Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: 0 };
+                self.defer::<EVENT_PREFETCH_W>(user, at);
             }
         }
     }
@@ -204,7 +272,7 @@ impl<'a> Sink for V3Sink<'a, '_> {
                 self.bad = true;
             }
             let r = self.clicks.push_at(0, [u64::from(b.ts[k]) << 32, b.loc[k] | (u64::from(b.campaign[k]) << 48)]);
-            self.defer(Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: 0 }, r as *mut u64);
+            self.defer::<true>(Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: 0 }, r as *mut u64);
         }
     }
 
@@ -213,10 +281,10 @@ impl<'a> Sink for V3Sink<'a, '_> {
         let n = b.n as usize;
         for k in 0..n {
             let r = self.edges.push_at(0, 0);
-            self.defer(Pending { long: b.a_long >> k & 1 != 0, a: b.a_a[k], b: b.a_b[k], slot: 0 }, r);
+            self.defer::<true>(Pending { long: b.a_long >> k & 1 != 0, a: b.a_a[k], b: b.a_b[k], slot: 0 }, r);
             // The second side's token goes into the high half: resolve it through a shifted word.
             let r2 = self.edges.push_at(0, 0);
-            self.defer(Pending { long: b.b_long >> k & 1 != 0, a: b.b_a[k], b: b.b_b[k], slot: 0 }, r2);
+            self.defer::<true>(Pending { long: b.b_long >> k & 1 != 0, a: b.b_a[k], b: b.b_b[k], slot: 0 }, r2);
         }
     }
 
@@ -231,7 +299,9 @@ impl<'a> Sink for V3Sink<'a, '_> {
         let ws = self.ctx.window_start_ms;
         let token = if e.survives { self.user_token(e.user_id) } else { NO_TOKEN };
         let buy = if e.survives && e.purchase {
-            u32::from(self.ctx.products.code(e.product_id)) | (e.price.unwrap_or(0) << 8)
+            let price = e.price.unwrap_or(0);
+            self.bad |= price >> 24 != 0;
+            u32::from(self.ctx.products.code(e.product_id)) | (price << 8)
         } else {
             0
         };

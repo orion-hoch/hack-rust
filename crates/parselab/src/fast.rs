@@ -95,6 +95,8 @@ pub struct Fast<'a> {
 
 impl<'a> Fast<'a> {
     pub fn new(ctx: &'a Ctx) -> Fast<'a> {
+        #[cfg(target_arch = "x86_64")]
+        crate::fast3::choose_paths();
         let ws = ctx.window_start_ms;
         let we = ctx.window_end_ms;
         let ws_day = ws.div_euclid(DAY_MS);
@@ -805,6 +807,13 @@ fn chunk_scalar<S: Sink>(f: &Fast, kind: Kind, file: u32, buf: Buf, from: usize,
 }
 
 /// Parses the lines of `buf` whose start is in from..to into `sink`, with the given ISA path.
+///
+/// Release contract (for releasing consumed input behind the parse): when this returns, no later
+/// read by this call touches the bytes of [from + 4096, to - 4096). Neighbouring ranges of the
+/// same file read only within about 512 bytes of their own boundaries (the line resync, the last
+/// line, the 128-byte look-ahead block, the 40-byte look-behind), so the whole pages strictly
+/// inside [from + 4096, to - 4096) may be released at once, and a boundary page once both ranges
+/// that share it have returned. Software prefetches beyond `to` never fault.
 pub fn parse<S: Sink>(f: &Fast, isa: Isa, kind: Kind, file: u32, buf: Buf, from: usize, to: usize, sink: &mut S) {
     match isa {
         #[cfg(target_arch = "x86_64")]

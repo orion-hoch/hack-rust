@@ -38,6 +38,8 @@ pub struct Mapped {
     ptr: *mut u8,
     len: usize,
     pub path: PathBuf,
+    /// False for `from_raw`: the caller keeps (and unmaps) the mapping.
+    owned: bool,
 }
 
 unsafe impl Send for Mapped {}
@@ -49,14 +51,23 @@ impl Mapped {
         let file = fs::File::open(path)?;
         let len = file.metadata()?.len() as usize;
         if len == 0 {
-            return Ok(Mapped { ptr: std::ptr::null_mut(), len: 0, path: path.to_path_buf() });
+            return Ok(Mapped { ptr: std::ptr::null_mut(), len: 0, path: path.to_path_buf(), owned: true });
         }
         let flags = MAP_PRIVATE | if mode == MapMode::Populate { MAP_POPULATE } else { 0 };
         let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, flags, file.as_raw_fd(), 0) };
         if ptr as isize == -1 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Mapped { ptr: ptr as *mut u8, len, path: path.to_path_buf() })
+        Ok(Mapped { ptr: ptr as *mut u8, len, path: path.to_path_buf(), owned: true })
+    }
+
+    /// A file the caller has already mapped (the runtime's single reservation). The caller
+    /// keeps the mapping: dropping this does not unmap it.
+    ///
+    /// # Safety
+    /// `[ptr, ptr + len)` is a read-only mapping of the whole file that outlives this value.
+    pub unsafe fn from_raw(ptr: *const u8, len: usize, path: PathBuf) -> Mapped {
+        Mapped { ptr: ptr as *mut u8, len, path, owned: false }
     }
 
     #[inline(always)]
@@ -85,7 +96,7 @@ impl Mapped {
 
 impl Drop for Mapped {
     fn drop(&mut self) {
-        if self.len != 0 {
+        if self.len != 0 && self.owned {
             unsafe { munmap(self.ptr as *mut c_void, self.len) };
         }
     }

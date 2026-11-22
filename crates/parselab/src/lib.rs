@@ -31,7 +31,7 @@ pub fn prepare(ds: &Dataset) -> Result<Ctx, Fallback> {
 }
 
 /// Runs the fast parser over every file of the dataset on `threads` threads, cutting files into
-/// ranges of about `chunk_bytes` at arbitrary bytes.
+/// ranges of about `chunk_bytes` at arbitrary bytes (0: shrinking chunks, `par::plan_shrinking`).
 pub fn fast_all<S: Sink + Default + Send>(
     ds: &Dataset,
     ctx: &Ctx,
@@ -39,7 +39,7 @@ pub fn fast_all<S: Sink + Default + Send>(
     isa: fast::Isa,
     chunk_bytes: usize,
 ) -> Vec<S> {
-    fast_streams(ds, ctx, threads, isa, chunk_bytes, &[Stream::Events, Stream::Clicks, Stream::Links])
+    fast_streams(ds, ctx, threads, isa, chunk_bytes, &[Stream::Clicks, Stream::Links, Stream::Events])
 }
 
 /// As `fast_all`, for the given streams only.
@@ -52,7 +52,7 @@ pub fn fast_streams<S: Sink + Default + Send>(
     streams: &[Stream],
 ) -> Vec<S> {
     let f = fast::Fast::new(ctx);
-    let chunks = par::plan(ds, streams, chunk_bytes);
+    let chunks = if chunk_bytes == 0 { par::plan_shrinking(ds, streams, threads) } else { par::plan(ds, streams, chunk_bytes) };
     par::run(ds, &chunks, threads, |c, data, sink: &mut S| {
         let kind = match c.stream {
             Stream::Events => fast::Kind::Events,

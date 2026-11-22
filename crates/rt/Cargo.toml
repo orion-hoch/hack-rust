@@ -1,0 +1,22 @@
+[package]
+name = "rt"
+version = "0.1.0"
+description = "Runtime layer of the fast path: direct system calls, a pinned worker pool, one input reservation, arenas, output files, exit and the fallback to the general engine."
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Test and measurement driver (uses std; never shipped).
+[[bin]]
+name = "rtcheck"
+path = "src/bin/rtcheck.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

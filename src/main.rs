@@ -333,22 +333,69 @@ fn run(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
+/// Huge pages for the allocator as far as the machine can give them without compaction: rt's
+/// verdict for about 0.7 times the input bytes (the measured peak of anonymous memory is 0.57 to
+/// 0.65 times the input). Enough free 2 MB blocks, or a defrag mode that cannot stall: every
+/// mapping. Fewer: a budget of 80% of the free blocks, first come first served (the token table
+/// and the parse buffers come first). RT_HUGE=on|off|<MB> overrides (measurements).
+fn huge_pages(cfg: &Config) {
+    use std::os::unix::ffi::OsStrExt;
+    let budget = match env::var("RT_HUGE").as_deref() {
+        Ok("on") => usize::MAX,
+        Ok("off") => 0,
+        Ok(mb) if mb.parse::<usize>().is_ok() => mb.parse::<usize>().unwrap_or(0) << 20,
+        _ => {
+            let mut bytes = 0u64;
+            for sub in ["events", "clicks", "links"] {
+                if let Ok(l) = rt::input::scan(cfg.data.join(sub).as_os_str().as_bytes()) {
+                    bytes += l.files().iter().chain(l.dots()).map(|e| e.size).sum::<u64>();
+                }
+            }
+            let v = rt::arena::huge_verdict((bytes as usize) / 10 * 7);
+            if !matches!(v.enabled, b'a' | b'm') {
+                0
+            } else if v.use_huge {
+                usize::MAX
+            } else {
+                (v.free_2m.max(0) as usize) * (2 << 20) / 5 * 4
+            }
+        }
+    };
+    alloc::set_thp_budget(budget);
+}
+
 fn main() {
+    // First, while single-threaded: grow the descriptor table (growing it once threads share it
+    // waits an RCU grace period, 11 to 22 ms measured on the x86 box) and start the stage clock.
+    rt::init(0);
     let cfg = config();
+    huge_pages(&cfg);
+    if env::var_os("ENGINE_PATH").is_some_and(|v| v == "v1") {
+        // Possibly started by rt's fallback after a fault: no fast-path thread exists any more,
+        // so this removes whatever partial output it left, race-free.
+        use std::os::unix::ffi::OsStrExt;
+        for table in ["user_daily", "campaign_daily"] {
+            rt::out::sweep(cfg.out.join(table).as_os_str().as_bytes());
+        }
+    } else {
+        // SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT or SIGTRAP anywhere in the fast path: rt removes
+        // its output and re-executes this binary with ENGINE_PATH=v1 (on the thread's alt stack).
+        rt::fail::install();
+    }
     // The dataset-level switch: the fast path when the ID keys are recovered (or forced), v1
     // otherwise. ENGINE_PATH=v1 forces v1; ENGINE_PATH=fast fails instead of falling back.
     let path = env::var("ENGINE_PATH").unwrap_or_default();
     if path != "v1" {
-        // Any refusal, failed check, I/O error or panic in the fast path falls back to v1, after
-        // removing whatever the fast path may have written.
-        let fast = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            v3::try_run(&cfg.data, &cfg.out, cfg.threads, cfg.timing)
-        }));
+        // A refusal, failed check or I/O error in the fast path falls back to v1 here, after
+        // removing whatever the fast path may have written. A panic (panic = "abort") or a fault
+        // signal goes through rt's handler instead: it re-executes this binary with ENGINE_PATH=v1.
+        let fast = v3::try_run(&cfg.data, &cfg.out, cfg.threads, cfg.timing);
         let why = match fast {
-            Ok(Ok(fast::Outcome::Done)) => return,
-            Ok(Ok(fast::Outcome::Fallback(why))) => why,
-            Ok(Err(e)) => format!("I/O error: {e}"),
-            Err(_) => "panic".to_string(),
+            // Done: release input and memory in parallel, then exit_group (no destructors); with
+            // everything still mapped the kernel's single-thread teardown took 80 to 90 ms.
+            Ok(fast::Outcome::Done) => rt::exit::leave(0, &rt::exit::Release::ALL),
+            Ok(fast::Outcome::Fallback(why)) => why,
+            Err(e) => format!("I/O error: {e}"),
         };
         if path == "fast" {
             eprintln!("engine: fast path refused: {why}");

@@ -46,17 +46,19 @@ docker run --rm --network none --read-only -v "$PWD/data":/data:ro -v "$PWD/out"
 ## Dependencies
 
 None. All code in this repository was written by this team; `Cargo.lock` lists no package
-from crates.io. The workspace has three crates, all ours:
+from crates.io. The workspace has five crates, all ours:
 
 | Crate | Path | What it is |
 | --- | --- | --- |
-| `shopping-sessions-engine` | `.` | the engine, including its global allocator (`src/alloc.rs`), input mapping and newline search |
-| `parselab` | `crates/parselab` | the input parser and the read-only file mapping (`mmap` by a plain `extern "C"` declaration) |
+| `shopping-sessions-engine` | `.` | the engine, including its global allocator (`src/alloc.rs`) and newline search |
+| `parselab` | `crates/parselab` | the input parser |
 | `pqw` | `crates/pqw` | the Parquet writer |
+| `rt` | `crates/rt` | the runtime layer: worker pool, input mapping, memory arenas, exit and fault handling |
+| `sortlab` | `crates/sortlab` | per-person ordering of events and cutting them into sessions |
 
-System calls go through plain `extern "C"` declarations against the libc that the static
-binary links (musl). Build image: `rust:1.99-alpine3.22` (its gcc only drives the link; no C
-code is compiled).
+The runtime crate `rt` issues Linux system calls directly. Elsewhere, system calls go through
+plain `extern "C"` declarations against the libc that the static binary links (musl). Build
+image: `rust:1.99-alpine3.22` (its gcc only drives the link; no C code is compiled).
 
 ## License
 

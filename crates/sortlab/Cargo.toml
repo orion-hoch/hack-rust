@@ -1,0 +1,8 @@
+[package]
+name = "sortlab"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Sessions from person-partition records: grouping, slot aggregation and sort kernels"
+
+[dependencies]

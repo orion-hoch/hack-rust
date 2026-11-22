@@ -4,6 +4,7 @@
 
 pub mod dedup;
 pub mod ids;
+pub mod mem;
 pub mod people;
 pub mod persons;
 pub mod sink;
@@ -14,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use parselab::{Dataset, MapMode, Stream};
+use parselab::{Dataset, Stream};
 
 use crate::fast::Outcome;
 use crate::fast::agg::FastAgg;
@@ -46,17 +47,23 @@ unsafe extern "C" {
 }
 
 /// (system CPU ms, minor faults, major faults) of the whole process so far.
-fn usage() -> (f64, i64, i64) {
+/// (user ms, system ms, minor faults, major faults) of the whole process so far.
+fn usage() -> (f64, f64, i64, i64) {
     let mut r = Rusage::default();
     // SAFETY: `r` is a writable struct with the layout of Linux `struct rusage`.
     unsafe { getrusage(0, &mut r) };
-    (r.stime[0] as f64 * 1e3 + r.stime[1] as f64 / 1e3, r.rest[4], r.rest[5])
+    (
+        r.utime[0] as f64 * 1e3 + r.utime[1] as f64 / 1e3,
+        r.stime[0] as f64 * 1e3 + r.stime[1] as f64 / 1e3,
+        r.rest[4],
+        r.rest[5],
+    )
 }
 
 struct Clock {
     on: bool,
     last: Instant,
-    last_use: (f64, i64, i64),
+    last_use: (f64, f64, i64, i64),
 }
 
 impl Clock {
@@ -65,11 +72,12 @@ impl Clock {
         if self.on {
             let u = usage();
             eprintln!(
-                "timing v3.{what:<12} {:9.2} ms   sys {:7.1} ms  minflt {:7}  majflt {}",
+                "timing v3.{what:<12} {:9.2} ms   user {:7.1} ms  sys {:7.1} ms  minflt {:7}  majflt {}",
                 (now - self.last).as_secs_f64() * 1e3,
                 u.0 - self.last_use.0,
                 u.1 - self.last_use.1,
-                u.2 - self.last_use.2
+                u.2 - self.last_use.2,
+                u.3 - self.last_use.3
             );
             self.last_use = u;
         }
@@ -77,40 +85,66 @@ impl Clock {
     }
 }
 
-fn hidden_csv(dir: &Path) -> bool {
-    ["events", "clicks", "links"].iter().any(|sub| {
-        std::fs::read_dir(dir.join(sub))
-            .map(|rd| rd.flatten().any(|e| {
-                let n = e.file_name();
-                let n = n.to_string_lossy();
-                n.starts_with('.') && n.ends_with(".csv")
-            }))
-            .unwrap_or(false)
-    })
+/// The inputs through rt: events, clicks and links mapped into one reservation (zero pages
+/// around every file), registered for release-behind and for the parallel release at exit. The
+/// same files as `Dataset::open` (regular `*.csv`, not starting with '.', in name order).
+fn open_rt(dir: &Path) -> io::Result<(Dataset, &'static rt::input::Inputs)> {
+    use std::os::unix::ffi::OsStrExt;
+    let errno = |e: rt::sys::Errno| io::Error::from_raw_os_error(e.0);
+    let subs = ["events", "clicks", "links"];
+    let mut ls = Vec::with_capacity(3);
+    for sub in subs {
+        ls.push(rt::input::scan(dir.join(sub).as_os_str().as_bytes()).map_err(errno)?);
+    }
+    let ls: &'static [rt::input::Listing] = Box::leak(ls.into_boxed_slice());
+    let streams: Vec<rt::input::Stream> = ls.iter().map(|l| rt::input::Stream { listing: l, dots: false }).collect();
+    let slot = Box::leak(Box::new(std::mem::MaybeUninit::uninit()));
+    let inp = rt::input::map(&streams, slot, true).map_err(errno)?;
+    let files = [0usize, 1, 2].map(|s| {
+        let base = dir.join(subs[s]);
+        inp.stream(s)
+            .iter()
+            .zip(ls[s].files())
+            .map(|(f, e)| {
+                let path = base.join(std::ffi::OsStr::from_bytes(e.name()));
+                // SAFETY: rt keeps the mapping for the whole run; this Mapped never unmaps it.
+                unsafe { parselab::dataset::Mapped::from_raw(f.ptr, f.len, path) }
+            })
+            .collect()
+    });
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_default();
+    let ds = Dataset { dir: dir.to_path_buf(), files, products: read("products.csv"), campaigns: read("campaigns.csv"), manifest: read("manifest.json") };
+    Ok((ds, inp))
 }
 
 pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Result<Outcome> {
     let t0 = Instant::now();
-    let mut clock = Clock { on: timing, last: t0, last_use: if timing { usage() } else { (0.0, 0, 0) } };
+    let mut clock = Clock { on: timing, last: t0, last_use: if timing { usage() } else { (0.0, 0.0, 0, 0) } };
     crate::par::init_pool(threads);
-    if hidden_csv(data) {
-        return Ok(Outcome::Fallback("a *.csv name starts with '.'".into()));
+    let (ds, inp) = open_rt(data)?;
+    // The fast path's memory region (address space only until a stage takes from it).
+    let input_bytes: u64 = [Stream::Events, Stream::Clicks, Stream::Links].iter().map(|&s| ds.bytes(s)).sum();
+    if !mem::init((input_bytes as usize / 100) * 45) {
+        return Ok(Outcome::Fallback("memory region could not be reserved".into()));
     }
-    let ds = Dataset::open(data, MapMode::Lazy)?;
     let ctx = match parselab::prepare(&ds) {
         Ok(c) => c,
         Err(f) => return Ok(Outcome::Fallback(format!("{f:?}"))),
     };
     let ev_bytes = ds.bytes(Stream::Events) as usize;
     let est_events = ev_bytes / 70 + 1;
-    // User IDs come from all three inputs: every link line can add two, a click or an event
-    // line one. Generator data has about one distinct user per 11 event lines, and every linked
-    // user is in a link line; this estimate is at least that from each input, and the tables
-    // are sized to twice it, so generator data sits near a quarter full (fallback at 3/4).
-    let link_lines = ds.bytes(Stream::Links) as usize / 18 + 1;
+    // User IDs come from all three inputs. In generator data every linked user is in a link line
+    // (about one new ID per 18-byte line) and the users seen only in events or clicks are about
+    // one per 30 of those lines; the estimate takes each input at that rate. The SHORT table
+    // gets twice the estimate and the LONG table a quarter (one ID in eight is LONG), so
+    // generator data sits below a third full; a table past 3/4 falls back to v1 (exact).
+    let link_lines = ds.bytes(Stream::Links) as usize / 16 + 1;
     let click_lines = ds.bytes(Stream::Clicks) as usize / 40 + 1;
-    let est_users = 2 * link_lines + click_lines / 8 + est_events / 12 + 4096;
-    let tok = Tokens::new(est_users);
+    let est_users = link_lines + (est_events + click_lines) / 30 + 4096;
+    // An upper bound on distinct users from line-count bounds (shortest plausible lines): small
+    // inputs size both tables from it, so an unusual mix of ID kinds does not fall back (tokens.rs).
+    let bound_users = ds.bytes(Stream::Links) as usize / 8 * 2 + ev_bytes / 40 + ds.bytes(Stream::Clicks) as usize / 30;
+    let tok = Tokens::with_bound(est_users, bound_users);
     // Move-1 partitions of about 16K records: the dedup table (32K slots) stays in L2.
     let p1_bits = ((est_events / 16_000).max(1).next_power_of_two().trailing_zeros()).clamp(4, 14);
     clock.mark("open");
@@ -140,8 +174,14 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             parselab::fast::parse(&fp, isa, kind, c.file, parselab::fast::Buf::plain(bytes), c.from, c.to, s);
         }
         // Release the parsed range: pages stay in the page cache, so a later re-read by locator
-        // (rare) faults them back; keeping them mapped costs 70 ms at exit at practice size.
-        file.advise(c.from, c.to, 4);
+        // faults them back; keeping them mapped costs 70 ms at exit at practice size. Click lines
+        // stay mapped: the session stage re-reads the click_id of every click in a ts tie
+        // (about 180K reads at practice size), which faulted about 20K pages back.
+        // rt batches whole 2 MB bins into 32 to 64 MB madvise calls (about 140 at p20v5 instead of
+        // one per 4 MB chunk; each call interrupts every other running worker for its TLB flush).
+        if c.stream != Stream::Clicks {
+            inp.consumed(inp.first(c.stream as usize) + c.file as usize, c.from, c.to);
+        }
     };
     let sinks = crate::par::run(
         threads,
@@ -156,6 +196,12 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     for s in sinks.iter_mut() {
         s.drain();
         s.edges.finish();
+    }
+    // Fault planting for tests of the fallback routes (ENGINE_PLANT=full|panic), compiled in only
+    // with the `plant` feature.
+    let plant = if cfg!(feature = "plant") { std::env::var("ENGINE_PLANT").unwrap_or_default() } else { String::new() };
+    if plant == "full" {
+        tok.full.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     // Every NO_TOKEN is caught here, before persons is built from the edges.
     if tok.full.load(std::sync::atomic::Ordering::Relaxed) || sinks.iter().any(|s| s.bad) {
@@ -180,7 +226,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             if i == 0 {
                 let t = Instant::now();
                 let refs: Vec<&[u64]> = edges.iter().flat_map(|b| b.all()).collect();
-                *people_slot.lock().unwrap() = People::build(&tok, &refs);
+                *people_slot.lock().unwrap() = People::build(&tok, &refs, timing);
                 if timing {
                     eprintln!("timing v3.  persons(task) {:9.2} ms", t.elapsed().as_secs_f64() * 1e3);
                 }
@@ -198,6 +244,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let Some(people) = people_slot.into_inner().unwrap_or(None) else {
         return Ok(Outcome::Fallback("persons could not be built (bad token)".into()));
     };
+    inp.flush();
     clock.mark("parse.events");
     if tok.full.load(std::sync::atomic::Ordering::Relaxed) || sinks.iter().any(|s| s.bad) {
         return Ok(Outcome::Fallback("token table full or a record did not fit".into()));
@@ -228,6 +275,13 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         .map(|p| sinks.iter().map(|s| s.long.slices(p).map(|c| c.len()).sum::<usize>()).sum::<usize>() + spec_by_part[p].len())
         .max()
         .unwrap_or(0);
+    // A partition above 2^24 records (many copies of one event_id, say) goes to v1.
+    if max_short.max(max_long) > 1 << 24 {
+        return Ok(Outcome::Fallback(format!("a dedup partition of {} records", max_short.max(max_long))));
+    }
+    // Tables start at the typical partition size and grow only on the worker that meets an outlier.
+    let typical_short = (sinks.iter().map(|s| s.short.len()).sum::<usize>() / parts) * 2 + 64;
+    let typical_long = (sinks.iter().map(|s| s.long.len()).sum::<usize>() / parts) * 2 + 64;
     let est_surv = est_events;
     let p2_bits = ((est_surv / 24_000).max(1).next_power_of_two().trailing_zeros()).clamp(4, 13);
     let cx3 = Ctx3 { people: &people, ingest_base_ms: ctx.ingest_base_s * 1000 };
@@ -236,8 +290,11 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let dd = crate::par::run(
         threads,
         parts,
-        |_| (Tables::new((max_short + max_short / 2).next_power_of_two().max(16), (max_long + max_long / 2).next_power_of_two().max(16)), Move2::new(p2_bits, est_surv / threads.max(1)), 0usize, None::<Abort>),
+        |_| (Tables::new((typical_short.min(max_short) * 3 / 2).next_power_of_two().max(16), (typical_long.min(max_long) * 3 / 2).next_power_of_two().max(16)), Move2::new(p2_bits, est_surv / threads.max(1)), 0usize, None::<Abort>),
         |(t, m2, n, err), p| {
+            if plant == "panic" && p == 7 {
+                panic!("planted panic in a dedup task");
+            }
             let short: Vec<&[[u64; 2]]> = sinks_ref.iter().flat_map(|s| s.short.slices(p)).collect();
             let long: Vec<&[[u64; 4]]> = sinks_ref.iter().flat_map(|s| s.long.slices(p)).collect();
             let ps: Vec<&[[u64; 2]]> = sinks_ref.iter().flat_map(|s| s.pshort.slices(p)).collect();
@@ -291,13 +348,24 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let span = ((ctx.window_end_ms - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     let campaigns_with_organic = ctx.campaigns.ids.len() + 1;
     let organic = ctx.campaigns.ids.len() as u32;
-    let person_bits = 32 - (tok.capacity() as u32).leading_zeros();
-    let pcx = PeopleCtx { ds: &ds, ctx: &ctx, tok: &tok, organic, person_bits };
+    // The session kernel: sorting network for small persons where AVX-512 exists, slots otherwise.
+    // Test builds can force another (ENGINE_KERNEL=slots|sort|radix).
+    let kernel = match if cfg!(feature = "plant") { std::env::var("ENGINE_KERNEL").unwrap_or_default() } else { String::new() }.as_str() {
+        "slots" => sortlab::Kernel::Slots,
+        "sort" => sortlab::Kernel::Sort,
+        "radix" => sortlab::Kernel::Radix,
+        _ => sortlab::Kernel::Net,
+    };
+    let pcx = PeopleCtx { ds: &ds, ctx: &ctx, tok: &tok, organic, kernel };
     let (m2s_ref, ck_ref) = (&m2s, &ck_parts);
     let workers = crate::par::run(
         threads,
         1 << p2_bits,
-        |_| Worker::new(FastAgg::new(campaigns_with_organic, day0, span)),
+        |_| {
+            let mut w = Worker::new(FastAgg::new(campaigns_with_organic, day0, span));
+            w.timing = timing;
+            w
+        },
         |w, q| {
             let ev: Vec<&[u64]> = m2s_ref.iter().flat_map(|m| m.ev.slices(q)).collect();
             let buys: Vec<&[[u64; 2]]> = m2s_ref.iter().flat_map(|m| m.buys.slices(q)).collect();
@@ -306,6 +374,32 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         },
     );
     clock.mark("sessions");
+    if timing {
+        let mut ph = [0u64; 5];
+        for w in &workers {
+            for i in 0..5 {
+                ph[i] += w.phase_ns[i];
+            }
+        }
+        eprintln!(
+            "timing v3.  sessions CPU ms: gather {:.1}, kernel {:.1}, purchases {:.1}, clicks {:.1}, walk {:.1}",
+            ph[0] as f64 / 1e6,
+            ph[1] as f64 / 1e6,
+            ph[2] as f64 / 1e6,
+            ph[3] as f64 / 1e6,
+            ph[4] as f64 / 1e6
+        );
+        let mut ct = [0u64; 6];
+        for w in &workers {
+            for i in 0..6 {
+                ct[i] += w.counts[i];
+            }
+        }
+        eprintln!(
+            "timing v3.  sessions counts: clicks {}, tie groups re-read {}, persons {}, rows {}, direct assist steps {}, interval-route persons {}",
+            ct[0], ct[1], ct[2], ct[3], ct[4], ct[5]
+        );
+    }
     if workers.iter().any(|w| w.bad) {
         return Ok(Outcome::Fallback("a purchase flag without its purchase record".into()));
     }

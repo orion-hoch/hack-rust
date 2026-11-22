@@ -14,11 +14,21 @@ path = "src/main.rs"
 [dependencies]
 parselab = { path = "crates/parselab" }
 pqw = { path = "crates/pqw" }
+rt = { path = "crates/rt" }
+sortlab = { path = "crates/sortlab" }
+
+[features]
+# Test builds only: ENGINE_PLANT=full|panic plants a fault to exercise the fallback routes.
+plant = []
+# Measurement builds only: ENGINE_SINK=1|2|3 (drops or redirects event records),
+# ENGINE_SINK_BITS, ENGINE_TOK_PREFAULT=0 and ENGINE_TOK_STAT in the v3 sink and token table.
+measure = []
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-# unwind: a panic in the fast path is caught and the run falls back to v1 (never a crash).
-panic = "unwind"
+# abort: a panic raises SIGABRT, and rt's handler removes partial output and re-executes the
+# binary as v1 (proved in the container under the scorer flags); no unwinding tables needed.
+panic = "abort"
 debug = false

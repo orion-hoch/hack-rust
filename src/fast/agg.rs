@@ -1,10 +1,9 @@
 //! campaign_daily counters of one fast worker, laid out for the cache.
 //!
-//! A cell is (day of the window, campaign), day-major. Credited sessions and purchasing sessions
-//! share one u64 (two u32 halves), revenue is a u64 array, assists a u32 array: 8 + 8 + 4 bytes a
-//! cell in three arrays (2,001 campaigns x 15 days: about 120 to 240 KB each) instead of one
-//! 32-byte cell, so the per-session updates stay in L2. Counts per thread are below 2^32 (at most
-//! the number of sessions).
+//! A cell is (day of the window, campaign), day-major. A credit touches one 16-byte pair (credited
+//! and purchasing sessions as two u32 halves of one u64, then revenue), so one cache line per
+//! credited session; assists are a separate u32 array. 2,001 campaigns x 15 days: 480 KB of pairs
+//! and 120 KB of assists. Counts per thread are below 2^32 (at most the number of sessions).
 
 use crate::sessions::CampaignAgg;
 
@@ -12,15 +11,15 @@ pub struct FastAgg {
     campaigns: usize,
     span: usize,
     day0: i64,
-    cred: Vec<u64>,
-    rev: Vec<u64>,
+    /// [sessions | purchasing << 32, revenue] per cell.
+    cred: Vec<[u64; 2]>,
     asst: Vec<u32>,
 }
 
 impl FastAgg {
     pub fn new(campaigns: usize, day0: i64, span: usize) -> Self {
         let cells = campaigns * span;
-        FastAgg { campaigns, span, day0, cred: vec![0; cells], rev: vec![0; cells], asst: vec![0; cells] }
+        FastAgg { campaigns, span, day0, cred: vec![[0, 0]; cells], asst: vec![0; cells] }
     }
 
     /// Day offset of an absolute day number.
@@ -32,9 +31,9 @@ impl FastAgg {
     /// One credited session.
     #[inline(always)]
     pub fn credit(&mut self, campaign: u32, off: usize, purchase: bool, revenue: u64) {
-        let c = off * self.campaigns + campaign as usize;
-        self.cred[c] += 1 | (u64::from(purchase) << 32);
-        self.rev[c] += revenue;
+        let c = &mut self.cred[off * self.campaigns + campaign as usize];
+        c[0] += 1 | (u64::from(purchase) << 32);
+        c[1] += revenue;
     }
 
     /// `n` sessions assisted.
@@ -45,10 +44,8 @@ impl FastAgg {
 
     pub fn merge(&mut self, other: &FastAgg) {
         for (a, b) in self.cred.iter_mut().zip(&other.cred) {
-            *a += b;
-        }
-        for (a, b) in self.rev.iter_mut().zip(&other.rev) {
-            *a += b;
+            a[0] += b[0];
+            a[1] += b[1];
         }
         for (a, b) in self.asst.iter_mut().zip(&other.asst) {
             *a += b;
@@ -61,7 +58,7 @@ impl FastAgg {
             let day = (self.day0 + off as i64) as i32;
             for campaign in 0..self.campaigns {
                 let c = off * self.campaigns + campaign;
-                let (cr, rv, a) = (self.cred[c], self.rev[c], self.asst[c]);
+                let ([cr, rv], a) = (self.cred[c], self.asst[c]);
                 if cr == 0 && a == 0 {
                     continue;
                 }

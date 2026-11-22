@@ -8,6 +8,11 @@ publish = false
 
 [features]
 phases = []
+# Do the vector batches' multiplies as 256-bit halves (no heavy 512-bit instruction): for CPUs
+# that lower their clock on heavy 512-bit code (Skylake-SP, Cascade Lake). Same records.
+mul256 = []
+# Force the full 512-bit multiplies (overrides the CPU-model choice).
+mul512 = []
 
 [lib]
 path = "src/lib.rs"

@@ -1,12 +1,12 @@
 //! Event lines, v2: line structure per 64-byte block, decoding 8 lines at a time.
 //!
 //! Phase A walks a window of the buffer in 64-byte blocks: comma, quote and newline masks; every
-//! separator position flattened into `sep`, every newline into `nl`; one bit per separator saying
-//! whether the next byte is a quote (`fbits`, via pext); quote legality as mask identities with
+//! separator flattened into `sep` as a window-relative position with two flags (newline; the next
+//! byte is a quote); quote legality as mask identities with
 //! carries across blocks, any violation position into `viol`.
 //!
 //! Phase B takes 8 consecutive lines whose separators sit at stride 7 (6 commas and the newline)
-//! and no violation: field bounds come from `sep` and `fbits`, and the decoders run lane-wise on
+//! and no violation: field bounds come from `sep` and its flags, and the decoders run lane-wise on
 //! [u64; 8] arrays (the same arithmetic as v1, so it vectorizes with the target features of the
 //! entry function). Any other line goes through the v1 per-line path, which falls back to the
 //! reference itself, so every line ends up exact.
@@ -51,16 +51,21 @@ impl Drop for ScratchGuard {
     }
 }
 
+/// A separator entry: window-relative position (bits 0..30), bit 31 set when the separator is a
+/// newline, bit 30 set when the byte after it is a quote (the next field is quoted).
+pub(crate) const NL_FLAG: u32 = 1 << 31;
+pub(crate) const Q_FLAG: u32 = 1 << 30;
+pub(crate) const POS_MASK: u32 = (1 << 30) - 1;
+
 pub(crate) struct Scratch {
     sep: Vec<u32>,
-    /// Bit s: separator s is a newline.
-    nbits: Vec<u64>,
-    /// Index in `sep` of the last newline of the window (valid when nnl > 0).
+    /// Index in `sep` of the last newline of the window (valid when `has_nl`).
     last_nl: usize,
+    has_nl: bool,
+    /// The window's first byte is a quote (field 0 of its first line is quoted).
+    pub(crate) wq0: bool,
     viol: Vec<u32>,
-    fbits: Vec<u64>,
     nsep: usize,
-    nnl: usize,
     nviol: usize,
 }
 
@@ -69,47 +74,71 @@ impl Scratch {
     pub(crate) fn sep_ptr(&self) -> *const u32 {
         self.sep.as_ptr()
     }
-    /// 64 bits of the newline-bit stream from bit k.
+    /// Window-relative position of separator k.
     #[inline(always)]
-    pub(crate) fn nbits_window(&self, k: usize) -> u64 {
-        let w = k >> 6;
-        let off = k & 63;
-        (self.nbits[w] >> off) | ((self.nbits[w + 1] << 1) << (63 - off))
+    fn pos(&self, k: usize) -> usize {
+        (self.sep[k] & POS_MASK) as usize
     }
     /// Index of the first newline separator at or after k (k <= last_nl).
     #[inline(always)]
     fn next_nl(&self, k: usize) -> usize {
-        let mut w = k >> 6;
-        let mut bits = self.nbits[w] >> (k & 63) << (k & 63);
-        while bits == 0 {
-            w += 1;
-            bits = self.nbits[w];
+        let mut k = k;
+        while self.sep[k] & NL_FLAG == 0 {
+            k += 1;
         }
-        (w << 6) + bits.trailing_zeros() as usize
+        k
     }
-    /// Start of the line whose first separator is k.
+    /// Window-relative start of the line whose first separator is k.
     #[inline(always)]
-    fn line_start(&self, k: usize, wpos: usize) -> usize {
-        if k == 0 { wpos } else { self.sep[k - 1] as usize + 1 }
+    fn line_start(&self, k: usize) -> usize {
+        if k == 0 { 0 } else { self.pos(k - 1) + 1 }
     }
-    /// 64 bits of the quote-bit stream from bit k.
+    /// Whether separator k - 1 (the one before field 0 of the line starting at k) is followed by a
+    /// quote.
     #[inline(always)]
-    pub(crate) fn fbits_window(&self, k: usize) -> u64 {
-        fbits7(&self.fbits, k)
+    fn q_before(&self, k: usize) -> bool {
+        if k == 0 { self.wq0 } else { self.sep[k - 1] & Q_FLAG != 0 }
     }
     fn new() -> Scratch {
         let n = W + 256;
-        Scratch {
-            sep: vec![0; n + 64],
-            nbits: vec![0; n / 64 + 8],
-            last_nl: 0,
-            viol: vec![0; n + 64],
-            fbits: vec![0; n / 64 + 8],
-            nsep: 0,
-            nnl: 0,
-            nviol: 0,
+        Scratch { sep: vec![0; n + 128], last_nl: 0, has_nl: false, wq0: false, viol: vec![0; n + 64], nsep: 0, nviol: 0 }
+    }
+}
+
+/// Whether the 8 * nf entries from k are 8 well-formed lines: a newline exactly at every nf-th.
+#[inline(always)]
+unsafe fn nl_pattern<const ISA: u8>(sc: &Scratch, k: usize, nf: usize) -> bool {
+    let n = 8 * nf;
+    let p = unsafe { sc.sep.as_ptr().add(k) };
+    let mut bits = 0u64;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if ISA != fast::ISA_SCALAR {
+            for c in 0..n.div_ceil(8) {
+                bits |= (unsafe { signs8(p.add(8 * c)) } as u64) << (8 * c);
+            }
+        } else {
+            for i in 0..n {
+                bits |= ((unsafe { *p.add(i) } >> 31) as u64) << i;
+            }
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    for i in 0..n {
+        bits |= ((unsafe { *p.add(i) } >> 31) as u64) << i;
+    }
+    let span = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let pattern: u64 = if nf == 7 { 0x0081_0204_0810_2040 } else { 0x8888_8888 };
+    bits & span == pattern
+}
+
+/// The sign bits (newline flags) of 8 entries.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn signs8(p: *const u32) -> u32 {
+    use std::arch::x86_64::*;
+    unsafe { _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_loadu_si256(p as *const __m256i))) as u32 }
 }
 
 /// Days table indexed by (year - y0) * 384 + month * 32 + day, for two years.
@@ -228,19 +257,22 @@ unsafe fn pext_bmi2(x: u64, mask: u64) -> u64 {
     std::arch::x86_64::_pext_u64(x, mask)
 }
 
-/// Writes the positions of the set bits of `m` (plus `base`) at out[n..]; returns the new n.
+/// Writes the entries of the set bits of `m` (position base + bit, flags from `nl` and `fq`) at
+/// out[n..]; returns the new n.
 #[inline(always)]
-unsafe fn flatten(mut m: u64, base: u32, out: *mut u32, n: usize) -> usize {
+unsafe fn flatten(mut m: u64, nl: u64, fq: u64, base: u32, out: *mut u32, n: usize) -> usize {
     let cnt = m.count_ones() as usize;
     let p = unsafe { out.add(n) };
+    let entry = |t: u32| (base + t) | (((nl >> t) as u32 & 1) << 31) | (((fq >> t) as u32 & 1) << 30);
     for i in 0..8 {
-        unsafe { *p.add(i) = base + m.trailing_zeros() };
+        let t = m.trailing_zeros() & 63;
+        unsafe { *p.add(i) = entry(t) };
         m &= m.wrapping_sub(1);
     }
     if cnt > 8 {
         let mut i = 8;
         while m != 0 {
-            unsafe { *p.add(i) = base + m.trailing_zeros() };
+            unsafe { *p.add(i) = entry(m.trailing_zeros()) };
             m &= m.wrapping_sub(1);
             i += 1;
         }
@@ -248,21 +280,165 @@ unsafe fn flatten(mut m: u64, base: u32, out: *mut u32, n: usize) -> usize {
     n + cnt
 }
 
-/// Phase A over blocks starting at wpos (a line start) up to wend. Returns the end of the bytes
-/// whose separators are all recorded.
+/// Plain position list (the violation list).
+#[inline(always)]
+unsafe fn flatten_pos(mut m: u64, base: u32, out: *mut u32, n: usize) -> usize {
+    let mut i = n;
+    while m != 0 {
+        unsafe { *out.add(i) = base + m.trailing_zeros() };
+        m &= m.wrapping_sub(1);
+        i += 1;
+    }
+    i
+}
+
+/// Separator entries of one block by compress (AVX-512F vpcompressd in 16-bit pieces), flags
+/// set by masked ors: writes out[n..n + popcnt(m)] (and up to 16 more entries of scratch).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn flatten_compress(m: u64, nl: u64, fq: u64, base: u32, out: *mut u32, n: usize) -> usize {
+    use std::arch::x86_64::*;
+    let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let b = _mm512_add_epi32(_mm512_set1_epi32(base as i32), iota);
+    let nlf = _mm512_set1_epi32(NL_FLAG as i32);
+    let qf = _mm512_set1_epi32(Q_FLAG as i32);
+    let mut n = n;
+    let pieces = [0i32, 16, 32, 48];
+    for (piece, &off) in pieces.iter().enumerate() {
+        let sh = 16 * piece as u32;
+        let k = (m >> sh) as u16;
+        let v = _mm512_add_epi32(b, _mm512_set1_epi32(off));
+        let v = _mm512_mask_or_epi32(v, (nl >> sh) as u16, v, nlf);
+        let v = _mm512_mask_or_epi32(v, (fq >> sh) as u16, v, qf);
+        let v = _mm512_maskz_compress_epi32(k, v);
+        unsafe { _mm512_storeu_si512(out.add(n) as *mut __m512i, v) };
+        n += k.count_ones() as usize;
+    }
+    n
+}
+
+/// The AVX-512 phase A: one function with few live values (block pointer, the three masks, two
+/// carry bits, the write pointer), so nothing spills. Returns the number of entries written.
+/// Violations go through an out-of-line path into `viol` (rare). Blocks read [p, p + 128).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,bmi1,bmi2,popcnt,lzcnt")]
+#[inline(never)]
+unsafe fn phase_a_avx512(p0: *const u8, nblocks: usize, pf: usize, sep: *mut u32, viol: &mut ViolList) -> usize {
+    use std::arch::x86_64::*;
+    unsafe {
+        let cc = _mm512_set1_epi8(b',' as i8);
+        let qq = _mm512_set1_epi8(b'"' as i8);
+        let nn = _mm512_set1_epi8(b'\n' as i8);
+        let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let nlf = _mm512_set1_epi32(NL_FLAG as i32);
+        let qf = _mm512_set1_epi32(Q_FLAG as i32);
+        let v = _mm512_loadu_si512(p0 as *const __m512i);
+        let mut q = _mm512_cmpeq_epi8_mask(v, qq);
+        let mut n = _mm512_cmpeq_epi8_mask(v, nn);
+        let mut d = _mm512_cmpeq_epi8_mask(v, cc) | n;
+        let mut dprev = 1u64;
+        let mut eprev = 0u64;
+        let mut carry = 0u64;
+        let mut out = sep;
+        let mut rel = 0u32;
+        let mut p = p0;
+        for _ in 0..nblocks {
+            if pf != 0 {
+                _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(pf) as *const i8);
+            }
+            let v2 = _mm512_loadu_si512(p.add(64) as *const __m512i);
+            let q2 = _mm512_cmpeq_epi8_mask(v2, qq);
+            let n2 = _mm512_cmpeq_epi8_mask(v2, nn);
+            let d2 = _mm512_cmpeq_epi8_mask(v2, cc) | n2;
+            let fs = (d << 1) | dprev;
+            let fe = (d >> 1) | (d2 << 63);
+            let s = q & fs;
+            let e = q & fe;
+            let (t1, o1) = (!d).overflowing_add(s);
+            let (t2, o2) = t1.overflowing_add(carry);
+            carry = (o1 | o2) as u64;
+            let bad = (q & !(fs | fe)) | (s & e) | ((t2 & d) ^ ((e << 1) | eprev));
+            if bad != 0 {
+                viol.push_mask(bad, rel);
+            }
+            let fq = ((q >> 1) | (q2 << 63)) & d;
+            // Entries: position, newline flag, quote-after flag; compressed by d in 16-bit pieces.
+            let b = _mm512_add_epi32(_mm512_set1_epi32(rel as i32), iota);
+            for piece in 0..4u32 {
+                let sh = 16 * piece;
+                let k = (d >> sh) as u16;
+                let x = _mm512_add_epi32(b, _mm512_set1_epi32(sh as i32));
+                let x = _mm512_mask_or_epi32(x, (n >> sh) as u16, x, nlf);
+                let x = _mm512_mask_or_epi32(x, (fq >> sh) as u16, x, qf);
+                _mm512_storeu_si512(out as *mut __m512i, _mm512_maskz_compress_epi32(k, x));
+                out = out.add(k.count_ones() as usize);
+            }
+            dprev = d >> 63;
+            eprev = e >> 63;
+            q = q2;
+            n = n2;
+            d = d2;
+            p = p.add(64);
+            rel += 64;
+        }
+        out.offset_from(sep) as usize
+    }
+}
+
+/// Violation positions (absolute), filled on the rare path.
+pub(crate) struct ViolList {
+    ptr: *mut u32,
+    n: usize,
+    base: u32,
+}
+
+impl ViolList {
+    #[inline(never)]
+    #[cold]
+    fn push_mask(&mut self, mut m: u64, rel: u32) {
+        while m != 0 {
+            unsafe { *self.ptr.add(self.n) = self.base + rel + m.trailing_zeros() };
+            self.n += 1;
+            m &= m - 1;
+        }
+    }
+}
+
+/// Phase A over blocks starting at wpos (a line start) up to wend: separator entries (window-
+/// relative, with flags), the violation list, and the index of the last newline.
 #[inline(always)]
 unsafe fn phase_a<const ISA: u8>(base: *const u8, wpos: usize, wend: usize, sc: &mut Scratch) -> usize {
-    let (mut nsep, mut nnl, mut nviol) = (0usize, 0usize, 0usize);
+    #[cfg(target_arch = "x86_64")]
+    if ISA == fast::ISA_AVX512 {
+        sc.wq0 = unsafe { *base.add(wpos) } == b'"';
+        let nblocks = (wend - wpos).div_ceil(64);
+        let pf = PREFETCH.load(std::sync::atomic::Ordering::Relaxed);
+        let mut vl = ViolList { ptr: sc.viol.as_mut_ptr(), n: 0, base: wpos as u32 };
+        let nsep = unsafe { phase_a_avx512(base.add(wpos), nblocks, pf, sc.sep.as_mut_ptr(), &mut vl) };
+        unsafe { *sc.viol.as_mut_ptr().add(vl.n) = u32::MAX };
+        sc.nviol = vl.n;
+        sc.nsep = nsep;
+        // The last newline: scan back over the flags (the window ends inside a line).
+        let mut k = nsep;
+        while k > 0 && sc.sep[k - 1] & NL_FLAG == 0 {
+            k -= 1;
+        }
+        sc.has_nl = k > 0;
+        sc.last_nl = k.saturating_sub(1);
+        return wpos + 64 * nblocks;
+    }
+    unsafe { phase_a_portable::<ISA>(base, wpos, wend, sc) }
+}
+
+#[inline(always)]
+unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: usize, sc: &mut Scratch) -> usize {
+    let (mut nsep, mut nviol) = (0usize, 0usize);
     let mut last_nl = 0usize;
-    let nb = sc.nbits.as_mut_ptr();
-    unsafe { *nb = 0 };
+    let mut has_nl = false;
     let sep = sc.sep.as_mut_ptr();
     let viol = sc.viol.as_mut_ptr();
-    let fb = sc.fbits.as_mut_ptr();
-    // Bit s + 1 of fbits: separator s is followed by a quote. Bit 0: the window's first byte is
-    // a quote. So bits [k, k + n) of a line whose first separator is k are the quote flags of its
-    // n fields, field 0 included.
-    unsafe { *fb = (*base.add(wpos) == b'"') as u64 };
+    sc.wq0 = unsafe { *base.add(wpos) } == b'"';
     let mut b = wpos;
     let (mut c, mut q, mut n) = unsafe { masks64::<ISA>(base.add(b)) };
     let mut dprev = 1u64; // the window starts at a line start
@@ -287,29 +463,30 @@ unsafe fn phase_a<const ISA: u8>(base: *const u8, wpos: usize, wend: usize, sc: 
         let closes = t2 & d;
         let bad = (q & !(fs | fe)) | (s & e) | (closes ^ ((e << 1) | eprev));
         if bad != 0 {
-            nviol = unsafe { flatten(bad, b as u32, viol, nviol) };
+            nviol = unsafe { flatten_pos(bad, b as u32, viol, nviol) };
         }
         let fq = ((q >> 1) | ((q2 & 1) << 63)) & d;
-        let bits = pext::<ISA>(fq, d);
-        let word = (nsep + 1) >> 6;
-        let off = (nsep + 1) & 63;
-        unsafe {
-            *fb.add(word) |= bits << off;
-            *fb.add(word + 1) = (bits >> 1) >> (63 - off);
+        // Index of the block's last newline separator.
+        let top = 63 - (n | 1).leading_zeros();
+        let below = u64::MAX >> (63 - top);
+        let idx = nsep + (d & below).count_ones() as usize - 1;
+        if n != 0 {
+            last_nl = idx;
+            has_nl = true;
         }
-        let nlb = pext::<ISA>(n, d);
-        let nword = nsep >> 6;
-        let noff = nsep & 63;
-        unsafe {
-            *nb.add(nword) |= nlb << noff;
-            *nb.add(nword + 1) = (nlb >> 1) >> (63 - noff);
+        let rel = (b - wpos) as u32;
+        #[cfg(target_arch = "x86_64")]
+        {
+            nsep = if ISA == fast::ISA_AVX512 {
+                unsafe { flatten_compress(d, n, fq, rel, sep, nsep) }
+            } else {
+                unsafe { flatten(d, n, fq, rel, sep, nsep) }
+            };
         }
-        let cnt_nl = nlb.count_ones() as usize;
-        // Index of the block's last newline separator: nsep + (index of nlb's top bit).
-        let top = nsep + 63 - (nlb | 1).leading_zeros() as usize;
-        last_nl = if cnt_nl != 0 { top } else { last_nl };
-        nnl += cnt_nl;
-        nsep = unsafe { flatten(d, b as u32, sep, nsep) };
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            nsep = unsafe { flatten(d, n, fq, rel, sep, nsep) };
+        }
         dprev = d >> 63;
         eprev = e >> 63;
         c = c2;
@@ -320,20 +497,12 @@ unsafe fn phase_a<const ISA: u8>(base: *const u8, wpos: usize, wend: usize, sc: 
     let _ = c;
     unsafe { *viol.add(nviol) = u32::MAX };
     sc.nsep = nsep;
-    sc.nnl = nnl;
-    sc.last_nl = last_nl;
     sc.nviol = nviol;
+    sc.last_nl = last_nl;
+    sc.has_nl = has_nl;
     b
 }
 
-#[inline(always)]
-fn fbits7(fb: &[u64], k: usize) -> u64 {
-    let w = k >> 6;
-    let off = k & 63;
-    let lo = fb[w] >> off;
-    let hi = (fb[w + 1] << 1) << (63 - off);
-    lo | hi
-}
 
 /// A conforming ID's base-36 value from the 8 bytes ending at its end, its digit count and whether
 /// the prefix byte matched, or NONE40.
@@ -400,19 +569,19 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
     for l in 0..LANES {
         let kl = k0 + 7 * l;
         let _ = i0;
-        let ls = sc.line_start(kl, wpos) as u32;
+        let w = wpos as u32;
+        let ls = w + sc.line_start(kl) as u32;
         ln.ls[l] = ls;
-        ln.end[l] = sc.sep[kl + 6];
-        let g = fbits7(&sc.fbits, kl);
-        let q0 = g & 1 != 0;
+        ln.end[l] = w + sc.pos(kl + 6) as u32;
+        let q0 = sc.q_before(kl);
         let b01 = unsafe { rd(base.add(ls as usize) as *const u16) };
         pre[l] = if q0 { (b01 >> 8) as u8 } else { b01 as u8 };
         ln.vs[0][l] = ls + q0 as u32;
-        ln.ve[0][l] = sc.sep[kl] - q0 as u32;
+        ln.ve[0][l] = w + sc.pos(kl) as u32 - q0 as u32;
         for j in 1..7 {
-            let q = ((g >> j) & 1) as u32;
-            ln.vs[j][l] = sc.sep[kl + j - 1] + 1 + q;
-            ln.ve[j][l] = sc.sep[kl + j] - q;
+            let q = (sc.sep[kl + j - 1] & Q_FLAG != 0) as u32;
+            ln.vs[j][l] = w + sc.pos(kl + j - 1) as u32 + 1 + q;
+            ln.ve[j][l] = w + sc.pos(kl + j) as u32 - q;
         }
     }
     if phase() <= 2 {
@@ -666,14 +835,13 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
         let wpos = start;
         let wend = (wpos + W).min(a_limit - 64);
         unsafe { phase_a::<ISA>(base, wpos, wend, sc) };
-        let nnl = sc.nnl;
-        if nnl == 0 {
+        if !sc.has_nl {
             let l = unsafe { fast::one_line::<S, ISA>(f, kind, file, buf, start, &mut fields, sink) };
             start += l + 1;
             continue;
         }
         let last = sc.last_nl;
-        let next_window = sc.sep[last] as usize + 1;
+        let next_window = wpos + sc.pos(last) + 1;
         if KIND == EVENTS && phase() <= 1 {
             std::hint::black_box(&sc.sep[..sc.nsep]);
             if next_window >= to {
@@ -682,27 +850,28 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
             start = next_window;
             continue;
         }
-        // Separators of 8 well-formed lines: nf - 1 commas and a newline, eight times.
-        let pattern: u64 = if nf == 7 { 0x0081_0204_0810_2040 } else { 0x8888_8888 };
-        let span: u64 = if nf == 7 { (1 << 56) - 1 } else { 0xFFFF_FFFF };
         let (mut k, mut vi) = (0usize, 0usize);
         let mut finished = false;
         while k <= last {
-            let ls = sc.line_start(k, wpos);
+            let ls = wpos + sc.line_start(k);
             if ls >= to {
                 finished = true;
                 break;
             }
             if k + nf * LANES - 1 <= last
-                && (sc.nbits_window(k) & span) == pattern
-                && (sc.sep[k + nf * (LANES - 1) - 1] as usize + 1) < to
-                && sc.viol[vi] > sc.sep[k + nf * LANES - 1]
+                && (wpos + sc.pos(k + nf * (LANES - 1) - 1) + 1) < to
+                && sc.viol[vi] as usize > wpos + sc.pos(k + nf * LANES - 1)
+                && unsafe { nl_pattern::<ISA>(sc, k, nf) }
             {
                 unsafe {
                     if KIND == EVENTS {
                         #[cfg(target_arch = "x86_64")]
                         if ISA == fast::ISA_AVX512 && crate::fast3::VEC512.load(std::sync::atomic::Ordering::Relaxed) && crate::fast3::READY {
-                            crate::fast3::ev_batch(f, dates, buf.data.as_ptr(), sc, wpos, k, &mut ev_out);
+                            if crate::fast3::MUL256.load(std::sync::atomic::Ordering::Relaxed) {
+                                crate::fast3::ev_batch::<true>(f, dates, buf.data.as_ptr(), sc, wpos, k, &mut ev_out);
+                            } else {
+                                crate::fast3::ev_batch::<false>(f, dates, buf.data.as_ptr(), sc, wpos, k, &mut ev_out);
+                            }
                             crate::fast3::emit_events(f, file, buf, wpos, &ev_out, &mut fields, sink);
                             k += nf * LANES;
                             continue;
@@ -715,7 +884,11 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
                             && crate::fast3::VEC512.load(std::sync::atomic::Ordering::Relaxed)
                             && crate::fast3::READY
                         {
-                            crate::fast3::click_batch(f, dates, buf.data.as_ptr(), file, sc, wpos, k, &mut cl_out);
+                            if crate::fast3::MUL256.load(std::sync::atomic::Ordering::Relaxed) {
+                                crate::fast3::click_batch::<true>(f, dates, buf.data.as_ptr(), file, sc, wpos, k, &mut cl_out);
+                            } else {
+                                crate::fast3::click_batch::<false>(f, dates, buf.data.as_ptr(), file, sc, wpos, k, &mut cl_out);
+                            }
                             crate::fast3::emit_clicks(f, file, buf, wpos, &cl_out, &mut fields, sink);
                             k += nf * LANES;
                             continue;
@@ -728,8 +901,8 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
             }
             let e = sc.next_nl(k);
             let l = unsafe { fast::one_line::<S, ISA>(f, kind, file, buf, ls, &mut fields, sink) };
-            debug_assert_eq!(ls + l, sc.sep[e] as usize);
-            let end = sc.sep[e];
+            debug_assert_eq!(ls + l, wpos + sc.pos(e));
+            let end = (wpos + sc.pos(e)) as u32;
             while sc.viol[vi] <= end {
                 vi += 1;
             }
@@ -786,19 +959,19 @@ unsafe fn batch_clicks<'b, S: Sink, const ISA: u8>(
     for l in 0..LANES {
         let kl = k0 + 4 * l;
         let _ = i0;
-        let s = sc.line_start(kl, wpos) as u32;
+        let w = wpos as u32;
+        let s = w + sc.line_start(kl) as u32;
         ls[l] = s;
-        end[l] = sc.sep[kl + 3];
-        let g = fbits7(&sc.fbits, kl);
-        let q0 = g & 1 != 0;
+        end[l] = w + sc.pos(kl + 3) as u32;
+        let q0 = sc.q_before(kl);
         let b01 = unsafe { rd(base.add(s as usize) as *const u16) };
         pre_k[l] = if q0 { (b01 >> 8) as u8 } else { b01 as u8 };
         vs[0][l] = s + q0 as u32;
-        ve[0][l] = sc.sep[kl] - q0 as u32;
+        ve[0][l] = w + sc.pos(kl) as u32 - q0 as u32;
         for j in 1..4 {
-            let q = ((g >> j) & 1) as u32;
-            vs[j][l] = sc.sep[kl + j - 1] + 1 + q;
-            ve[j][l] = sc.sep[kl + j] - q;
+            let q = (sc.sep[kl + j - 1] & Q_FLAG != 0) as u32;
+            vs[j][l] = w + sc.pos(kl + j - 1) as u32 + 1 + q;
+            ve[j][l] = w + sc.pos(kl + j) as u32 - q;
         }
     }
     let mut w_k = [0u64; LANES];

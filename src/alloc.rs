@@ -119,7 +119,23 @@ const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 const MADV_HUGEPAGE: i32 = 14;
 /// Transparent huge pages for the chunks and for large blocks of at least HUGE bytes: one fault per
 /// 2 MiB instead of per 4 KiB where the kernel allows it (THP "madvise" or "always").
-const THP: bool = true;
+/// Bytes of new mappings that may still be advised MADV_HUGEPAGE. Set once at start-up from rt's
+/// verdict: everything when the machine has the free 2 MB blocks (or its THP defrag mode cannot
+/// stall), about 80% of the free blocks when it has fewer, none when THP is unusable. Past the
+/// budget a mapping gets 4 KB pages at once instead of a direct-compaction stall (118 to 200
+/// ms/GB measured on a fragmented box, against 62 to 66 for 4 KB pages and 38 to 43 for free
+/// huge pages).
+static THP_BUDGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+pub fn set_thp_budget(bytes: usize) {
+    THP_BUDGET.store(bytes, Ordering::Relaxed);
+}
+
+/// Takes `len` bytes of the budget; false when it does not fit (the budget stays as it is).
+#[inline]
+fn take_thp(len: usize) -> bool {
+    THP_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(len)).is_ok()
+}
 const HUGE: usize = 2 << 20;
 
 const PAGE: usize = 4096;
@@ -178,7 +194,7 @@ pub fn mapped_bytes() -> usize {
 /// A fresh zeroed mapping of `len` bytes. From HUGE bytes up it starts on a 2 MiB boundary (the
 /// mapping is HUGE longer; the unused head and tail are never touched) and is advised for huge pages.
 fn map(len: usize) -> *mut u8 {
-    let huge = THP && len >= HUGE;
+    let huge = len >= HUGE && take_thp(len);
     let total = if huge { len + HUGE } else { len };
     // SAFETY: a fresh private anonymous mapping; no existing memory is touched.
     let p = unsafe { mmap(null_mut(), total, PROT_READ_WRITE, MAP_PRIVATE_ANON_NORESERVE, -1, 0) };
@@ -205,7 +221,7 @@ fn map_aligned(len: usize, align: usize) -> *mut u8 {
     }
     MAPPED.fetch_add(len + align, Ordering::Relaxed);
     let a = (p as usize + align - 1) & !(align - 1);
-    if THP {
+    if take_thp(len) {
         // SAFETY: inside the new mapping; a hint only.
         unsafe { madvise(a as *mut c_void, len, MADV_HUGEPAGE) };
     }
@@ -779,7 +795,25 @@ impl Alloc {
         }
     }
 
+    /// Over-aligned requests for the large tier go there unpadded: large blocks are whole
+    /// mappings, page-aligned (2 MiB-aligned from HUGE up). Padding them pushed a power-of-two
+    /// size just past its bucket: twice the mapping, and under HUGE no huge-page advice (the
+    /// dedup builder measured 27K faults in one stage). alloc and free decide alike from the layout.
+    #[inline(always)]
+    fn direct(l: Layout) -> bool {
+        l.align() <= PAGE && l.size() > SMALL_MAX
+    }
+
     unsafe fn aligned_alloc(l: Layout, zero: bool) -> *mut u8 {
+        if Self::direct(l) {
+            // SAFETY: forwarded contract; the large tier returns page-aligned blocks.
+            let (p, fresh) = unsafe { Self::raw_alloc(l.size()) };
+            if !p.is_null() && zero && !fresh {
+                // SAFETY: the block holds at least l.size() bytes.
+                unsafe { ptr::write_bytes(p, 0, l.size()) };
+            }
+            return p;
+        }
         // SAFETY: forwarded contract.
         let (raw, fresh) = unsafe { Self::raw_alloc(padded(l)) };
         if raw.is_null() {
@@ -797,6 +831,10 @@ impl Alloc {
     }
 
     unsafe fn aligned_free(p: *mut u8, l: Layout) {
+        if Self::direct(l) {
+            // SAFETY: aligned_alloc took this block from raw_alloc(l.size()) unpadded.
+            return unsafe { Self::raw_free(p, l.size()) };
+        }
         // SAFETY: aligned_alloc stored the distance to the block start before p.
         unsafe {
             let raw = p as usize - *((p as usize - 8) as *const usize);

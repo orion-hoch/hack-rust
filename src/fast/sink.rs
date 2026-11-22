@@ -4,11 +4,10 @@
 //! most one partly filled chunk per bin.
 
 
-
 /// Records binned by an index, in chunks bumped from arena blocks.
 pub struct Bins<T: Copy> {
-    cur: Vec<*mut T>,
-    end: Vec<*mut T>,
+    /// Per bin: write pointer and end of the current chunk (one pair: one cache access per push).
+    ce: Vec<[*mut T; 2]>,
     full: Vec<Vec<(*const T, u32)>>,
     blocks: Vec<Vec<T>>,
     bump: *mut T,
@@ -34,8 +33,7 @@ impl<T: Copy> Bins<T> {
     pub fn with_chunk(n: usize, block: usize, chunk: usize) -> Self {
         let chunk = chunk.max(1);
         Bins {
-            cur: vec![std::ptr::null_mut(); n],
-            end: vec![std::ptr::null_mut(); n],
+            ce: vec![[std::ptr::null_mut(); 2]; n],
             full: (0..n).map(|_| Vec::new()).collect(),
             blocks: Vec::new(),
             bump: std::ptr::null_mut(),
@@ -54,15 +52,15 @@ impl<T: Copy> Bins<T> {
     /// of the bins (chunks never move), so a field can be patched later.
     #[inline(always)]
     pub fn push_at(&mut self, b: usize, x: T) -> *mut T {
-        let mut p = self.cur[b];
-        if p == self.end[b] {
+        let [mut p, e] = self.ce[b];
+        if p == e {
             self.refill(b);
-            p = self.cur[b];
+            p = self.ce[b][0];
         }
         // SAFETY: p lies in [chunk start, chunk end) of a chunk inside a live block.
         unsafe {
             p.write(x);
-            self.cur[b] = p.add(1);
+            self.ce[b][0] = p.add(1);
         }
         p
     }
@@ -75,9 +73,10 @@ impl<T: Copy> Bins<T> {
     #[cold]
     #[inline(never)]
     fn refill(&mut self, b: usize) {
-        if !self.cur[b].is_null() {
-            // SAFETY: end[b] is `chunk` records past the start of the same chunk.
-            let start = unsafe { self.end[b].sub(self.chunk) };
+        let [cur, end] = self.ce[b];
+        if !cur.is_null() {
+            // SAFETY: end is `chunk` records past the start of the same chunk.
+            let start = unsafe { end.sub(self.chunk) };
             self.full[b].push((start, self.chunk as u32));
         }
         // SAFETY (pointer arithmetic): bump and bump_end delimit the unused tail of the newest block.
@@ -88,26 +87,25 @@ impl<T: Copy> Bins<T> {
             self.bump_end = unsafe { self.bump.add(self.block) };
             self.blocks.push(v);
         }
-        self.cur[b] = self.bump;
         // SAFETY: at least `chunk` records remain in the block (checked above).
         unsafe {
-            self.end[b] = self.bump.add(self.chunk);
+            self.ce[b] = [self.bump, self.bump.add(self.chunk)];
             self.bump = self.bump.add(self.chunk);
         }
     }
 
     /// Closes every partly filled chunk; call once, after the last push.
     pub fn finish(&mut self) {
-        for b in 0..self.cur.len() {
-            if !self.cur[b].is_null() {
-                // SAFETY: as in refill; cur[b] is within [start, end].
-                let start = unsafe { self.end[b].sub(self.chunk) };
-                let len = (self.cur[b] as usize - start as usize) / std::mem::size_of::<T>();
+        for b in 0..self.ce.len() {
+            let [cur, end] = self.ce[b];
+            if !cur.is_null() {
+                // SAFETY: as in refill; cur is within [start, end].
+                let start = unsafe { end.sub(self.chunk) };
+                let len = (cur as usize - start as usize) / std::mem::size_of::<T>();
                 if len > 0 {
                     self.full[b].push((start, len as u32));
                 }
-                self.cur[b] = std::ptr::null_mut();
-                self.end[b] = std::ptr::null_mut();
+                self.ce[b] = [std::ptr::null_mut(); 2];
             }
         }
     }

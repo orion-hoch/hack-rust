@@ -50,8 +50,8 @@ impl Chunk {
     }
 }
 
-/// Every `*.csv` file directly in `dir` (following symlinks), sorted by name.
-/// A missing directory has no files.
+/// Every `*.csv` file directly in `dir` (following symlinks), sorted by name. As with a shell
+/// glob, a name starting with `.` does not match. A missing directory has no files.
 pub fn list_csv(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -63,7 +63,7 @@ pub fn list_csv(dir: &Path) -> io::Result<Vec<PathBuf>> {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".csv") {
+        if !name.ends_with(".csv") || name.starts_with('.') {
             continue;
         }
         let path = entry.path();

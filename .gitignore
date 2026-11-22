@@ -1,1 +1,4 @@
 /target
+# design notes that stay out of the repository
+/STAGES.md
+/FASTPATH.md

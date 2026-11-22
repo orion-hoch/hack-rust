@@ -48,26 +48,39 @@ impl People {
 
     /// `edges`: token pairs as consecutive words (side a, side b), in chunks of even length.
     /// None if any token is not a valid token (the run falls back).
-    pub fn build(tok: &Tokens, edges: &[&[u64]]) -> Option<People> {
+    pub fn build(tok: &Tokens, edges: &[&[u64]], timing: bool) -> Option<People> {
+        let mut t0 = std::time::Instant::now();
+        let mut lap = |what: &str| {
+            if timing {
+                let now = std::time::Instant::now();
+                eprintln!("timing v3.    persons.{what:<10} {:8.2} ms", (now - t0).as_secs_f64() * 1e3);
+                t0 = now;
+            }
+        };
         // Dense node numbers: sort (token << 32 | endpoint position), number distinct tokens.
         let m: usize = edges.iter().map(|c| c.len()).sum();
+        // Every token must name a slot or an interned ID (one read of the bound, not one per
+        // token: the bound takes a lock).
+        let cap = tok.capacity() as u64;
         let mut keys: Vec<u64> = Vec::with_capacity(m);
         for c in edges {
             if c.len() % 2 != 0 {
                 return None;
             }
             for &t in c.iter() {
-                if t > u64::from(u32::MAX) || !tok.valid(t as u32) {
+                if t >= cap {
                     return None;
                 }
-                keys.push(((t & 0xffff_ffff) << 32) | keys.len() as u64);
+                keys.push((t << 32) | keys.len() as u64);
             }
         }
+        lap("collect");
         let mut tmp = Vec::new();
         radix_sort(&mut keys, &mut tmp, 32, 64);
         drop(tmp);
+        lap("sort");
         let mut node_of_pos = vec![0u32; m];
-        let mut node_token: Vec<u32> = Vec::new();
+        let mut node_token: Vec<u32> = Vec::with_capacity(m / 2 + 1);
         let mut last = u64::MAX;
         for &k in &keys {
             let t = k >> 32;
@@ -79,6 +92,7 @@ impl People {
         }
         drop(keys);
         let n = node_token.len();
+        lap("number");
         // Union-find on nodes (union by index: a root points to a smaller index).
         let mut parent: Vec<u32> = (0..n as u32).collect();
         for e in node_of_pos.chunks_exact(2) {
@@ -89,26 +103,74 @@ impl People {
             }
         }
         drop(node_of_pos);
-        // Names: the smallest member by bytes, per root. Nodes are in token order, so the key
-        // loads walk the token table forward.
+        // Full compression in one forward pass: a parent is a smaller index, already final.
+        for i in 0..n {
+            let p = parent[i] as usize;
+            parent[i] = parent[p];
+        }
+        lap("union");
+        // Name keys, read once per node in token order (tokens are slot indexes, so this walks
+        // the token table forward): a SHORT ID's left-aligned base-36 order key; anything else is
+        // marked and kept aside with its key for a byte comparison.
+        const OTHER: u64 = 1 << 63;
+        let mut nk: Vec<u64> = Vec::with_capacity(n);
+        // Bytes of every LONG or FOREIGN member, rebuilt once in this streaming pass.
+        let mut other_bytes: Vec<Vec<u8>> = Vec::new();
+        for &t in &node_token {
+            match tok.key_of(t) {
+                (super::ids::Key::Short(v), _) => nk.push(crate::fast::names::order_key(v)),
+                _ => {
+                    nk.push(OTHER | other_bytes.len() as u64);
+                    let mut b = Vec::with_capacity(33);
+                    tok.bytes(t, &mut b);
+                    other_bytes.push(b);
+                }
+            }
+        }
+        // Bytes of a node from its key: SHORT from the order key, others from the side list.
+        let node_bytes = |k: u64, out: &mut Vec<u8>| {
+            out.clear();
+            if k & OTHER == 0 {
+                crate::fast::names::append_bytes(b'u', k, out);
+            } else {
+                out.extend_from_slice(&other_bytes[(k & !OTHER) as usize]);
+            }
+        };
+        lap("keys");
+        // Names: the smallest member by bytes, per root.
         let mut best: Vec<u32> = vec![u32::MAX; n];
         let mut roots = 0usize;
+        let (mut bx, mut by) = (Vec::new(), Vec::new());
         for i in 0..n as u32 {
-            let r = find(&mut parent, i) as usize;
+            let r = parent[i as usize] as usize;
             let cur = best[r];
             if cur == u32::MAX {
                 best[r] = i;
                 roots += 1;
-            } else if tok.cmp(node_token[i as usize], node_token[cur as usize]).is_lt() {
+                continue;
+            }
+            let (ki, kc) = (nk[i as usize], nk[cur as usize]);
+            let smaller = if (ki | kc) & OTHER == 0 {
+                ki < kc
+            } else {
+                // A LONG or FOREIGN member on either side: compare the rebuilt bytes.
+                node_bytes(ki, &mut bx);
+                node_bytes(kc, &mut by);
+                bx < by
+            };
+            if smaller {
                 best[r] = i;
             }
         }
+        drop(nk);
+        lap("names");
         // Person map, written once per node in token order.
-        let mut person: Vec<u32> = vec![0; tok.capacity()];
+        let mut person: Vec<u32> = vec![0; cap as usize];
         for i in 0..n {
-            let r = find(&mut parent, i as u32) as usize;
+            let r = parent[i] as usize;
             person[node_token[i] as usize] = node_token[best[r] as usize] + 1;
         }
+        lap("map");
         Some(People { person, linked: n, persons: roots })
     }
 }
