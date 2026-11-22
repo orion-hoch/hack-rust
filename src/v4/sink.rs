@@ -997,10 +997,11 @@ impl EventBins {
 /// The link tasks, every event chunk and every click chunk in ONE pool run (links first: their
 /// union-find waits for them on its own thread, beside the rest), so no stage stands in front of
 /// the event parse. Every link task runs exactly once (`LinkTasks::finish` waits for them all).
-pub fn parse_all(cx: &Cx, lt: &super::links::LinkTasks) -> (Stage<EventBins>, Stage<ClickBins>) {
+pub fn parse_all(cx: &Cx, lt: &super::links::LinkTasks, links_done: bool) -> (Stage<EventBins>, Stage<ClickBins>) {
     let ev = parselab::par::plan(cx.ds, &[Stream::Events], 4 << 20);
     let ck = parselab::par::plan(cx.ds, &[Stream::Clicks], 4 << 20);
-    let (nl, ne) = (lt.len(), ev.len());
+    // links_done: the link chunks ran in a pool run of their own; task 0 resolves them here.
+    let (nl, ne) = (if links_done { 1 } else { lt.len() }, ev.len());
     let t0 = std::time::Instant::now();
     let st: Vec<(EvSink, ClickSink, usize)> = crate::par::run(
         cx.plan.threads,
@@ -1013,7 +1014,11 @@ pub fn parse_all(cx: &Cx, lt: &super::links::LinkTasks) -> (Stage<EventBins>, St
                 super::lap("first event byte");
             }
             if i < nl {
-                lt.task(cx, i, *t);
+                if links_done {
+                    lt.finish_deferred();
+                } else {
+                    lt.task(cx, i, *t);
+                }
             } else if i < nl + ne {
                 let c = &ev[i - nl];
                 let bytes = cx.ds.stream(c.stream)[c.file as usize].bytes();
