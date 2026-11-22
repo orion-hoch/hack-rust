@@ -122,6 +122,8 @@ pub struct WalkScratch {
     /// Per session of the partition: its revenue, and the index of its user-day row.
     sess_rev: Vec<u64>,
     row_of: Vec<u32>,
+    /// The click keys of this call carry the campaign (see `walk`).
+    packed: bool,
     pub stats: Stats,
 }
 
@@ -151,6 +153,7 @@ impl WalkScratch {
             day_end: Vec::new(),
             sess_rev: Vec::new(),
             row_of: Vec::new(),
+            packed: false,
             stats: Stats::default(),
         }
     }
@@ -278,13 +281,17 @@ pub fn walk<F: FnMut(u64, u64) -> Ordering>(
         ws.ccur[p] = sum;
         sum += c;
     }
+    let packed = n <= 1 << 16;
+    ws.packed = packed;
     ws.ckey.clear();
     ws.ckey.resize(kept as usize, 0);
     for (i, c) in clicks.iter().enumerate() {
         let p = ws.cidx[i];
         if p != EMPTY {
             let at = &mut ws.ccur[p as usize];
-            ws.ckey[*at as usize] = (c[0] << 32) | i as u64;
+            // ts_click << 32 | campaign << 16 | input index (partitions of at most 2^16 clicks):
+            // the credit and the sweep read the campaign from the key, not the click record.
+            ws.ckey[*at as usize] = if packed { (c[0] << 32) | ((c[1] >> 48) << 16) | i as u64 } else { (c[0] << 32) | i as u64 };
             *at += 1;
         }
     }
@@ -396,8 +403,13 @@ fn ts_c(k: u64) -> i64 {
 }
 
 #[inline(always)]
-fn camp_of(clicks: &[[u64; 2]], k: u64) -> u32 {
-    (clicks[(k & 0xffff_ffff) as usize][1] >> 48) as u32
+fn camp_of(clicks: &[[u64; 2]], k: u64, packed: bool) -> u32 {
+    if packed { ((k >> 16) & 0xffff) as u32 } else { (clicks[(k & 0xffff_ffff) as usize][1] >> 48) as u32 }
+}
+
+#[inline(always)]
+fn idx_of(k: u64, packed: bool) -> usize {
+    (if packed { k & 0xffff } else { k & 0xffff_ffff }) as usize
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -416,6 +428,7 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
     cells: &mut Cells2,
     rows: &mut Rows,
 ) -> Result<(), Error> {
+    let packed = ws.packed;
     let n = ck.len();
     let cn = prm.campaigns;
     ws.s_at.clear();
@@ -477,7 +490,7 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
             if k > 0 {
                 let t = ts_c(ck[k - 1]);
                 if at - t <= REACH {
-                    camp = camp_of(clicks, ck[k - 1]);
+                    camp = camp_of(clicks, ck[k - 1], packed);
                     if k >= 2 && ts_c(ck[k - 2]) == t {
                         let mut g = k - 1;
                         while g > 0 && ts_c(ck[g - 1]) == t {
@@ -486,7 +499,7 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
                         if g == memo_g {
                             camp = memo_c;
                         } else {
-                            let mixed = ck[g..k].iter().any(|&x| camp_of(clicks, x) != camp);
+                            let mixed = ck[g..k].iter().any(|&x| camp_of(clicks, x, packed) != camp);
                             if mixed {
                                 ws.stats.tie_groups += 1;
                                 // smallest click_id; among equal ids the later click (as a stable
@@ -494,12 +507,12 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
                                 let mut best = g;
                                 for i in g + 1..k {
                                     ws.stats.tie_calls += 1;
-                                    let (lb, li) = (clicks[(ck[best] & 0xffff_ffff) as usize][1] & LOC, clicks[(ck[i] & 0xffff_ffff) as usize][1] & LOC);
+                                    let (lb, li) = (clicks[idx_of(ck[best], packed)][1] & LOC, clicks[idx_of(ck[i], packed)][1] & LOC);
                                     if tie(lb, li) != Ordering::Less {
                                         best = i;
                                     }
                                 }
-                                camp = camp_of(clicks, ck[best]);
+                                camp = camp_of(clicks, ck[best], packed);
                             }
                             memo_g = g;
                             memo_c = camp;
@@ -539,6 +552,7 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
 /// ends). Ranges are split into days by `day_end`.
 #[inline(always)]
 fn assists(ck: &[u64], clicks: &[[u64; 2]], prm: &Params, ws: &mut WalkScratch, cells: &mut Cells2) {
+    let packed = ws.packed;
     let m = ws.s_at.len();
     ws.day_end.clear();
     ws.day_end.resize(m, m as u32);
@@ -570,7 +584,7 @@ fn assists(ck: &[u64], clicks: &[[u64; 2]], prm: &Params, ws: &mut WalkScratch, 
         if lo == hi {
             continue;
         }
-        let c = camp_of(clicks, x) as usize;
+        let c = camp_of(clicks, x, packed) as usize;
         // stamp[c]: serial of the person that last counted c; upto[c]: the end it counted to
         let from = if stamp[c] == serial { lo.max(upto[c] as usize) } else { lo };
         stamp[c] = serial;

@@ -28,6 +28,8 @@ pub struct Bins<T: Copy> {
     chunk: usize,
     /// Chunks from this block class, one block each, for pool participant `w` (`from_blocks`).
     src: Option<(&'static rt::arena::Blocks, usize)>,
+    /// Prefetch each append's next line for writing (`next_line_prefetch`; off by default).
+    pf: bool,
 }
 
 // SAFETY: the raw pointers point into `blocks`, which the struct owns; moving the struct to
@@ -55,6 +57,7 @@ impl<T: Copy> Bins<T> {
             block: block.div_ceil(chunk).max(1) * chunk,
             chunk,
             src: None,
+            pf: false,
         }
     }
 
@@ -66,6 +69,12 @@ impl<T: Copy> Bins<T> {
         let mut b = Self::with_chunk(n, 1, bs / sz);
         b.src = Some((src, w));
         b
+    }
+
+    /// Turns the next-line prefetch on appends on or off.
+    pub fn next_line_prefetch(mut self, on: bool) -> Self {
+        self.pf = on;
+        self
     }
 
     #[inline(always)]
@@ -103,8 +112,10 @@ impl<T: Copy> Bins<T> {
         }
         // The front's next line, owned before it is written: with thousands of write fronts the
         // hardware streamers follow none of them, and each fresh line's first store otherwise
-        // waits at the head of the store buffer for a read from DRAM.
-        if pf_on() {
+        // waits at the head of the store buffer for a read from DRAM (box 1, p20v5, 2,048
+        // partitions: store-buffer stalls 0.70G -> 0.36G cycles). At 8,192 partitions it only
+        // competes with the token probes for fill buffers: the v3 sink turns it off there.
+        if self.pf && pf_on() {
             let nx = (p as *const u8).wrapping_add(64);
             let q = if nx < e as *const u8 { nx } else { p as *const u8 };
             #[cfg(target_arch = "x86_64")]

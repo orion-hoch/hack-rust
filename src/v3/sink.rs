@@ -77,12 +77,46 @@ impl Default for Pend {
 /// each write front's next line (the phase is store-bound: see fast::sink::Bins::push_at).
 const D: usize = 4;
 
+/// Partition bits from which the grouped path is used. Box 1, interleaved, cycles up to the end of
+/// the event parse: p20v5 (2^11) ring + next-line prefetch 4.38G, grouped 4.71G, grouped +
+/// prefetch 4.66G; f60v5 (2^13) grouped 16.62G, grouped + prefetch 17.14G, ring + prefetch
+/// 17.21G. With 4 x 2^13 write fronts (2 MB) beyond L2 the fill buffers bind, and the
+/// prefetches only compete with the token probes for them.
+const BIG_BITS: u32 = 13;
+
 struct EvRing {
     b: [EvBatch; D],
     slot: [[u32; 8]; D],
     /// Next ring entry to fill (the oldest when the ring is full).
     head: usize,
     n: usize,
+}
+
+/// At 2^13 partitions and more (final size): surviving events wait in blocks of G with their lookups started; when a block fills, the other
+/// block (started G records earlier, its lines landed) is resolved and its records are written
+/// complete. Against writing each record at once and OR-ing its token in 64 records later
+/// (interleaved, box 1): equal at p20v5 (2,048 partitions); at f60v5 (8,192 partitions, 2 MB of
+/// write fronts, beyond L2, so the later OR missed) 400 to 700 ms less CPU in the phase.
+const G: usize = 32;
+
+/// A surviving event whose token is pending: user key and slot, partition, the record words
+/// (SHORT [w0, w1]; LONG [a, b, w2, w3]; the token goes into the last word), kind flags.
+#[derive(Clone, Copy, Default)]
+struct EvPend {
+    ua: u64,
+    ub: u64,
+    slot: usize,
+    w: [u64; 4],
+    part: u32,
+    /// Bit 0: the user ID is LONG; bit 1: the event ID is LONG.
+    flags: u32,
+}
+
+struct Groups {
+    blk: [[EvPend; G]; 2],
+    /// Block being filled; the other one waits for its tokens.
+    cur: usize,
+    n: [usize; 2],
 }
 
 pub struct V3Sink<'a, 'b> {
@@ -108,6 +142,10 @@ pub struct V3Sink<'a, 'b> {
     ring_n: usize,
     ring_at: usize,
     evr: Box<EvRing>,
+    /// 2^13 partitions or more: the grouped path (blocks of G staged records), no next-line
+    /// prefetch on the event bins; below, the ring of D batches with it (see `new`).
+    big: bool,
+    grp: Box<Groups>,
 }
 
 // SAFETY: the ring's pointers point into this sink's own bins (moved with it).
@@ -129,10 +167,10 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             bits,
             // One block per chunk (v3::mem's classes): SHORT 512 x 16 B, LONG 64 x 32 B, purchases
             // 16 x 16 B and 8 x 32 B, clicks and edges 2 MB.
-            short: Bins::from_blocks(parts, &B8K, w),
-            long: Bins::from_blocks(parts, &B2K, w),
-            pshort: Bins::from_blocks(parts, &B256, w),
-            plong: Bins::from_blocks(parts, &B256, w),
+            short: Bins::from_blocks(parts, &B8K, w).next_line_prefetch(bits < BIG_BITS),
+            long: Bins::from_blocks(parts, &B2K, w).next_line_prefetch(bits < BIG_BITS),
+            pshort: Bins::from_blocks(parts, &B256, w).next_line_prefetch(bits < BIG_BITS),
+            plong: Bins::from_blocks(parts, &B256, w).next_line_prefetch(bits < BIG_BITS),
             clicks: Bins::from_blocks(1, &B2M, w),
             edges: Bins::from_blocks(1, &B2M, w),
             special: Vec::new(),
@@ -143,8 +181,43 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             ring: Box::new([Pend::default(); RING]),
             ring_n: 0,
             ring_at: 0,
+            big: bits >= BIG_BITS,
+            grp: Box::new(Groups { blk: [[EvPend::default(); G]; 2], cur: 0, n: [0; 2] }),
             evr: Box::new(EvRing { b: [EvBatch::default(); D], slot: [[0; 8]; D], head: 0, n: 0 }),
         }
+    }
+
+    /// Queues a surviving event (its lookup started); a full block resolves the other one.
+    #[inline(always)]
+    fn group(&mut self, e: EvPend) {
+        let g = &mut *self.grp;
+        let c = g.cur;
+        g.blk[c][g.n[c]] = e;
+        g.n[c] += 1;
+        if g.n[c] == G {
+            self.resolve_block(c ^ 1);
+            self.grp.cur = c ^ 1;
+        }
+    }
+
+    /// Resolves block `k`: tokens, then the complete records into their bins.
+    #[inline(always)]
+    fn resolve_block(&mut self, k: usize) {
+        let n = self.grp.n[k];
+        let mut bad = false;
+        for i in 0..n {
+            let e = self.grp.blk[k][i];
+            let t = self.tok.finish(&Pending { long: e.flags & 1 != 0, a: e.ua, b: e.ub, slot: e.slot });
+            bad |= t == NO_TOKEN;
+            let t = u64::from(t);
+            if e.flags & 2 == 0 {
+                self.short.push(e.part as usize, [e.w[0], e.w[1] | t]);
+            } else {
+                self.long.push(e.part as usize, [e.w[0], e.w[1], e.w[2], e.w[3] | t]);
+            }
+        }
+        self.bad |= bad;
+        self.grp.n[k] = 0;
     }
 
     /// Resolves ring entry `j`: every lane's token (survivors), then its complete records.
@@ -237,6 +310,9 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         }
         self.evr.n = 0;
         self.evr.head = 0;
+        let c = self.grp.cur;
+        self.resolve_block(c ^ 1);
+        self.resolve_block(c);
     }
 
     pub fn finish(&mut self) {
@@ -289,17 +365,9 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         }
     }
 
-    fn user_token(&self, id: &'a [u8]) -> u32 {
-        self.tok.token(classify(id, b'u'), id)
-    }
-}
-
-impl<'a> Sink for V3Sink<'a, '_> {
-    #[inline]
-    fn events(&mut self, b: &EvBatch) {
-        if cfg!(feature = "measure") && self.mode != 0 && self.mode != 5 {
-            return self.events_measure(b);
-        }
+    /// The ring path (below 2^13 partitions).
+    #[inline(never)]
+    fn events_ring(&mut self, b: &EvBatch) {
         let n = b.n as usize;
         let i = self.evr.head;
         if self.evr.n == D {
@@ -314,6 +382,61 @@ impl<'a> Sink for V3Sink<'a, '_> {
             r.slot[i][k] = if notab { (b.user_a[k] ^ b.user_b[k]) as u32 & 0xff_ffff } else { self.tok.home(b.user_long >> k & 1 != 0, b.user_a[k], b.user_b[k]) };
         }
         r.head = (i + 1) % D;
+    }
+
+    /// The grouped path (2^13 partitions or more).
+    #[inline(never)]
+    fn events_grouped(&mut self, b: &EvBatch) {
+        let n = b.n as usize;
+        for k in 0..n {
+            let surv = b.surv >> k & 1 != 0;
+            let purch = surv && b.purch >> k & 1 != 0;
+            let ing = u64::from(b.ingest[k]);
+            let ts = if surv { u64::from(b.ts[k]) } else { 0 };
+            let w1 = (ts << 32) | (u64::from(purch) << 63);
+            let buy = if purch {
+                // The parser accepts 1 to 10,000,000; anything at 2^24 or above would not fit.
+                self.bad |= b.price[k] >> 24 != 0;
+                u64::from(b.cat[k]) | (u64::from(b.price[k]) << 8)
+            } else {
+                0
+            };
+            let ev_long = b.ev_long >> k & 1 != 0;
+            let (a, bb) = (b.ev_a[k], if ev_long { b.ev_b[k] } else { 0 });
+            let p = part_of(a, bb, self.bits);
+            if purch {
+                if ev_long {
+                    self.plong.push(p, [a, bb, ing, buy]);
+                } else {
+                    self.pshort.push(p, [a | (ing << 40), buy]);
+                }
+            }
+            let w: [u64; 4] = if ev_long { [a, bb, ing | (u64::from(surv) << 63), w1] } else { [a | (ing << 40) | (u64::from(surv) << 63), w1, 0, 0] };
+            if surv {
+                let ul = b.user_long >> k & 1 != 0;
+                let slot = self.tok.start_hint::<EVENT_PREFETCH_W>(ul, b.user_a[k], b.user_b[k]).slot;
+                self.group(EvPend { ua: b.user_a[k], ub: b.user_b[k], slot, w, part: p as u32, flags: u32::from(ul) | (u32::from(ev_long) << 1) });
+            } else if ev_long {
+                // A dead copy only shadows: its key, ingest and dead bit; no token needed.
+                self.long.push(p, w);
+            } else {
+                self.short.push(p, [w[0], w[1]]);
+            }
+        }
+    }
+
+    fn user_token(&self, id: &'a [u8]) -> u32 {
+        self.tok.token(classify(id, b'u'), id)
+    }
+}
+
+impl<'a> Sink for V3Sink<'a, '_> {
+    #[inline]
+    fn events(&mut self, b: &EvBatch) {
+        if cfg!(feature = "measure") && self.mode != 0 && self.mode != 5 {
+            return self.events_measure(b);
+        }
+        if self.big { self.events_grouped(b) } else { self.events_ring(b) }
     }
 
     #[inline]
