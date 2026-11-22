@@ -507,19 +507,40 @@ unsafe fn wrec(st: &mut State, h: &mut Hot, t: &WideTab, a: u64, b: u64, kind: u
     true
 }
 
+/// A purchase of wide user `id` with payload `pay`: counted and stored through the Hot pointers
+/// in memory (rare, so the wide loop keeps no register for them).
+///
+/// # Safety
+/// As `wrec`.
+#[cold]
+#[inline(never)]
+unsafe fn wbuy(h: *mut Hot, id: usize, pay: u64) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        *((*h).uc.add(id) as *mut u32).add(1) += 1;
+        *(*h).bval = pay;
+        *(*h).bidx = id as u32;
+        (*h).bval = (*h).bval.add(1);
+        (*h).bidx = (*h).bidx.add(1);
+    }
+}
+
 /// The wide stream of one piece from word *i on, whole records only (`*i` ends at the first one cut by
-/// the piece end): `wrec` with the Hot pointers and the table held in locals for the whole piece.
-/// false: stopped at a user not in the table yet (the record at *i, whole).
+/// the piece end): `wrec` with the table and the output pointers in registers for the whole piece.
+/// Its own function, not inlined: inside `pass` the loop had a dozen stack loads and stores per
+/// record (45 instructions a record). false: stopped at a user not in the table yet (the record
+/// at *i, whole).
 ///
 /// # Safety
 /// As `wrec`; *i <= c.len().
-#[inline(always)]
+#[inline(never)]
 unsafe fn wfast(c: &[u64], i: &mut usize, h: &mut Hot, t: &WideTab) -> bool {
     let n = c.len();
     let cp = c.as_ptr();
     let (wt, bits, mask) = (t.wt, t.bits, t.mask);
-    let (ua, uc) = (h.ua, h.uc);
-    let (mut idxp, mut evp, mut bvp, mut bip) = (h.idx, h.ev, h.bval, h.bidx);
+    let ua = h.ua;
+    let (mut idxp, mut evp) = (h.idx, h.ev);
+    let hp = h as *mut Hot;
     let mut j = *i;
     let mut miss = false;
     // SAFETY: the caller's contract; j + 4 <= n for every word read below.
@@ -533,7 +554,7 @@ unsafe fn wfast(c: &[u64], i: &mut usize, h: &mut Hot, t: &WideTab) -> bool {
             let (a, b) = (*cp.add(j), *cp.add(j + 1));
             let kind = w >> 62;
             let mut x = wide_hash(a, b, kind, bits);
-            // a miss leaves the loop (no call inside it: nothing spills); the caller inserts
+            // a miss leaves the loop; the caller inserts
             let id = loop {
                 let en = &*wt.add(x);
                 if en[0] == a && en[1] == b && en[2] == kind {
@@ -554,16 +575,13 @@ unsafe fn wfast(c: &[u64], i: &mut usize, h: &mut Hot, t: &WideTab) -> bool {
             idxp = idxp.add(1);
             evp = evp.add(1);
             if p != 0 {
-                *(uc.add(id) as *mut u32).add(1) += 1;
-                *bvp = *cp.add(j + 3);
-                *bip = id as u32;
-                bvp = bvp.add(1);
-                bip = bip.add(1);
+                wbuy(hp, id, *cp.add(j + 3));
             }
             j += 3 + p;
         }
+        (*hp).idx = idxp;
+        (*hp).ev = evp;
     }
-    (h.idx, h.ev, h.bval, h.bidx) = (idxp, evp, bvp, bip);
     *i = j;
     !miss
 }
@@ -698,7 +716,8 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     let mut why = Stop::End;
     let wt = WideTab { wt: st.wt.as_mut_ptr(), bits: st.wt.len().trailing_zeros(), mask: st.wt.len() - 1, max: wide_max };
     let mut wide_full = false;
-    for c in inp.surv {
+    for (pi, c) in inp.surv.iter().enumerate() {
+        ahead(inp.surv, pi);
         let mut i = 0usize;
         if pend != EMPTY && !c.is_empty() {
             // SAFETY: bval/bidx have room for one entry per survivor word.
@@ -727,7 +746,8 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     let mut carry = [0u64; 4];
     let mut nc = 0usize; // words in carry
     if matches!(why, Stop::End | Stop::Pend(_)) {
-        'wpieces: for c in inp.wsurv {
+        'wpieces: for (pi, c) in inp.wsurv.iter().enumerate() {
+            ahead(inp.wsurv, pi);
             let mut i = 0usize;
             let n = c.len();
             // finish a record begun in the last piece
@@ -791,7 +811,8 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     {
         let cidx = st.cidx.as_mut_ptr();
         let mut j = 0usize;
-        for c in inp.clicks {
+        for (pi, c) in inp.clicks.iter().enumerate() {
+            ahead(inp.clicks, pi);
             let cp = c.as_ptr();
             for i in 0..c.len() {
                 // SAFETY: i < c.len(); slots are masked below 2^k = tab.len(); j + i < n_ck =
@@ -813,7 +834,8 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
             }
             j += c.len();
         }
-        for c in inp.wclicks {
+        for (pi, c) in inp.wclicks.iter().enumerate() {
+            ahead(inp.wclicks, pi);
             for r in c.iter() {
                 let (a, b, kind) = (r[0], r[1], r[2] >> 62);
                 let mut x = wide_hash(a, b, kind, wt.bits);
@@ -984,6 +1006,26 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     }
     split(st, out);
     Ok(Pass::Done)
+}
+
+/// Asks for the first lines (up to 512 bytes) of the piece after `pi`. The pieces of a partition
+/// lie apart in memory written long ago: each one's first lines are misses to memory that the
+/// hardware prefetcher only follows after it has seen a few, so they are asked for one piece early.
+#[inline(always)]
+fn ahead<T>(pieces: &[&[T]], pi: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(nx) = pieces.get(pi + 1) {
+        let p = nx.as_ptr() as *const i8;
+        let bytes = core::mem::size_of_val::<[T]>(nx).min(512);
+        let mut o = 0usize;
+        while o < bytes {
+            // SAFETY: a prefetch reads nothing; p + o is inside the piece.
+            unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p.add(o)) };
+            o += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (pieces, pi);
 }
 
 /// a if c, else b, without a branch.

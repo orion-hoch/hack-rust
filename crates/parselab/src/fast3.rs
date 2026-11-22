@@ -370,21 +370,39 @@ unsafe fn with_long(wbase: *const u8, ve: __m256i, len: __m512i, pre_ok: __mmask
         let swap = _mm_set_epi8(8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7);
         let mut rest = lanes as u32;
         let mut long = 0u32;
-        while rest != 0 {
-            let l = rest.trailing_zeros() as usize;
-            rest &= rest - 1;
-            let v = _mm256_loadu_si256(wbase.add(*ends.get_unchecked(l) as usize).sub(32) as *const __m256i);
-            let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
-            let t = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
-            let digit = _mm256_cmplt_epu8_mask(d, _mm256_set1_epi8(10));
-            let letter = _mm256_cmplt_epu8_mask(t, _mm256_set1_epi8(6));
-            let val = _mm256_mask_add_epi8(d, letter, t, _mm256_set1_epi8(10));
-            // nibble pairs [16, 1] -> 16 bytes, then each half byte-reversed: character 0 most significant
-            let bytes = _mm_shuffle_epi8(_mm256_cvtepi16_epi8(_mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0110))), swap);
-            let k = (((digit | letter) == u32::MAX) as u32) << l;
-            a = _mm512_mask_broadcastq_epi64(a, k as u8, bytes);
-            b = _mm512_mask_broadcastq_epi64(b, k as u8, _mm_unpackhi_epi64(bytes, bytes));
-            long |= k;
+        // Written out eight times, not as a loop: a loop gets its seven constants loaded into
+        // registers before it (once per batch that has a LONG lane, for one or two lanes); here
+        // each copy uses them as memory operands.
+        macro_rules! lane {
+            ($done:lifetime) => {
+                if rest == 0 {
+                    break $done;
+                }
+                let l = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                let v = _mm256_loadu_si256(wbase.add(*ends.get_unchecked(l) as usize).sub(32) as *const __m256i);
+                let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+                let t = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+                let digit = _mm256_cmplt_epu8_mask(d, _mm256_set1_epi8(10));
+                let letter = _mm256_cmplt_epu8_mask(t, _mm256_set1_epi8(6));
+                let val = _mm256_mask_add_epi8(d, letter, t, _mm256_set1_epi8(10));
+                // nibble pairs [16, 1] -> 16 bytes, then each half byte-reversed: character 0 most significant
+                let bytes = _mm_shuffle_epi8(_mm256_cvtepi16_epi8(_mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0110))), swap);
+                let k = (((digit | letter) == u32::MAX) as u32) << l;
+                a = _mm512_mask_broadcastq_epi64(a, k as u8, bytes);
+                b = _mm512_mask_broadcastq_epi64(b, k as u8, _mm_unpackhi_epi64(bytes, bytes));
+                long |= k;
+            };
+        }
+        'lanes: {
+            lane!('lanes);
+            lane!('lanes);
+            lane!('lanes);
+            lane!('lanes);
+            lane!('lanes);
+            lane!('lanes);
+            lane!('lanes);
+            lane!('lanes);
         }
         (a, b, long as u8)
     }
@@ -609,13 +627,21 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let dt_ok = date_ok & t_ok & hms_ok;
         let f1 = _mm512_cmpeq_epi64_mask(len[2], _mm512_set1_epi64(20)) & z & dt_ok;
         let f2 = _mm512_cmpeq_epi64_mask(len[2], _mm512_set1_epi64(25)) & off_ok & dt_ok;
-        let (hi, hi_ok) = dec8::<S>(t_hi);
-        let (lo, lo_ok) = dec8::<S>(_mm512_or_si512(_mm512_slli_epi64::<24>(t_mid), _mm512_set1_epi64(0x0030_3030)));
-        let f3 = _mm512_cmpeq_epi64_mask(len[2], _mm512_set1_epi64(13)) & hi_ok & lo_ok;
         // day * DAY_MS + secs * 1000 as (day * 86400 + secs) * 1000, by shifts.
         let local = _mm512_sub_epi64(times1000(_mm512_add_epi64(day_s, secs)), _mm512_set1_epi64(f.ws_frac));
         let f12 = _mm512_mask_sub_epi64(local, f2, local, off);
-        let v3 = _mm512_sub_epi64(_mm512_add_epi64(mul_epu32::<S>(hi, _mm512_set1_epi64(100_000)), lo), _mm512_set1_epi64(f.ws_ms));
+        // Epoch ms: only when a lane has 13 characters (nearly every batch: one line in three).
+        // The branch is predictable, and it ends the block: the ISO decode above and the ingest
+        // decode below then each fold their constants into memory operands instead of sharing
+        // one register load per constant.
+        let m13 = _mm512_cmpeq_epi64_mask(len[2], _mm512_set1_epi64(13));
+        let (mut f3, mut v3) = (0u8, zero);
+        if m13 != 0 {
+            let (hi, hi_ok) = dec8::<S>(t_hi);
+            let (lo, lo_ok) = dec8::<S>(_mm512_or_si512(_mm512_slli_epi64::<24>(t_mid), _mm512_set1_epi64(0x0030_3030)));
+            f3 = m13 & hi_ok & lo_ok;
+            v3 = _mm512_sub_epi64(_mm512_add_epi64(mul_epu32::<S>(hi, _mm512_set1_epi64(100_000)), lo), _mm512_set1_epi64(f.ws_ms));
+        }
         let ts_rel = _mm512_mask_blend_epi64(f3, f12, v3);
         let ts_fast = f1 | f2 | f3;
         // ingest (always F1).
@@ -680,22 +706,39 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         // A lane goes into the batch when it is decided, non-empty, keyed, its ingest fits, and it
         // does not survive or has a keyed user_id.
         let batchable = fast_ok & nonempty & ev_ok & ing_fits & (!surv | user_ok);
-        // Compact the batchable lanes (vpcompressq), branch-free.
         let m = batchable;
         let b = &mut out.b;
         b.n = m.count_ones();
-        store64(_mm512_maskz_compress_epi64(m, e_a), &mut b.ev_a);
-        store64(_mm512_maskz_compress_epi64(m, e_b), &mut b.ev_b);
-        store64(_mm512_maskz_compress_epi64(m, u_a), &mut b.user_a);
-        store64(_mm512_maskz_compress_epi64(m, u_b), &mut b.user_b);
-        store32(_mm512_maskz_compress_epi64(m, ts_rel), &mut b.ts);
-        store32(_mm512_maskz_compress_epi64(m, ingest), &mut b.ingest);
-        store32(_mm512_maskz_compress_epi64(m, price), &mut b.price);
-        _mm_storel_epi64(b.cat.as_mut_ptr() as *mut __m128i, _mm512_cvtepi64_epi8(_mm512_maskz_compress_epi64(m, cat)));
-        b.ev_long = _pext_u32(e_long as u32, m as u32) as u8;
-        b.user_long = _pext_u32(u_long as u32, m as u32) as u8;
-        b.surv = _pext_u32(surv as u32, m as u32) as u8;
-        b.purch = _pext_u32(purch as u32, m as u32) as u8;
+        if m == 0xFF {
+            // Every lane goes into the batch (nearly every batch): compaction is the identity, so
+            // the eight compresses (two port-5 uops each) and the four bit extracts are skipped.
+            store64(e_a, &mut b.ev_a);
+            store64(e_b, &mut b.ev_b);
+            store64(u_a, &mut b.user_a);
+            store64(u_b, &mut b.user_b);
+            store32(ts_rel, &mut b.ts);
+            store32(ingest, &mut b.ingest);
+            store32(price, &mut b.price);
+            _mm_storel_epi64(b.cat.as_mut_ptr() as *mut __m128i, _mm512_cvtepi64_epi8(cat));
+            b.ev_long = e_long;
+            b.user_long = u_long;
+            b.surv = surv;
+            b.purch = purch;
+        } else {
+            // Compact the batchable lanes (vpcompressq).
+            store64(_mm512_maskz_compress_epi64(m, e_a), &mut b.ev_a);
+            store64(_mm512_maskz_compress_epi64(m, e_b), &mut b.ev_b);
+            store64(_mm512_maskz_compress_epi64(m, u_a), &mut b.user_a);
+            store64(_mm512_maskz_compress_epi64(m, u_b), &mut b.user_b);
+            store32(_mm512_maskz_compress_epi64(m, ts_rel), &mut b.ts);
+            store32(_mm512_maskz_compress_epi64(m, ingest), &mut b.ingest);
+            store32(_mm512_maskz_compress_epi64(m, price), &mut b.price);
+            _mm_storel_epi64(b.cat.as_mut_ptr() as *mut __m128i, _mm512_cvtepi64_epi8(_mm512_maskz_compress_epi64(m, cat)));
+            b.ev_long = _pext_u32(e_long as u32, m as u32) as u8;
+            b.user_long = _pext_u32(u_long as u32, m as u32) as u8;
+            b.surv = _pext_u32(surv as u32, m as u32) as u8;
+            b.purch = _pext_u32(purch as u32, m as u32) as u8;
+        }
         out.slow = !fast_ok;
         out.foreign = fast_ok & nonempty & !batchable;
         _mm256_storeu_si256(out.ls.as_mut_ptr() as *mut __m256i, ls);
@@ -774,12 +817,22 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         let m = batchable;
         let b = &mut out.b;
         b.n = m.count_ones();
-        store64(_mm512_maskz_compress_epi64(m, u_a), &mut b.user_a);
-        store64(_mm512_maskz_compress_epi64(m, u_b), &mut b.user_b);
-        store32(_mm512_maskz_compress_epi64(m, ts_rel), &mut b.ts);
-        _mm_storeu_si128(b.campaign.as_mut_ptr() as *mut __m128i, _mm512_cvtepi64_epi16(_mm512_maskz_compress_epi64(m, camp)));
-        store64(_mm512_maskz_compress_epi64(m, loc), &mut b.loc);
-        b.user_long = _pext_u32(u_long as u32, m as u32) as u8;
+        if m == 0xFF {
+            // Every lane goes into the batch: compaction is the identity (see `ev_batch`).
+            store64(u_a, &mut b.user_a);
+            store64(u_b, &mut b.user_b);
+            store32(ts_rel, &mut b.ts);
+            _mm_storeu_si128(b.campaign.as_mut_ptr() as *mut __m128i, _mm512_cvtepi64_epi16(camp));
+            store64(loc, &mut b.loc);
+            b.user_long = u_long;
+        } else {
+            store64(_mm512_maskz_compress_epi64(m, u_a), &mut b.user_a);
+            store64(_mm512_maskz_compress_epi64(m, u_b), &mut b.user_b);
+            store32(_mm512_maskz_compress_epi64(m, ts_rel), &mut b.ts);
+            _mm_storeu_si128(b.campaign.as_mut_ptr() as *mut __m128i, _mm512_cvtepi64_epi16(_mm512_maskz_compress_epi64(m, camp)));
+            store64(_mm512_maskz_compress_epi64(m, loc), &mut b.loc);
+            b.user_long = _pext_u32(u_long as u32, m as u32) as u8;
+        }
         out.slow = !ts_fast;
         out.foreign = ts_fast & valid & !batchable;
         _mm256_storeu_si256(out.ls.as_mut_ptr() as *mut __m256i, ls);

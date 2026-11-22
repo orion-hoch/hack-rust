@@ -191,7 +191,28 @@ impl Out2 {
     #[inline(always)]
     fn emit_wide(&mut self, ukind: u64, ua: u64, ub: u64, ts: u64, purch: u64, pay: u64) {
         let q = (long_hash(ua, ub) >> (64 - self.b2)) as usize;
-        put(&mut self.wide, q, &[ua, ub, (ts << 1) | purch | (ukind << 62), pay][..3 + purch as usize]);
+        let w = (ts << 1) | purch | (ukind << 62);
+        let cnt = 3 + purch as usize;
+        let (stage, fill, _) = self.wide.raw_parts();
+        // SAFETY: q is below the partition count; when the record ends inside the line
+        // (n + cnt < 8), slots n to n + 3 are inside it too (the payload's slot is n + 3 <= 7
+        // also without a purchase, where it is not counted).
+        unsafe {
+            let f = fill.add(q);
+            let n = (*f & 7) as usize;
+            if n + cnt < 8 {
+                // Four stores and one count, no word loop.
+                let p = stage.add(q * 8 + n);
+                *p = ua;
+                *p.add(1) = ub;
+                *p.add(2) = w;
+                *p.add(3) = pay;
+                *f = FILL0 + (n + cnt) as u32;
+                return;
+            }
+        }
+        // The record fills its line or crosses it.
+        put(&mut self.wide, q, &[ua, ub, w, pay][..cnt]);
     }
 
     #[inline(always)]
@@ -241,14 +262,17 @@ fn put(o: &mut Out, q: usize, words: &[u64]) {
 /// bits of an odd multiple are a permutation of the key's low bits; the top bits mix all of
 /// them): one shift for the pair, and the bit number is the product as it is (a shift count
 /// is taken modulo 32). A plain unit's key is 32 bits (one multiply by an immediate, straight
-/// from the unit); a rare record's key hash is folded to 32 bits first (`product`), which
+/// from the unit); a rare record's key (a, b) is folded to 32 bits first (`product`), which
 /// leaves a SHORT key as it is, so both lanes name the same bit for the same key.
 type Pair = [u32; 2];
 
-/// The product of key hash `hk` (see `Pair`).
+/// The product (see `Pair`) of a rare record's event key (a, b) from `rkey`: (re, 0) gives
+/// re * FH as a plain unit's; a LONG/FOREIGN key is folded to 32 bits first (without the kind:
+/// a filter needs no exact key).
 #[inline(always)]
-fn product(hk: u64) -> u32 {
-    ((hk ^ (hk >> 32)) as u32).wrapping_mul(FH)
+fn product(a: u64, b: u64) -> u32 {
+    let x = a ^ b.rotate_left(29);
+    ((x ^ (x >> 32)) as u32).wrapping_mul(FH)
 }
 
 /// Sets the [seen, again] pair of product `k`.
@@ -337,8 +361,8 @@ unsafe fn mark_rare(c: &[Unit], next: *const Unit, fp: *mut Pair, wsh: u32, mut 
         // SAFETY: u is a record of this chunk; the caller's bound.
         unsafe {
             while u < end && n < 16 {
-                let (a, b, k) = rkey(u);
-                let h = product(key_hash(a, b, k));
+                let (a, b, _) = rkey(u);
+                let h = product(a, b);
                 *rh.add(n) = h;
                 #[cfg(target_arch = "x86_64")]
                 core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(fp.add((h >> wsh) as usize) as *const i8);
@@ -371,9 +395,9 @@ fn low_bits(x: u64, n: u32) -> u64 {
 /// `stage`, `fill` from `short.raw_parts()`; `rsh` = 40 - b2.
 #[inline(always)]
 unsafe fn stage_plain(stage: *mut u64, fill: *mut u32, short: &mut Out, rsh: u32, w: u64, w1: u64, keep: u64) {
-    let mu = (((w >> 55) & 0x7f) << 33) | (w1 >> 31);
-    let q = (mu >> rsh) as usize;
-    let word = (low_bits(mu, rsh) << 32) | ((w1 & TS) << 1);
+    // As `emit_plain_any`: q from the two shifted parts of mu, the word as w1 << 1 under a mask.
+    let q = ((((w >> 55) & 0x7f) << (33 - rsh)) | (w1 >> (31 + rsh))) as usize;
+    let word = (w1 << 1) & ((low_bits(u64::MAX, rsh) << 32) | 0xffff_fffe);
     // SAFETY: mu is below 2^40, so q is below 2^b2 = the partition count; the fill count is
     // below 8 (see `Out::raw_parts`), so the slot is inside q's line.
     unsafe {
@@ -646,17 +670,20 @@ unsafe fn sort_rare(c: &[Unit], fp: *const Pair, wsh: u32, mut rh: *const u32, m
         // SAFETY: u is a record of this chunk; the caller's bounds.
         unsafe {
             let h = (*u)[0];
-            let ag = again(fp, wsh, *rh);
+            let k = *rh;
             rh = rh.add(1);
+            // The again word shifted to its bit (bit 0; the bits above are other keys').
+            let agw = u64::from((*fp.add((k >> wsh) as usize))[1] >> (k & 31));
             let at = u as usize;
-            let keep = (ag ^ 1) & (h >> 27) & 1;
-            let wide = u64::from((h >> 25) & 3 != 0);
+            // The only copy, alive: bit 27 without the again bit; with a wide user, kw.
+            let keep = (h >> 27) & !agw & 1;
+            let kw = std::hint::select_unpredictable(h & (3 << 25) != 0, keep, 0);
             *cw = at;
             *sw = at;
             *ww = at;
-            cw = cw.add(ag as usize);
-            sw = sw.add((keep & (wide ^ 1)) as usize);
-            ww = ww.add((keep & wide) as usize);
+            cw = cw.add((agw & 1) as usize);
+            sw = sw.add((keep - kw) as usize);
+            ww = ww.add(kw as usize);
             u = rnext(u);
         }
     }
