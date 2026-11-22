@@ -308,6 +308,9 @@ pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a
     }
     let mut mask = gs.keys.len() - 1;
     let (mut nev, mut nck) = (0u32, 0u32);
+    // A click block usually directly follows its person block: the same key as the last block
+    // needs no lookup.
+    let (mut last_pk, mut last_k) = (NO_KEY, 0u32);
     for c in chunks {
         let mut at = 0usize;
         while at < c.len() && c[at] != 0 {
@@ -317,7 +320,7 @@ pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a
             }
             // pk is a mixed key (uniform low bits) or a wide index: its low bits hash it.
             let mut h = (pk ^ (pk >> 29)) as usize & mask;
-            let k = loop {
+            let k = if pk == last_pk { last_k } else { loop {
                 let key = gs.keys[h];
                 if key == pk {
                     break gs.vals[h];
@@ -334,7 +337,9 @@ pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a
                     break k;
                 }
                 h = (h + 1) & mask;
-            };
+            } };
+            last_pk = pk;
+            last_k = k;
             gs.refs.push((k, click, (c[at..].as_ptr(), len)));
             if click {
                 nck += 1;

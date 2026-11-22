@@ -259,12 +259,28 @@ unsafe fn mark_rare(c: &[Unit], fp: *mut [u64; 2], fsh: u32) {
     let mut u = c.as_ptr();
     // SAFETY: one past the end of `c`; records never cross a chunk, so the walk ends there.
     let end = unsafe { u.add(c.len()) };
+    // Walk 16 records ahead of the bit updates, prefetching each one's bitmap word.
+    let mut ks = [0u64; 16];
     while u < end {
+        let mut n = 0;
         // SAFETY: u is a record of this chunk; the caller's bound.
         unsafe {
-            let (a, b, k) = rkey(u);
-            mark(fp, fsh, key_hash(a, b, k));
-            u = rnext(u);
+            while u < end && n < 16 {
+                let (a, b, k) = rkey(u);
+                let h = key_hash(a, b, k).wrapping_mul(FH) >> fsh;
+                ks[n] = h;
+                #[cfg(target_arch = "x86_64")]
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(fp.add((h >> 6) as usize) as *const i8);
+                n += 1;
+                u = rnext(u);
+            }
+            for &k in &ks[..n] {
+                let k = k as usize;
+                let wd = fp.add(k >> 6);
+                let bit = 1u64 << (k & 63);
+                (*wd)[1] |= (*wd)[0] & bit;
+                (*wd)[0] |= bit;
+            }
         }
     }
 }
