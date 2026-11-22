@@ -65,10 +65,26 @@ fn click_id(ds: &Dataset, loc: parselab::Locator) -> &[u8] {
 }
 
 impl Worker {
-    pub fn new(agg: FastAgg) -> Self {
+    /// `est_rows`: a guess of the user-day rows this worker will write. The row columns are
+    /// reserved up front, each at least 2 MB, so they are huge-page mappings that never move
+    /// (the allocator advises 2 MB+ mappings MADV_HUGEPAGE): growing them on 4 KB pages was most
+    /// of the stage's 20K page faults.
+    pub fn new(agg: FastAgg, est_rows: usize) -> Self {
+        const MB2: usize = 2 << 20;
+        let rows_n = est_rows.max(MB2 / 4);
+        let persons_n = (est_rows / 2).max(MB2 / 4);
+        let mut rows = Rows::new();
+        rows.names.reserve((persons_n * 16).max(MB2));
+        rows.name_offsets.reserve(persons_n);
+        rows.runs.reserve(persons_n);
+        rows.day.reserve(rows_n);
+        rows.sessions.reserve(rows_n);
+        rows.events.reserve(rows_n);
+        rows.revenue.reserve(rows_n.max(MB2 / 8));
+        rows.top.reserve(rows_n.max(MB2));
         Worker {
             bad: false,
-            rows: Rows::new(),
+            rows,
             agg,
             sessions: 0,
             events: 0,
@@ -126,8 +142,8 @@ impl Worker {
         // Clicks into the sessions: credit and assist cells, user-day rows.
         let ds = cx.ds;
         let mut tie = |a: u64, b: u64| click_id(ds, parselab::Locator(a)).cmp(click_id(ds, parselab::Locator(b)));
-        let (cred, asst) = self.agg.cells_mut();
-        if sortlab::walk::walk(&self.cl, &self.buys, None, &cx.walk, &mut tie, &self.sc, &mut self.ws, &self.out, cred, asst, &mut self.wrows).is_err() {
+        let (hot, buy) = self.agg.cells_mut();
+        if sortlab::walk::walk(&self.cl, &self.buys, None, &cx.walk, &mut tie, &self.sc, &mut self.ws, &self.out, hot, buy, &mut self.wrows).is_err() {
             self.bad = true;
             return;
         }
@@ -146,9 +162,7 @@ impl Worker {
             }
             let r1 = wr.row_end[k];
             if r1 > r0 {
-                self.name_buf.clear();
-                cx.tok.bytes(out.persons[k], &mut self.name_buf);
-                r.names.extend_from_slice(&self.name_buf);
+                cx.tok.bytes(out.persons[k], &mut r.names);
                 r.name_offsets.push(r.names.len() as u32);
                 r.runs.push(r1 - r0);
             }

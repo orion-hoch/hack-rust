@@ -25,4 +25,17 @@ impl Rows {
     pub fn len(&self) -> usize {
         self.day.len()
     }
+
+    /// Room for `rows` rows and `persons` names of about `name_bytes` bytes in all, so the
+    /// appends never reallocate (each doubling copied the whole column).
+    pub fn reserve(&mut self, rows: usize, persons: usize, name_bytes: usize) {
+        self.names.reserve(name_bytes);
+        self.name_offsets.reserve(persons);
+        self.runs.reserve(persons);
+        self.day.reserve(rows);
+        self.sessions.reserve(rows);
+        self.events.reserve(rows);
+        self.revenue.reserve(rows);
+        self.top.reserve(rows);
+    }
 }

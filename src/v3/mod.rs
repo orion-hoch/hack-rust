@@ -131,6 +131,9 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let t0 = Instant::now();
     let mut clock = Clock { on: timing, last: t0, last_use: if timing { usage() } else { (0.0, 0.0, 0, 0) } };
     crate::par::init_pool(threads);
+    if cfg!(feature = "measure") && std::env::var("ENGINE_BINPF").as_deref() == Ok("0") {
+        crate::fast::sink::BINPF.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     let (ds, inp) = match open_rt(data)? {
         Ok(x) => x,
         Err(why) => return Ok(Outcome::Fallback(why)),
@@ -265,6 +268,9 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     };
     inp.flush();
     clock.mark("parse.events");
+    if cfg!(feature = "measure") && std::env::var("ENGINE_STOP").is_ok() {
+        std::process::exit(0);
+    }
     // Finish first: the final drain resolves the last lookups and can raise the flags checked next.
     for s in sinks.iter_mut() {
         s.finish();
@@ -399,8 +405,12 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         threads,
         1 << p2_bits,
         |_| {
-            let mut w = Worker::new(FastAgg::new(campaigns_with_organic, day0, span));
+            // user-day rows are about 1 in 9 survivors on generator data; 1.5 times that per worker
+            let mut w = Worker::new(FastAgg::new(campaigns_with_organic, day0, span), est_surv / 6 / threads.max(1));
             w.timing = timing;
+            // About 0.11 user-day rows and 0.034 persons per event at practice size; a little more.
+            let per = est_events / threads.max(1) + 1;
+            w.rows.reserve(per / 7, per / 25, per / 25 * 12);
             w
         },
         |w, q| {

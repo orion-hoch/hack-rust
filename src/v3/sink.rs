@@ -70,31 +70,19 @@ impl Default for Pend {
     }
 }
 
-/// Surviving events wait in blocks of G with their lookups started; when a block fills, the other
-/// block (started G records earlier, its lines landed) is resolved and its records are written
-/// complete. Against writing each record at once and OR-ing its token in 64 records later
-/// (interleaved, box 1): equal at p20v5 (2,048 partitions); at f60v5 (8,192 partitions, 2 MB of
-/// write fronts, beyond L2, so the later OR missed) 400 to 700 ms less CPU in the phase.
-const G: usize = 32;
+/// Event batches wait here, D deep: each batch is copied whole on arrival and its users' home
+/// slots computed and prefetched; when the ring is full the oldest batch is resolved in one loop
+/// (probe, then its complete records into their bins). Against blocks of 32 staged 64-byte
+/// records (box 1, perf, p20v5): 0.94G fewer instructions, cycles equal until Bins prefetches
+/// each write front's next line (the phase is store-bound: see fast::sink::Bins::push_at).
+const D: usize = 4;
 
-/// A surviving event whose token is pending: user key and slot, partition, the record words
-/// (SHORT [w0, w1]; LONG [a, b, w2, w3]; the token goes into the last word), kind flags.
-#[derive(Clone, Copy, Default)]
-struct EvPend {
-    ua: u64,
-    ub: u64,
-    slot: usize,
-    w: [u64; 4],
-    part: u32,
-    /// Bit 0: the user ID is LONG; bit 1: the event ID is LONG.
-    flags: u32,
-}
-
-struct Groups {
-    blk: [[EvPend; G]; 2],
-    /// Block being filled; the other one waits for its tokens.
-    cur: usize,
-    n: [usize; 2],
+struct EvRing {
+    b: [EvBatch; D],
+    slot: [[u32; 8]; D],
+    /// Next ring entry to fill (the oldest when the ring is full).
+    head: usize,
+    n: usize,
 }
 
 pub struct V3Sink<'a, 'b> {
@@ -119,7 +107,7 @@ pub struct V3Sink<'a, 'b> {
     ring: Box<[Pend; RING]>,
     ring_n: usize,
     ring_at: usize,
-    grp: Box<Groups>,
+    evr: Box<EvRing>,
 }
 
 // SAFETY: the ring's pointers point into this sink's own bins (moved with it).
@@ -155,41 +143,57 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             ring: Box::new([Pend::default(); RING]),
             ring_n: 0,
             ring_at: 0,
-            grp: Box::new(Groups { blk: [[EvPend::default(); G]; 2], cur: 0, n: [0; 2] }),
+            evr: Box::new(EvRing { b: [EvBatch::default(); D], slot: [[0; 8]; D], head: 0, n: 0 }),
         }
     }
 
-    /// Queues a surviving event (its lookup started); a full block resolves the other one.
+    /// Resolves ring entry `j`: every lane's token (survivors), then its complete records.
     #[inline(always)]
-    fn group(&mut self, e: EvPend) {
-        let g = &mut *self.grp;
-        let c = g.cur;
-        g.blk[c][g.n[c]] = e;
-        g.n[c] += 1;
-        if g.n[c] == G {
-            self.resolve_block(c ^ 1);
-            self.grp.cur = c ^ 1;
-        }
-    }
-
-    /// Resolves block `k`: tokens, then the complete records into their bins.
-    #[inline(always)]
-    fn resolve_block(&mut self, k: usize) {
-        let n = self.grp.n[k];
-        let mut bad = false;
-        for i in 0..n {
-            let e = self.grp.blk[k][i];
-            let t = self.tok.finish(&Pending { long: e.flags & 1 != 0, a: e.ua, b: e.ub, slot: e.slot });
-            bad |= t == NO_TOKEN;
-            let t = u64::from(t);
-            if e.flags & 2 == 0 {
-                self.short.push(e.part as usize, [e.w[0], e.w[1] | t]);
+    fn resolve_batch(&mut self, j: usize) {
+        let V3Sink { tok, evr, short, long, pshort, plong, bad, bits, mbits, mode, .. } = self;
+        let b = &evr.b[j];
+        let sl = &evr.slot[j];
+        let n = b.n as usize;
+        let pbits = if cfg!(feature = "measure") { *mbits } else { *bits };
+        let notab = cfg!(feature = "measure") && *mode == 5;
+        let mut nb = false;
+        for k in 0..n {
+            let surv = b.surv >> k & 1 != 0;
+            let purch = surv && b.purch >> k & 1 != 0;
+            let ing = u64::from(b.ingest[k]);
+            let ev_long = b.ev_long >> k & 1 != 0;
+            let (a, bb) = (b.ev_a[k], if ev_long { b.ev_b[k] } else { 0 });
+            let p = part_of(a, bb, pbits);
+            let w1 = if surv {
+                let t = if notab {
+                    sl[k]
+                } else if b.user_long >> k & 1 == 0 {
+                    tok.short_at(b.user_a[k], sl[k])
+                } else {
+                    tok.long_at(b.user_a[k], b.user_b[k], sl[k])
+                };
+                nb |= t == NO_TOKEN;
+                u64::from(t) | (u64::from(b.ts[k]) << 32) | (u64::from(purch) << 63)
             } else {
-                self.long.push(e.part as usize, [e.w[0], e.w[1], e.w[2], e.w[3] | t]);
+                0
+            };
+            if purch {
+                // The parser accepts 1 to 10,000,000; anything at 2^24 or above would not fit.
+                nb |= b.price[k] >> 24 != 0;
+                let buy = u64::from(b.cat[k]) | (u64::from(b.price[k]) << 8);
+                if ev_long {
+                    plong.push(p, [a, bb, ing, buy]);
+                } else {
+                    pshort.push(p, [a | (ing << 40), buy]);
+                }
+            }
+            if ev_long {
+                long.push(p, [a, bb, ing | (u64::from(surv) << 63), w1]);
+            } else {
+                short.push(p, [a | (ing << 40) | (u64::from(surv) << 63), w1]);
             }
         }
-        self.bad |= bad;
-        self.grp.n[k] = 0;
+        *bad |= nb;
     }
 
     /// Starts a lookup whose token is to be OR-ed into `*at` (bits 0-31) later (prefetched for
@@ -226,9 +230,13 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         }
         self.ring_n = 0;
         self.ring_at = 0;
-        let c = self.grp.cur;
-        self.resolve_block(c ^ 1);
-        self.resolve_block(c);
+        let r = &mut *self.evr;
+        let first = (r.head + D - r.n) % D;
+        for k in 0..r.n {
+            self.resolve_batch((first + k) % D);
+        }
+        self.evr.n = 0;
+        self.evr.head = 0;
     }
 
     pub fn finish(&mut self) {
@@ -289,45 +297,23 @@ impl<'a, 'b> V3Sink<'a, 'b> {
 impl<'a> Sink for V3Sink<'a, '_> {
     #[inline]
     fn events(&mut self, b: &EvBatch) {
-        let n = b.n as usize;
-        if cfg!(feature = "measure") && self.mode != 0 {
+        if cfg!(feature = "measure") && self.mode != 0 && self.mode != 5 {
             return self.events_measure(b);
         }
-        for k in 0..n {
-            let surv = b.surv >> k & 1 != 0;
-            let purch = surv && b.purch >> k & 1 != 0;
-            let ing = u64::from(b.ingest[k]);
-            let ts = if surv { u64::from(b.ts[k]) } else { 0 };
-            let w1 = (ts << 32) | (u64::from(purch) << 63);
-            let buy = if purch {
-                // The parser accepts 1 to 10,000,000; anything at 2^24 or above would not fit.
-                self.bad |= b.price[k] >> 24 != 0;
-                u64::from(b.cat[k]) | (u64::from(b.price[k]) << 8)
-            } else {
-                0
-            };
-            let ev_long = b.ev_long >> k & 1 != 0;
-            let (a, bb) = (b.ev_a[k], if ev_long { b.ev_b[k] } else { 0 });
-            let p = part_of(a, bb, self.bits);
-            if purch {
-                if ev_long {
-                    self.plong.push(p, [a, bb, ing, buy]);
-                } else {
-                    self.pshort.push(p, [a | (ing << 40), buy]);
-                }
-            }
-            let w: [u64; 4] = if ev_long { [a, bb, ing | (u64::from(surv) << 63), w1] } else { [a | (ing << 40) | (u64::from(surv) << 63), w1, 0, 0] };
-            if surv {
-                let ul = b.user_long >> k & 1 != 0;
-                let slot = self.tok.start_hint::<EVENT_PREFETCH_W>(ul, b.user_a[k], b.user_b[k]).slot;
-                self.group(EvPend { ua: b.user_a[k], ub: b.user_b[k], slot, w, part: p as u32, flags: u32::from(ul) | (u32::from(ev_long) << 1) });
-            } else if ev_long {
-                // A dead copy only shadows: its key, ingest and dead bit; no token needed.
-                self.long.push(p, w);
-            } else {
-                self.short.push(p, [w[0], w[1]]);
-            }
+        let n = b.n as usize;
+        let i = self.evr.head;
+        if self.evr.n == D {
+            self.resolve_batch(i);
+        } else {
+            self.evr.n += 1;
         }
+        let r = &mut *self.evr;
+        r.b[i] = *b;
+        let notab = cfg!(feature = "measure") && self.mode == 5;
+        for k in 0..n {
+            r.slot[i][k] = if notab { (b.user_a[k] ^ b.user_b[k]) as u32 & 0xff_ffff } else { self.tok.home(b.user_long >> k & 1 != 0, b.user_a[k], b.user_b[k]) };
+        }
+        r.head = (i + 1) % D;
     }
 
     #[inline]

@@ -22,8 +22,8 @@
 //! * Clicks of persons without events here are dropped.
 //!
 //! Output: `Cells` (the engine's FastAgg layout, cell = day * campaigns + campaign:
-//! cred = [sessions | purchasing << 32, revenue], asst = assisted sessions), accumulated across
-//! calls; `Rows`, cleared per call: per output person (as `Out::persons`) the end of its rows,
+//! hot = [credited sessions, assisted sessions], buy = [purchasing sessions, revenue], the latter
+//! touched only by sessions with revenue), accumulated across calls; `Rows`, cleared per call: per output person (as `Out::persons`) the end of its rows,
 //! and per row the relative day, sessions, events, revenue and top category.
 
 use super::*;
@@ -48,21 +48,21 @@ pub struct Params {
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Cells {
-    pub cred: Vec<[u64; 2]>,
-    pub asst: Vec<u32>,
+    pub hot: Vec<[u32; 2]>,
+    pub buy: Vec<[u64; 2]>,
 }
 
 impl Cells {
     pub fn new(p: &Params) -> Self {
         let n = p.days * p.campaigns;
-        Cells { cred: vec![[0, 0]; n], asst: vec![0; n] }
+        Cells { hot: vec![[0, 0]; n], buy: vec![[0, 0]; n] }
     }
 }
 
 /// The cells as the caller's slices (e.g. the engine's FastAgg), same layout as `Cells`.
 struct Cells2<'a> {
-    cred: &'a mut [[u64; 2]],
-    asst: &'a mut [u32],
+    hot: &'a mut [[u32; 2]],
+    buy: &'a mut [[u64; 2]],
 }
 
 #[derive(Default, Debug, Clone)]
@@ -119,6 +119,9 @@ pub struct WalkScratch {
     s_at: Vec<i64>,
     s_day: Vec<u32>,
     day_end: Vec<u32>,
+    /// Per session of the partition: its revenue, and the index of its user-day row.
+    sess_rev: Vec<u64>,
+    row_of: Vec<u32>,
     pub stats: Stats,
 }
 
@@ -146,6 +149,8 @@ impl WalkScratch {
             s_at: Vec::new(),
             s_day: Vec::new(),
             day_end: Vec::new(),
+            sess_rev: Vec::new(),
+            row_of: Vec::new(),
             stats: Stats::default(),
         }
     }
@@ -216,17 +221,17 @@ pub fn walk<F: FnMut(u64, u64) -> Ordering>(
     sc: &Scratch,
     ws: &mut WalkScratch,
     out: &Out,
-    cred: &mut [[u64; 2]],
-    asst: &mut [u32],
+    hot: &mut [[u32; 2]],
+    buy: &mut [[u64; 2]],
     rows: &mut Rows,
 ) -> Result<(), Error> {
     rows.clear();
-    let mut cells = Cells2 { cred, asst };
+    let mut cells = Cells2 { hot, buy };
     let cells = &mut cells;
     let np = out.persons.len();
     let ns = out.start.len();
     let cn = prm.campaigns;
-    if out.sess_end.len() != np || out.buy_session.len() != buys.len() || cells.cred.len() != prm.days * cn || cells.asst.len() != prm.days * cn || prm.organic as usize >= cn {
+    if out.sess_end.len() != np || out.buy_session.len() != buys.len() || cells.hot.len() != prm.days * cn || cells.buy.len() != prm.days * cn || prm.organic as usize >= cn {
         return Err(Error::WalkInput);
     }
     if let Some(d) = dense {
@@ -297,11 +302,16 @@ pub fn walk<F: FnMut(u64, u64) -> Ordering>(
     }
     ws.sbuy.clear();
     ws.sbuy.resize(buys.len(), 0);
+    ws.sess_rev.clear();
+    ws.sess_rev.resize(ns, 0);
     for (j, &s) in out.buy_session.iter().enumerate() {
         let at = &mut ws.sb_at[s as usize + 1];
         ws.sbuy[*at as usize] = j as u32;
         *at += 1;
+        ws.sess_rev[s as usize] += u64::from((buys[j][1] as u32) >> 8);
     }
+    ws.row_of.clear();
+    ws.row_of.resize(ns, 0);
     if ws.stamp.len() < cn {
         ws.stamp.resize(cn, 0);
         ws.upto.resize(cn, 0);
@@ -325,7 +335,59 @@ pub fn walk<F: FnMut(u64, u64) -> Ordering>(
         s0 = s1;
     }
     ws.ckey = ckey;
+    if res.is_ok() {
+        top_categories(buys, ws, out, rows);
+    }
     res
+}
+
+/// Top category of every user-day row with purchases, from the purchases in session order
+/// (sessions, hence rows, ascending): the largest category sum, ties to the smaller index, any
+/// category with a purchase a candidate (even at price 0). Other rows keep `NO_TOP`.
+fn top_categories(buys: &[[u64; 2]], ws: &mut WalkScratch, out: &Out, rows: &mut Rows) {
+    let mut cur = u32::MAX;
+    for i in 0..ws.sbuy.len() {
+        let j = ws.sbuy[i] as usize;
+        let row = ws.row_of[out.buy_session[j] as usize];
+        if row != cur {
+            if cur != u32::MAX {
+                rows.top[cur as usize] = take_top(ws);
+            }
+            cur = row;
+        }
+        let pay = buys[j][1] as u32;
+        let cat = (pay & 255) as usize;
+        ws.cat_sum[cat] += u64::from(pay >> 8);
+        ws.cat_seen[cat >> 6] |= 1 << (cat & 63);
+    }
+    if cur != u32::MAX {
+        rows.top[cur as usize] = take_top(ws);
+    }
+}
+
+/// The top category of the sums gathered, which are then cleared.
+#[inline(always)]
+fn take_top(ws: &mut WalkScratch) -> u8 {
+    let mut top = NO_TOP;
+    let mut top_sum = 0u64;
+    let mut any = false;
+    for w in 0..4 {
+        let mut bits = ws.cat_seen[w];
+        while bits != 0 {
+            let cat = w * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let s = ws.cat_sum[cat];
+            // ascending categories: the first is taken, later ones only when strictly larger
+            if !any || s > top_sum {
+                any = true;
+                top = cat as u8;
+                top_sum = s;
+            }
+            ws.cat_sum[cat] = 0;
+        }
+        ws.cat_seen[w] = 0;
+    }
+    top
 }
 
 #[inline(always)]
@@ -360,6 +422,24 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
     ws.s_day.clear();
     let mut k = 0usize;
     let (mut memo_g, mut memo_c) = (usize::MAX, 0u32);
+    // Rows are written in place, one slot per session at most: every session rewrites the
+    // current row with its running sums, and a new day moves to the next slot first (no branch
+    // on the day change; the top category comes later, from the purchases).
+    let r0 = rows.day.len();
+    let m = s1 - s0;
+    rows.day.reserve(m);
+    rows.sessions.reserve(m);
+    rows.events.reserve(m);
+    rows.revenue.reserve(m);
+    rows.top.reserve(m);
+    let (pd, ps, pe, pr, pt) = (
+        rows.day.as_mut_ptr(),
+        rows.sessions.as_mut_ptr(),
+        rows.events.as_mut_ptr(),
+        rows.revenue.as_mut_ptr(),
+        rows.top.as_mut_ptr(),
+    );
+    let mut r = r0.wrapping_sub(1);
     let mut day_now = u32::MAX;
     let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0u64);
     for s in s0..s1 {
@@ -369,26 +449,23 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
         if day as usize >= prm.days {
             return Err(Error::DayOutOfRange(s));
         }
-        if day != day_now {
-            if day_now != u32::MAX {
-                emit(ws, rows, day_now, d_sessions, d_events, d_revenue);
-            }
-            day_now = day;
-            d_sessions = 0;
-            d_events = 0;
-            d_revenue = 0;
+        let new_day = day != day_now;
+        day_now = day;
+        r = r.wrapping_add(usize::from(new_day));
+        let revenue = ws.sess_rev[s];
+        let ev = out.events[s];
+        d_sessions = if new_day { 1 } else { d_sessions + 1 };
+        d_events = if new_day { ev } else { d_events + ev };
+        d_revenue = if new_day { revenue } else { d_revenue + revenue };
+        // SAFETY: r - r0 < m (one slot per session at most), within the reserved room.
+        unsafe {
+            *pd.add(r) = day;
+            *ps.add(r) = d_sessions;
+            *pe.add(r) = d_events;
+            *pr.add(r) = d_revenue;
+            *pt.add(r) = NO_TOP;
         }
-        let mut revenue = 0u64;
-        for &j in &ws.sbuy[ws.sb_at[s] as usize..ws.sb_at[s + 1] as usize] {
-            let pay = buys[j as usize][1] as u32;
-            let (price, cat) = (u64::from(pay >> 8), (pay & 255) as usize);
-            revenue += price;
-            ws.cat_sum[cat] += price;
-            ws.cat_seen[cat >> 6] |= 1 << (cat & 63);
-        }
-        d_sessions += 1;
-        d_events += out.events[s];
-        d_revenue += revenue;
+        ws.row_of[s] = r as u32;
         let mut camp = prm.organic;
         if n > 0 {
             let at = i64::from(start) - base;
@@ -431,44 +508,27 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
                 }
             }
         }
-        let c = &mut cells.cred[day as usize * cn + camp as usize];
-        c[0] += 1 | (u64::from(revenue > 0) << 32);
-        c[1] += revenue;
+        let cell = day as usize * cn + camp as usize;
+        cells.hot[cell][0] += 1;
+        if revenue > 0 {
+            let b = &mut cells.buy[cell];
+            b[0] += 1;
+            b[1] += revenue;
+        }
     }
-    emit(ws, rows, day_now, d_sessions, d_events, d_revenue);
+    // SAFETY: slots r0..=r were all written above.
+    unsafe {
+        let len = r.wrapping_add(1);
+        rows.day.set_len(len);
+        rows.sessions.set_len(len);
+        rows.events.set_len(len);
+        rows.revenue.set_len(len);
+        rows.top.set_len(len);
+    }
     if n > 0 {
         assists(ck, clicks, prm, ws, cells);
     }
     Ok(())
-}
-
-/// One user-day row; the top category from the sums of the day, then the sums are cleared.
-#[inline(always)]
-fn emit(ws: &mut WalkScratch, rows: &mut Rows, day: u32, sessions: u32, events: u32, revenue: u64) {
-    let mut top = NO_TOP;
-    let mut top_sum = 0u64;
-    let mut any = false;
-    for w in 0..4 {
-        let mut bits = ws.cat_seen[w];
-        while bits != 0 {
-            let cat = w * 64 + bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let s = ws.cat_sum[cat];
-            // ascending categories: the first is taken, later ones only when strictly larger
-            if !any || s > top_sum {
-                any = true;
-                top = cat as u8;
-                top_sum = s;
-            }
-            ws.cat_sum[cat] = 0;
-        }
-        ws.cat_seen[w] = 0;
-    }
-    rows.day.push(day);
-    rows.sessions.push(sessions);
-    rows.events.push(events);
-    rows.revenue.push(revenue);
-    rows.top.push(top);
 }
 
 /// Assists of one person as the interval union, by one sweep over its clicks in ts order: a
@@ -491,13 +551,20 @@ fn assists(ck: &[u64], clicks: &[[u64; 2]], prm: &Params, ws: &mut WalkScratch, 
         ws.serial = 1;
     }
     let serial = ws.serial;
+    let cn = prm.campaigns;
+    // locals so that nothing is reloaded through `ws` inside the loop
+    let (s_at, s_day, day_end) = (&ws.s_at[..m], &ws.s_day[..m], &ws.day_end[..m]);
+    let (stamp, upto) = (&mut ws.stamp[..cn], &mut ws.upto[..cn]);
+    let hot = &mut *cells.hot;
+    let mut ranges = 0u64;
     let (mut lo, mut hi) = (0usize, 0usize);
     for &x in ck {
         let t = ts_c(x);
-        while lo < m && ws.s_at[lo] < t {
+        while lo < m && s_at[lo] < t {
             lo += 1;
         }
-        while hi < m && ws.s_at[hi] <= t + REACH {
+        let te = t + REACH;
+        while hi < m && s_at[hi] <= te {
             hi += 1;
         }
         if lo == hi {
@@ -505,18 +572,16 @@ fn assists(ck: &[u64], clicks: &[[u64; 2]], prm: &Params, ws: &mut WalkScratch, 
         }
         let c = camp_of(clicks, x) as usize;
         // stamp[c]: serial of the person that last counted c; upto[c]: the end it counted to
-        let mut from = lo;
-        if ws.stamp[c] == serial {
-            from = from.max(ws.upto[c] as usize);
-        }
-        ws.stamp[c] = serial;
-        ws.upto[c] = hi as u32;
+        let from = if stamp[c] == serial { lo.max(upto[c] as usize) } else { lo };
+        stamp[c] = serial;
+        upto[c] = hi as u32;
         let mut i = from;
         while i < hi {
-            let end = (ws.day_end[i] as usize).min(hi);
-            ws.stats.assist_ranges += 1;
-            cells.asst[ws.s_day[i] as usize * prm.campaigns + c] += (end - i) as u32;
+            let end = (day_end[i] as usize).min(hi);
+            ranges += 1;
+            hot[s_day[i] as usize * cn + c][1] += (end - i) as u32;
             i = end;
         }
     }
+    ws.stats.assist_ranges += ranges;
 }

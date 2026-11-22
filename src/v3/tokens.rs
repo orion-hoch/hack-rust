@@ -410,6 +410,28 @@ impl<'a> Tokens<'a> {
         Pending { long, a, b, slot }
     }
 
+    /// Home slot of a key (SHORT or LONG), its line prefetched (shared). Branchless.
+    #[inline(always)]
+    pub fn home(&self, long: bool, a: u64, b: u64) -> u32 {
+        let h = mix(if long { a ^ b.rotate_left(29) } else { a }) as usize;
+        let slot = h & if long { self.long_mask } else { self.short_mask };
+        let at = if long { self.long.as_ptr().wrapping_add(4 * slot) } else { self.short.as_ptr().wrapping_add(slot) };
+        prefetch(at);
+        slot as u32
+    }
+
+    /// Token of a SHORT key whose home slot is `slot` (see `home`).
+    #[inline(always)]
+    pub fn short_at(&self, v: u64, slot: u32) -> u32 {
+        self.short_token(v, slot as usize)
+    }
+
+    /// Token of a LONG key whose home slot is `slot` (see `home`).
+    #[inline(always)]
+    pub fn long_at(&self, a: u64, b: u64, slot: u32) -> u32 {
+        self.long_token(a, b, slot as usize)
+    }
+
     #[inline(always)]
     pub fn start(&self, long: bool, a: u64, b: u64) -> Pending {
         self.start_hint::<false>(long, a, b)

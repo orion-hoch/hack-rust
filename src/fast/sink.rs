@@ -8,6 +8,14 @@
 //! frees it (dedup, per partition) or the class is reset (the driver).
 
 
+/// Measurement builds: ENGINE_BINPF=0 turns the next-line prefetch off.
+pub static BINPF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[inline(always)]
+fn pf_on() -> bool {
+    !cfg!(feature = "measure") || BINPF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Records binned by an index, in chunks bumped from arena blocks.
 pub struct Bins<T: Copy> {
     /// Per bin: write pointer and end of the current chunk (one pair: one cache access per push).
@@ -92,6 +100,19 @@ impl<T: Copy> Bins<T> {
         unsafe {
             p.write(x);
             self.ce[b][0] = p.add(1);
+        }
+        // The front's next line, owned before it is written: with thousands of write fronts the
+        // hardware streamers follow none of them, and each fresh line's first store otherwise
+        // waits at the head of the store buffer for a read from DRAM.
+        if pf_on() {
+            let nx = (p as *const u8).wrapping_add(64);
+            let q = if nx < e as *const u8 { nx } else { p as *const u8 };
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: prefetch never faults.
+            unsafe {
+                core::arch::x86_64::_mm_prefetch(q as *const i8, core::arch::x86_64::_MM_HINT_ET0);
+            }
+            let _ = q;
         }
         p
     }

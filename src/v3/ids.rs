@@ -68,6 +68,49 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Appends the bytes of a SHORT ID.
 pub fn short_bytes(prefix: u8, v: u64, out: &mut Vec<u8>) {
+    if v >= P36[8] {
+        return short_bytes_slow(prefix, v, out);
+    }
+    // Eight base-36 digits, most significant first, two per table entry; then the leading
+    // zeros are shifted off (the canonical form has none, except "0" itself).
+    let (hi, lo) = ((v / P36[4]) as usize, (v % P36[4]) as usize);
+    let d = [&PAIR36[hi / 1296], &PAIR36[hi % 1296], &PAIR36[lo / 1296], &PAIR36[lo % 1296]];
+    let word = u64::from_le_bytes([d[0][0], d[0][1], d[1][0], d[1][1], d[2][0], d[2][1], d[3][0], d[3][1]]);
+    let len = 1 + (1..8).map(|i| usize::from(v >= P36[i])).sum::<usize>();
+    let word = word >> (8 * (8 - len));
+    out.reserve(9);
+    // SAFETY: 9 bytes reserved past the length; the 8-byte store covers the len <= 8 digits.
+    unsafe {
+        let p = out.as_mut_ptr().add(out.len());
+        *p = prefix;
+        p.add(1).cast::<u64>().write_unaligned(word.to_le());
+        out.set_len(out.len() + 1 + len);
+    }
+}
+
+/// Powers of 36 up to 36^8.
+const P36: [u64; 9] = {
+    let mut p = [1u64; 9];
+    let mut i = 1;
+    while i < 9 {
+        p[i] = p[i - 1] * 36;
+        i += 1;
+    }
+    p
+};
+
+/// The two base-36 digits of every value below 36^2.
+static PAIR36: [[u8; 2]; 1296] = {
+    let mut t = [[0u8; 2]; 1296];
+    let mut i = 0;
+    while i < 1296 {
+        t[i] = [DIG36[i / 36], DIG36[i % 36]];
+        i += 1;
+    }
+    t
+};
+
+fn short_bytes_slow(prefix: u8, v: u64, out: &mut Vec<u8>) {
     out.push(prefix);
     let mut buf = [0u8; 13];
     let mut at = buf.len();
@@ -101,6 +144,25 @@ pub fn cmp_short(x: u64, y: u64) -> Ordering {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_bytes_matches_the_digit_loop() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut vals: Vec<u64> = (0..40).map(|i| super::P36[i % 9].saturating_sub(1 + i as u64 % 2)).collect();
+        vals.extend([0, 1, 35, 36, 1295, 1296, (1 << 40) - 1]);
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            vals.push(x % (1 << 40));
+        }
+        for v in vals {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            super::short_bytes(b'u', v, &mut a);
+            super::short_bytes_slow(b'u', v, &mut b);
+            assert_eq!(a, b, "{v}");
+        }
+    }
+
     use super::*;
 
     fn bytes(k: Key) -> Vec<u8> {
