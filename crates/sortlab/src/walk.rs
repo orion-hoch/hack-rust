@@ -270,8 +270,6 @@ pub fn walk<F: FnMut(u64, u64) -> Ordering>(
         ws.cfirst[p as usize] += 1;
         kept += 1;
     }
-    ws.stats.clicks_kept += kept;
-    ws.stats.clicks_dropped += n as u64 - kept;
     let mut sum = 0u32;
     ws.ccur.clear();
     ws.ccur.resize(np, 0);
@@ -501,12 +499,10 @@ fn person<F: FnMut(u64, u64) -> Ordering>(
                         } else {
                             let mixed = ck[g..k].iter().any(|&x| camp_of(clicks, x, packed) != camp);
                             if mixed {
-                                ws.stats.tie_groups += 1;
                                 // smallest click_id; among equal ids the later click (as a stable
                                 // sort by click_id descending would leave last)
                                 let mut best = g;
                                 for i in g + 1..k {
-                                    ws.stats.tie_calls += 1;
                                     let (lb, li) = (clicks[idx_of(ck[best], packed)][1] & LOC, clicks[idx_of(ck[i], packed)][1] & LOC);
                                     if tie(lb, li) != Ordering::Less {
                                         best = i;
@@ -570,7 +566,6 @@ fn assists(ck: &[u64], clicks: &[[u64; 2]], prm: &Params, ws: &mut WalkScratch, 
     let (s_at, s_day, day_end) = (&ws.s_at[..m], &ws.s_day[..m], &ws.day_end[..m]);
     let (stamp, upto) = (&mut ws.stamp[..cn], &mut ws.upto[..cn]);
     let hot = &mut *cells.hot;
-    let mut ranges = 0u64;
     let (mut lo, mut hi) = (0usize, 0usize);
     for &x in ck {
         let t = ts_c(x);
@@ -592,10 +587,8 @@ fn assists(ck: &[u64], clicks: &[[u64; 2]], prm: &Params, ws: &mut WalkScratch, 
         let mut i = from;
         while i < hi {
             let end = (day_end[i] as usize).min(hi);
-            ranges += 1;
             hot[s_day[i] as usize * cn + c][1] += (end - i) as u32;
             i = end;
         }
     }
-    ws.stats.assist_ranges += ranges;
 }

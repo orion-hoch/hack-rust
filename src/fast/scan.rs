@@ -26,6 +26,19 @@ impl Rows {
         self.day.len()
     }
 
+    /// Empties the rows, keeping their room.
+    pub fn clear(&mut self) {
+        self.names.clear();
+        self.name_offsets.clear();
+        self.name_offsets.push(0);
+        self.runs.clear();
+        self.day.clear();
+        self.sessions.clear();
+        self.events.clear();
+        self.revenue.clear();
+        self.top.clear();
+    }
+
     /// Room for `rows` rows and `persons` names of about `name_bytes` bytes in all, so the
     /// appends never reallocate (each doubling copied the whole column).
     pub fn reserve(&mut self, rows: usize, persons: usize, name_bytes: usize) {

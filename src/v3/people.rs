@@ -31,6 +31,13 @@ pub struct PeopleCtx<'a, 'b> {
 }
 
 pub struct Worker {
+    /// The user_daily file this worker wrote at the end of the session stage, or its error.
+    pub wrote: bool,
+    pub write_err: Option<std::io::Error>,
+    /// user_daily files this worker has written (its next file's sequence number), and the
+    /// pool participant it runs on (in the file names).
+    pub files: u32,
+    pub index: usize,
     /// A check failed (a purchase outside every session, a purchase of an absent person, a bad
     /// campaign or day): the run falls back.
     pub bad: bool,
@@ -46,12 +53,6 @@ pub struct Worker {
     ws: sortlab::walk::WalkScratch,
     wrows: sortlab::walk::Rows,
     name_buf: Vec<u8>,
-    /// Nanoseconds by phase (gather, sessions kernel, clicks gather, walk, rows) when timing.
-    pub phase_ns: [u64; 5],
-    pub timing: bool,
-    /// Counts when timing: clicks kept, credited tie groups resolved, persons, rows, tie
-    /// comparisons, assist ranges.
-    pub counts: [u64; 6],
 }
 
 /// The click_id of the click line at `loc`: its first field, unquoted (the line was accepted by
@@ -83,6 +84,10 @@ impl Worker {
         rows.revenue.reserve(rows_n.max(MB2 / 8));
         rows.top.reserve(rows_n.max(MB2));
         Worker {
+            wrote: false,
+            write_err: None,
+            files: 0,
+            index: 0,
             bad: false,
             rows,
             agg,
@@ -96,23 +101,11 @@ impl Worker {
             ws: sortlab::walk::WalkScratch::new(),
             wrows: sortlab::walk::Rows::default(),
             name_buf: Vec::new(),
-            phase_ns: [0; 5],
-            timing: false,
-            counts: [0; 6],
         }
     }
 
     /// One person partition: survivor records, purchase records and click records of it.
     pub fn partition(&mut self, ev: &[&[u64]], buys: &[&[[u64; 2]]], clicks: &[&[[u64; 2]]], cx: &PeopleCtx) {
-        let timing = self.timing;
-        let mut t_last = if timing { Some(std::time::Instant::now()) } else { None };
-        let mut lap = |w: &mut [u64; 5], i: usize| {
-            if let Some(t) = t_last.as_mut() {
-                let now = std::time::Instant::now();
-                w[i] += (now - *t).as_nanos() as u64;
-                *t = now;
-            }
-        };
         self.ev.clear();
         for c in ev {
             self.ev.extend_from_slice(c);
@@ -127,18 +120,15 @@ impl Worker {
         for c in buys {
             self.buys.extend_from_slice(c);
         }
-        lap(&mut self.phase_ns, 0);
         // Sessions per person (start, event count, in time order) and each purchase's session.
         if sortlab::sessions(&self.ev, &self.buys, cx.kernel, None, &mut self.sc, &mut self.out).is_err() {
             self.bad = true;
             return;
         }
-        lap(&mut self.phase_ns, 1);
         self.cl.clear();
         for c in clicks {
             self.cl.extend_from_slice(c);
         }
-        lap(&mut self.phase_ns, 2);
         // Clicks into the sessions: credit and assist cells, user-day rows.
         let ds = cx.ds;
         let mut tie = |a: u64, b: u64| click_id(ds, parselab::Locator(a)).cmp(click_id(ds, parselab::Locator(b)));
@@ -147,7 +137,6 @@ impl Worker {
             self.bad = true;
             return;
         }
-        lap(&mut self.phase_ns, 3);
         // Rows with the person names.
         let (out, wr, r) = (&self.out, &self.wrows, &mut self.rows);
         let np = out.persons.len();
@@ -176,15 +165,5 @@ impl Worker {
         r.top.extend_from_slice(&wr.top);
         self.sessions += out.start.len() as u64;
         self.events += self.ev.len() as u64;
-        if timing {
-            let st = self.ws.stats;
-            self.counts[0] = st.clicks_kept;
-            self.counts[1] = st.tie_groups;
-            self.counts[2] += np as u64;
-            self.counts[3] += wr.day.len() as u64;
-            self.counts[4] = st.tie_calls;
-            self.counts[5] = st.assist_ranges;
-        }
-        lap(&mut self.phase_ns, 4);
     }
 }

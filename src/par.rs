@@ -118,12 +118,25 @@ where
     I: Fn(usize) -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    run_fin(threads, tasks, init, work, |_, _| ())
+}
+
+/// `run`, and each participant calls `fin(state, participant)` on its own thread as soon as the
+/// task queue is empty for it (while others may still be working: no barrier before `fin`).
+pub fn run_fin<S, I, F, G>(threads: usize, tasks: usize, init: I, work: F, fin: G) -> Vec<S>
+where
+    S: Send,
+    I: Fn(usize) -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+    G: Fn(&mut S, usize) + Sync,
+{
     let threads = threads.clamp(1, tasks.max(1));
     if threads == 1 {
         let mut state = init(0);
         for task in 0..tasks {
             work(&mut state, task);
         }
+        fin(&mut state, 0);
         return vec![state];
     }
     let next = AtomicUsize::new(0);
@@ -136,6 +149,7 @@ where
             }
             work(&mut state, task);
         }
+        fin(&mut state, t);
         state
     };
     let pooled = POOL.get().filter(|p| p.threads >= threads && !IN_POOL.with(|c| c.get()));

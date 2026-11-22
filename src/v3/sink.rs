@@ -1,14 +1,15 @@
 //! The v3 sink, one per parser worker: user tokens for every batch (probes batched), event
-//! records into move-1 partitions by a mix of the event key, purchases into side streams, clicks
-//! and link edges appended flat, and every rare line (locator) read exactly and turned into the
+//! records into move-1 partitions by a mix of the event key (purchases as side records in the same
+//! bins), clicks and link edges appended flat, and every rare line (locator) read exactly and turned into the
 //! same records or into a "special" record that carries its ingest in milliseconds.
 //!
 //! Record shapes (all u64 words):
 //! - SHORT event [w0, w1]: w0 = key | ingest << 40 | surv << 63; w1 = token | ts << 32 | purch << 63
 //! - LONG event [a, b, w2, w3]: w2 = ingest | surv << 63; w3 as w1 above
-//! - SHORT purchase [w0, buy]: w0 = key | ingest << 40; buy = category | price << 8 (price below
-//!   2^24: a larger one reaching the sink sets `bad`, a fallback, never a wrap)
-//! - LONG purchase [a, b, ingest, buy]
+//! - SHORT purchase, in the SHORT bins [w0, buy | PURCHASE_SIDE]: w0 = key | ingest << 40 (surv
+//!   clear); buy = category | price << 8 (price below 2^24: a larger one reaching the sink sets
+//!   `bad`, a fallback, never a wrap)
+//! - LONG purchase, in the LONG bins [a, b, ingest, buy | PURCHASE_SIDE]
 //! - click [w0, w1]: w0 = token | ts << 32 (ts since window_start - 7 days); w1 = locator (48 bits:
 //!   file 12, offset 36) | campaign << 48
 //! - edge: token_a | token_b << 32
@@ -48,6 +49,12 @@ pub fn mix(x: u64) -> u64 {
 pub fn part_of(a: u64, b: u64, bits: u32) -> usize {
     (mix(a ^ b.rotate_left(17).wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> (64 - bits)) as usize
 }
+
+/// A purchase's side record goes into its event's own bin (SHORT [key | ingest << 40, buy | this],
+/// LONG [a, b, ingest, buy | this]): the surv bit is clear and the last word is not zero, which no
+/// event record has (a dead copy's last word is 0). Two streams of write fronts fewer; at 8,192
+/// partitions every purchase push missed on its own front.
+pub const PURCHASE_SIDE: u64 = 1 << 62;
 
 /// Lookups are resolved this many records after they start, so the prefetch has time to land.
 const RING: usize = 64;
@@ -169,8 +176,9 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             // 16 x 16 B and 8 x 32 B, clicks and edges 2 MB.
             short: Bins::from_blocks(parts, &B8K, w).next_line_prefetch(bits < BIG_BITS),
             long: Bins::from_blocks(parts, &B2K, w).next_line_prefetch(bits < BIG_BITS),
-            pshort: Bins::from_blocks(parts, &B256, w).next_line_prefetch(bits < BIG_BITS),
-            plong: Bins::from_blocks(parts, &B256, w).next_line_prefetch(bits < BIG_BITS),
+            // Empty: purchases go into the event bins (PURCHASE_SIDE); dedup still takes these.
+            pshort: Bins::from_blocks(parts, &B256, w),
+            plong: Bins::from_blocks(parts, &B256, w),
             clicks: Bins::from_blocks(1, &B2M, w),
             edges: Bins::from_blocks(1, &B2M, w),
             special: Vec::new(),
@@ -223,7 +231,7 @@ impl<'a, 'b> V3Sink<'a, 'b> {
     /// Resolves ring entry `j`: every lane's token (survivors), then its complete records.
     #[inline(always)]
     fn resolve_batch(&mut self, j: usize) {
-        let V3Sink { tok, evr, short, long, pshort, plong, bad, bits, mbits, mode, .. } = self;
+        let V3Sink { tok, evr, short, long, bad, bits, mbits, mode, .. } = self;
         let b = &evr.b[j];
         let sl = &evr.slot[j];
         let n = b.n as usize;
@@ -255,9 +263,9 @@ impl<'a, 'b> V3Sink<'a, 'b> {
                 nb |= b.price[k] >> 24 != 0;
                 let buy = u64::from(b.cat[k]) | (u64::from(b.price[k]) << 8);
                 if ev_long {
-                    plong.push(p, [a, bb, ing, buy]);
+                    long.push(p, [a, bb, ing, buy | PURCHASE_SIDE]);
                 } else {
-                    pshort.push(p, [a | (ing << 40), buy]);
+                    short.push(p, [a | (ing << 40), buy | PURCHASE_SIDE]);
                 }
             }
             if ev_long {
@@ -365,23 +373,44 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         }
     }
 
-    /// The ring path (below 2^13 partitions).
+    /// The ring path (below 2^13 partitions), for a batch the parser filled on its own.
     #[inline(never)]
     fn events_ring(&mut self, b: &EvBatch) {
-        let n = b.n as usize;
-        let i = self.evr.head;
+        let slot = self.ring_slot();
+        // SAFETY: the ring's head entry, resolved and handed out just now.
+        unsafe { *slot = *b };
+        self.ring_commit();
+    }
+
+    /// The ring's head entry, cleared for filling (its old batch resolved first when full).
+    #[inline(always)]
+    fn ring_slot(&mut self) -> *mut EvBatch {
         if self.evr.n == D {
-            self.resolve_batch(i);
-        } else {
-            self.evr.n += 1;
+            self.resolve_batch(self.evr.head);
+            self.evr.n = D - 1;
         }
+        let b = &mut self.evr.b[self.evr.head];
+        b.n = 0;
+        b.ev_long = 0;
+        b.user_long = 0;
+        b.surv = 0;
+        b.purch = 0;
+        b
+    }
+
+    /// The head entry is filled: its users' home slots computed and prefetched, the ring advanced.
+    #[inline(always)]
+    fn ring_commit(&mut self) {
+        let i = self.evr.head;
         let r = &mut *self.evr;
-        r.b[i] = *b;
+        let b = &r.b[i];
+        let n = b.n as usize;
         let notab = cfg!(feature = "measure") && self.mode == 5;
         for k in 0..n {
             r.slot[i][k] = if notab { (b.user_a[k] ^ b.user_b[k]) as u32 & 0xff_ffff } else { self.tok.home(b.user_long >> k & 1 != 0, b.user_a[k], b.user_b[k]) };
         }
         r.head = (i + 1) % D;
+        r.n += 1;
     }
 
     /// The grouped path (2^13 partitions or more).
@@ -406,9 +435,9 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             let p = part_of(a, bb, self.bits);
             if purch {
                 if ev_long {
-                    self.plong.push(p, [a, bb, ing, buy]);
+                    self.long.push(p, [a, bb, ing, buy | PURCHASE_SIDE]);
                 } else {
-                    self.pshort.push(p, [a | (ing << 40), buy]);
+                    self.short.push(p, [a | (ing << 40), buy | PURCHASE_SIDE]);
                 }
             }
             let w: [u64; 4] = if ev_long { [a, bb, ing | (u64::from(surv) << 63), w1] } else { [a | (ing << 40) | (u64::from(surv) << 63), w1, 0, 0] };

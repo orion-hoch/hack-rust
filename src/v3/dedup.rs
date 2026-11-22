@@ -132,7 +132,14 @@ pub struct Tables {
     spec: Vec<(u32, u32, u32)>,
     /// A failed check left the tables in an unknown state: every later call refuses.
     poisoned: bool,
+    /// Purchase side records met in the main streams (layout with purchases inline: surv 0 and a
+    /// nonzero second word, `buy | PURCH_MARK`); joined with the side streams' records.
+    pin_s: Vec<[u64; 2]>,
+    pin_l: Vec<[u64; 4]>,
 }
+
+/// Marks an inline purchase side record's last word (a dead copy's is 0, a live one has surv).
+const PURCH_MARK: u64 = 1 << 62;
 
 impl Tables {
     pub fn new(short_slots: usize, long_slots: usize) -> Self {
@@ -148,6 +155,8 @@ impl Tables {
             buys: Vec::new(),
             spec: Vec::new(),
             poisoned: false,
+            pin_s: Vec::new(),
+            pin_l: Vec::new(),
         }
     }
 
@@ -631,6 +640,11 @@ fn insert_short<const GROW: bool>(t: &mut Tables, bits: &mut u32, chunks: &[&[[u
                 prefetch(tab.wrapping_add(4 * slot_of(ka, bshift)));
                 // SAFETY: j < n.
                 let r = unsafe { *p.add(j) };
+                if r[0] & TOP == 0 && r[1] != 0 {
+                    // An inline purchase side record: joined after the inserts.
+                    t.pin_s.push(r);
+                    continue;
+                }
                 low = low.min(!r[0] & X0);
                 // SAFETY: bits <= log2(t.s_len()), and the caller's bound keeps 3/4 free.
                 distinct += usize::from(unsafe { put_short(tab, bshift, bmask, r) });
@@ -638,6 +652,10 @@ fn insert_short<const GROW: bool>(t: &mut Tables, bits: &mut u32, chunks: &[&[[u
             for j in pre..n {
                 // SAFETY: j < n.
                 let r = unsafe { *p.add(j) };
+                if r[0] & TOP == 0 && r[1] != 0 {
+                    t.pin_s.push(r);
+                    continue;
+                }
                 low = low.min(!r[0] & X0);
                 // SAFETY: as above.
                 distinct += usize::from(unsafe { put_short(tab, bshift, bmask, r) });
@@ -655,6 +673,10 @@ fn insert_short<const GROW: bool>(t: &mut Tables, bits: &mut u32, chunks: &[&[[u
             }
             // SAFETY: j < n.
             let r = unsafe { *p.add(j) };
+            if r[0] & TOP == 0 && r[1] != 0 {
+                t.pin_s.push(r);
+                continue;
+            }
             low = low.min(!r[0] & X0);
             // SAFETY: bits <= log2(t.s_len()); growth below keeps at most 3/4 used.
             if unsafe { put_short(tab, bshift, bmask, r) } {
@@ -690,6 +712,10 @@ fn insert_long<const GROW: bool>(t: &mut Tables, bits: &mut u32, chunks: &[&[[u6
                 // SAFETY: j < n.
                 let r = unsafe { *p.add(j) };
                 j += 1;
+                if r[2] & TOP == 0 && r[3] != 0 {
+                    t.pin_l.push(r);
+                    continue;
+                }
                 bad |= u64::from(r[2] & ING == ING);
                 let mut i = slot_of(long_hash(r[0], r[1]), shift);
                 loop {
@@ -808,6 +834,8 @@ pub fn partition(
         return Err(Abort("dedup tables left in an unknown state by an earlier failure".into()));
     }
     t.poisoned = true;
+    t.pin_s.clear();
+    t.pin_l.clear();
     let ns: usize = short.iter().map(|c| c.len()).sum::<usize>() + specials.len();
     let nl: usize = long.iter().map(|c| c.len()).sum::<usize>() + specials.len();
     let mut sb = bits_for(ns, 3, t.s_len());
@@ -830,8 +858,11 @@ pub fn partition(
     // wider would be cut by the 32-bit payload, so the run falls back instead.
     let mut wide = 0u64;
     let tab = t.s_ptr();
-    for c in pshort {
-        for r in c.iter() {
+    let pin_s = std::mem::take(&mut t.pin_s);
+    let pin_l = std::mem::take(&mut t.pin_l);
+    {
+        let side = pshort.iter().flat_map(|c| c.iter().copied());
+        for r in side.chain(pin_s.iter().map(|r| [r[0], r[1] & !PURCH_MARK])) {
             let key = r[0] & KEY40;
             let mut b = slot_of(key, b_shift);
             loop {
@@ -863,8 +894,9 @@ pub fn partition(
             }
         }
     }
-    for c in plong {
-        for r in c.iter() {
+    {
+        let side = plong.iter().flat_map(|c| c.iter().copied());
+        for r in side.chain(pin_l.iter().map(|r| [r[0], r[1], r[2], r[3] & !PURCH_MARK])) {
             let mut i = slot_of(long_hash(r[0], r[1]), l_shift);
             loop {
                 let s = t.l[i];
@@ -889,6 +921,8 @@ pub fn partition(
             }
         }
     }
+    t.pin_s = pin_s;
+    t.pin_l = pin_l;
     for &m in &t.marked {
         let i = (m & !(1 << 31)) as usize;
         if m >> 31 == 0 {

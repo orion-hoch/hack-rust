@@ -165,6 +165,18 @@ fn bits_delta(bits: u32, var: &str, lo: u32, hi: u32) -> u32 {
     (bits as i32 + d).clamp(lo as i32, hi as i32) as u32
 }
 
+/// Rows per user_daily file written during the session stage (about 1 MB of output).
+const ROWS_PER_FILE: usize = 1 << 16;
+
+/// Writes a session worker's rows as its next user_daily file and empties them.
+fn flush_rows(w: &mut Worker, dir: &Path, cats: &[&[u8]]) {
+    let path = dir.join(format!("part-{:03}-{:05}.parquet", w.index, w.files));
+    w.write_err = crate::fast::write::user_rows(&path, &w.rows, cats).err();
+    w.files += 1;
+    w.wrote = true;
+    w.rows.clear();
+}
+
 pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Result<Outcome> {
     let t0 = Instant::now();
     let mut clock = Clock { on: timing, last: t0, last_use: if timing { usage() } else { (0.0, 0.0, 0, 0) } };
@@ -194,13 +206,10 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     };
     // The fast path's memory region (address space only until a stage takes from it).
     let input_bytes: u64 = [Stream::Events, Stream::Clicks, Stream::Links].iter().map(|&s| ds.bytes(s)).sum();
+    crate::huge_pages(input_bytes);
     if !mem::init((input_bytes as usize / 100) * 45) {
         return Ok(Outcome::Fallback("memory region could not be reserved".into()));
     }
-    let ctx = match parselab::prepare(&ds) {
-        Ok(c) => c,
-        Err(f) => return Ok(Outcome::Fallback(format!("{f:?}"))),
-    };
     let ev_bytes = ds.bytes(Stream::Events) as usize;
     let est_events = ev_bytes / 70 + 1;
     // User IDs come from all three inputs. In generator data every linked user is in a link line
@@ -214,7 +223,18 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     // An upper bound on distinct users from line-count bounds (shortest plausible lines): small
     // inputs size both tables from it, so an unusual mix of ID kinds does not fall back (tokens.rs).
     let bound_users = ds.bytes(Stream::Links) as usize / 8 * 2 + ev_bytes / 40 + ds.bytes(Stream::Clicks) as usize / 30;
-    let tok = Tokens::with_bound(est_users, bound_users);
+    // The products and campaigns tables are read on a side thread while the pool builds and
+    // faults the token table (neither needs the other).
+    let (ctx, tok) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| parselab::prepare(&ds));
+        let tok = Tokens::with_bound(est_users, bound_users);
+        (h.join(), tok)
+    });
+    let ctx = match ctx {
+        Ok(Ok(c)) => c,
+        Ok(Err(f)) => return Ok(Outcome::Fallback(format!("{f:?}"))),
+        Err(_) => return Ok(Outcome::Fallback("reading the tables failed".into())),
+    };
     // The persons region (huge pages by the verdict for its own size), sized from the link
     // bytes: at most one link line per 16 bytes.
     if !mem::init_persons(persons::region_bytes(tok.capacity(), 2 * link_lines)) {
@@ -266,63 +286,69 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             inp.consumed(inp.first(c.stream as usize) + c.file as usize, c.from, c.to);
         }
     };
-    let sinks = crate::par::run(
-        threads,
-        chunks.len(),
-        |t| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread, t),
-        |s, i| parse(&chunks[i], s),
-    );
-    clock.mark("parse.links+clicks");
-
-    // Parse B: events; one worker builds persons meanwhile.
-    let mut sinks = sinks;
-    for s in sinks.iter_mut() {
-        s.drain();
-        s.edges.finish();
-    }
-    // Fault planting for tests of the fallback routes (ENGINE_PLANT=full|panic), compiled in only
-    // with the `plant` feature.
+    // Links, persons and events in one pool run, no barrier between them: link chunks first;
+    // a worker that moves on from links resolves its pending lookups and publishes its edges, and
+    // the worker whose publication completes the links builds persons while the others parse
+    // events.
     let plant = if cfg!(feature = "plant") { std::env::var("ENGINE_PLANT").unwrap_or_default() } else { String::new() };
     if plant == "full" {
         tok.full.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    // Every NO_TOKEN is caught here, before persons is built from the edges.
-    if tok.full.load(std::sync::atomic::Ordering::Relaxed) || sinks.iter().any(|s| s.bad) {
-        return Ok(Outcome::Fallback("token table full or a link/click record did not fit".into()));
-    }
-    let edges: Vec<Bins<u64>> = sinks.iter_mut().map(|s| std::mem::replace(&mut s.edges, Bins::with_chunk(1, 2, 2))).collect();
-    let slots: Vec<Mutex<Option<V3Sink>>> = sinks.into_iter().map(|s| Mutex::new(Some(s))).collect();
     let ev_chunks = parselab::par::plan(&ds, &[Stream::Events], 4 << 20);
+    let nlink = chunks.len();
     let people_slot: Mutex<Option<People>> = Mutex::new(None);
-    let tasks = ev_chunks.len() + 1;
-    let workers_n = slots.len();
-    let mut sinks: Vec<V3Sink> = crate::par::run(
+    let edges_pub: Mutex<Vec<Bins<u64>>> = Mutex::new(Vec::new());
+    let links_published = std::sync::atomic::AtomicUsize::new(0);
+    let link_bad = std::sync::atomic::AtomicBool::new(false);
+    // Per participant: its sink, link chunks parsed and not yet published.
+    let publish = |s: &mut V3Sink, done: &mut usize| {
+        if *done == 0 {
+            return;
+        }
+        s.drain();
+        s.edges.finish();
+        if s.bad {
+            link_bad.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let e = std::mem::replace(&mut s.edges, Bins::with_chunk(1, 2, 2));
+        edges_pub.lock().unwrap().push(e);
+        let k = *done;
+        *done = 0;
+        if links_published.fetch_add(k, std::sync::atomic::Ordering::AcqRel) + k == nlink {
+            // The last links are in: persons now, on this worker.
+            let t = Instant::now();
+            let ed = edges_pub.lock().unwrap();
+            let refs: Vec<&[u64]> = ed.iter().flat_map(|b| b.all()).collect();
+            let built = if link_bad.load(std::sync::atomic::Ordering::Relaxed) || tok.full.load(std::sync::atomic::Ordering::Relaxed) {
+                None
+            } else {
+                People::build(&tok, &refs, timing)
+            };
+            *people_slot.lock().unwrap() = built;
+            if timing {
+                eprintln!("timing v3.  persons(task) {:9.2} ms", t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+    };
+    let st: Vec<(V3Sink, usize)> = crate::par::run_fin(
         threads,
-        tasks,
-        |t| {
-            slots
-                .get(t)
-                .and_then(|m| m.lock().unwrap().take())
-                .unwrap_or_else(|| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread, t))
-        },
-        |s, i| {
-            if i == 0 {
-                let t = Instant::now();
-                let refs: Vec<&[u64]> = edges.iter().flat_map(|b| b.all()).collect();
-                *people_slot.lock().unwrap() = People::build(&tok, &refs, timing);
-                if timing {
-                    eprintln!("timing v3.  persons(task) {:9.2} ms", t.elapsed().as_secs_f64() * 1e3);
-                }
+        nlink + ev_chunks.len(),
+        |t| (V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread, t), 0usize),
+        |(s, done), i| {
+            if i < nlink {
+                parse(&chunks[i], s);
+                *done += 1;
                 return;
             }
-            parse(&ev_chunks[i - 1], s);
+            publish(s, done);
+            parse(&ev_chunks[i - nlink], s);
         },
+        |(s, done), _| publish(s, done),
     );
-    // A pool with fewer participants than sinks leaves some sinks untaken: keep them too.
-    for m in slots.iter().take(workers_n) {
-        if let Some(s) = m.lock().unwrap().take() {
-            sinks.push(s);
-        }
+    let mut sinks: Vec<V3Sink> = st.into_iter().map(|(s, _)| s).collect();
+    if nlink == 0 {
+        // No link chunks: persons over no edges.
+        *people_slot.lock().unwrap() = People::build(&tok, &[], timing);
     }
     let Some(people) = people_slot.into_inner().unwrap_or(None) else {
         return Ok(Outcome::Fallback("persons could not be built (bad token)".into()));
@@ -376,11 +402,34 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let cx3 = Ctx3 { people: &people, ingest_base_ms: ctx.ingest_base_s * 1000 };
     let sinks_ref = &sinks;
     let spec_ref = &spec_by_part;
+    // Dedup partitions and the click parse in one pool run (clicks need only the token table and
+    // the person map): the 4 MB click chunks first, the small dedup partitions fill the tail.
+    let ck_chunks = parselab::par::plan(&ds, &[Stream::Clicks], 4 << 20);
+    let nck = ck_chunks.len();
     let dd = crate::par::run(
         threads,
-        parts,
-        |w| (Tables::new((typical_short.min(max_short) * 3 / 2).next_power_of_two().max(16), (typical_long.min(max_long) * 3 / 2).next_power_of_two().max(16)), Move2::new_in(p2_bits, est_surv / threads.max(1), w), 0usize, None::<Abort>),
-        |(t, m2, n, err), p| {
+        nck + parts,
+        |w| {
+            (
+                Tables::new((typical_short.min(max_short) * 3 / 2).next_power_of_two().max(16), (typical_long.min(max_long) * 3 / 2).next_power_of_two().max(16)),
+                Move2::new_in(p2_bits, est_surv / threads.max(1), w),
+                0usize,
+                None::<Abort>,
+                ClickSink::new(&tok, &people, &ds, &ctx, p2_bits, w),
+            )
+        },
+        |(t, m2, n, err, cs), i| {
+            if i < nck {
+                let c = &ck_chunks[i];
+                let bytes = ds.stream(c.stream)[c.file as usize].bytes();
+                if reference {
+                    parselab::reference::clicks(&ctx, c.file, bytes, c.from, c.to, cs);
+                } else {
+                    parselab::fast::parse(&fp, isa, parselab::fast::Kind::Clicks, c.file, parselab::fast::Buf::plain(bytes), c.from, c.to, cs);
+                }
+                return;
+            }
+            let p = i - nck;
             if plant == "panic" && p == 7 {
                 panic!("planted panic in a dedup task");
             }
@@ -395,13 +444,15 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         },
     );
     let mut m2s: Vec<Move2> = Vec::with_capacity(dd.len());
+    let mut csinks: Vec<ClickSink> = Vec::with_capacity(dd.len());
     let mut survivors = 0usize;
-    for (_, m2, n, err) in dd {
+    for (_, m2, n, err, cs) in dd {
         if let Some(e) = err {
             return Ok(Outcome::Fallback(format!("abort: {}", e.0)));
         }
         survivors += n;
         m2s.push(m2);
+        csinks.push(cs);
     }
     if !foreign_specials.is_empty() {
         let refs: Vec<&Special> = foreign_specials.iter().collect();
@@ -411,24 +462,6 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         m.ev.finish();
         m.buys.finish();
     }
-    clock.mark("dedup");
-
-    // Clicks: parsed now, straight into person partitions (ClickSink).
-    let ck_chunks = parselab::par::plan(&ds, &[Stream::Clicks], 4 << 20);
-    let mut csinks: Vec<ClickSink> = crate::par::run(
-        threads,
-        ck_chunks.len(),
-        |t| ClickSink::new(&tok, &people, &ds, &ctx, p2_bits, t),
-        |s, i| {
-            let c = &ck_chunks[i];
-            let bytes = ds.stream(c.stream)[c.file as usize].bytes();
-            if reference {
-                parselab::reference::clicks(&ctx, c.file, bytes, c.from, c.to, s);
-            } else {
-                parselab::fast::parse(&fp, isa, parselab::fast::Kind::Clicks, c.file, parselab::fast::Buf::plain(bytes), c.from, c.to, s);
-            }
-        },
-    );
     let mut ck_parts: Vec<Bins<[u64; 2]>> = Vec::with_capacity(csinks.len());
     for s in csinks.iter_mut() {
         s.drain();
@@ -440,7 +473,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     for s in csinks {
         ck_parts.push(s.bins);
     }
-    clock.mark("clicks");
+    clock.mark("dedup+clicks");
 
     // Person partitions.
     let day0 = ctx.window_start_ms.div_euclid(DAY);
@@ -464,13 +497,20 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     };
     let pcx = PeopleCtx { ds: &ds, ctx: &ctx, tok: &tok, organic, kernel, walk, day0: day0 as i32 };
     let (m2s_ref, ck_ref) = (&m2s, &ck_parts);
-    let workers = crate::par::run(
+    // Each worker writes its own user_daily file as soon as the queue is empty for it, while the
+    // others finish their partitions (no write stage for these rows).
+    let user_dir = out.join("user_daily");
+    let campaign_dir = out.join("campaign_daily");
+    std::fs::create_dir_all(&user_dir)?;
+    std::fs::create_dir_all(&campaign_dir)?;
+    let cats: Vec<&[u8]> = ctx.products.categories.iter().map(|c| c.as_slice()).collect();
+    let mut workers = crate::par::run_fin(
         threads,
         1 << p2_bits,
-        |_| {
+        |t| {
             // user-day rows are about 1 in 9 survivors on generator data; 1.5 times that per worker
             let mut w = Worker::new(FastAgg::new(campaigns_with_organic, day0, span), est_surv / 6 / threads.max(1));
-            w.timing = timing;
+            w.index = t;
             // About 0.11 user-day rows and 0.034 persons per event at practice size; a little more.
             let per = est_events / threads.max(1) + 1;
             w.rows.reserve(per / 7, per / 25, per / 25 * 12);
@@ -481,74 +521,40 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             let buys: Vec<&[[u64; 2]]> = m2s_ref.iter().flat_map(|m| m.buys.slices(q)).collect();
             let cl: Vec<&[[u64; 2]]> = ck_ref.iter().flat_map(|b| b.slices(q)).collect();
             w.partition(&ev, &buys, &cl, &pcx);
+            // A file per ROWS_PER_FILE rows, written by the worker as it goes, so that at the end
+            // of the stage only each worker's remainder is left to write.
+            if !w.bad && w.write_err.is_none() && w.rows.len() >= ROWS_PER_FILE {
+                flush_rows(w, &user_dir, &cats);
+            }
+        },
+        |w, _| {
+            if !w.bad && w.write_err.is_none() && w.rows.len() > 0 {
+                flush_rows(w, &user_dir, &cats);
+            }
         },
     );
     clock.mark("sessions");
-    if timing {
-        let mut ph = [0u64; 5];
-        for w in &workers {
-            for i in 0..5 {
-                ph[i] += w.phase_ns[i];
-            }
-        }
-        eprintln!(
-            "timing v3.  sessions CPU ms: gather {:.1}, kernel {:.1}, clicks gather {:.1}, walk {:.1}, rows {:.1}",
-            ph[0] as f64 / 1e6,
-            ph[1] as f64 / 1e6,
-            ph[2] as f64 / 1e6,
-            ph[3] as f64 / 1e6,
-            ph[4] as f64 / 1e6
-        );
-        let mut ct = [0u64; 6];
-        for w in &workers {
-            for i in 0..6 {
-                ct[i] += w.counts[i];
-            }
-        }
-        eprintln!(
-            "timing v3.  sessions counts: clicks {}, credited tie groups {}, persons {}, rows {}, tie comparisons {}, assist ranges {}",
-            ct[0], ct[1], ct[2], ct[3], ct[4], ct[5]
-        );
-    }
     if workers.iter().any(|w| w.bad) {
         return Ok(Outcome::Fallback("a purchase flag without its purchase record".into()));
     }
 
-    // Write.
-    let user_dir = out.join("user_daily");
-    let campaign_dir = out.join("campaign_daily");
-    std::fs::create_dir_all(&user_dir)?;
-    std::fs::create_dir_all(&campaign_dir)?;
-    let cats: Vec<&[u8]> = ctx.products.categories.iter().map(|c| c.as_slice()).collect();
+    // Write: the user_daily files are written; the campaign table from the merged counters.
     let mut camp = CampaignAgg::new(campaigns_with_organic, day0, span);
-    let mut rows: Vec<&Rows> = Vec::new();
     let (mut sessions, mut events) = (0u64, 0u64);
-    for w in &workers {
+    let mut wrote = false;
+    for w in workers.iter_mut() {
+        if let Some(e) = w.write_err.take() {
+            return Err(e);
+        }
+        wrote |= w.wrote;
         w.agg.add_into(&mut camp);
         sessions += w.sessions;
         events += w.events;
-        if w.rows.len() > 0 {
-            rows.push(&w.rows);
-        }
     }
-    let empty = Rows::new();
-    if rows.is_empty() {
-        rows.push(&empty);
+    if !wrote {
+        crate::fast::write::user_rows(&user_dir.join("part-00000.parquet"), &Rows::new(), &cats)?;
     }
-    let errors: Mutex<Vec<io::Error>> = Mutex::new(Vec::new());
-    crate::par::run(threads, rows.len() + 1, |_| (), |_, i| {
-        let r = if i == rows.len() {
-            crate::fast::write::campaigns(&campaign_dir.join("part-00000.parquet"), &camp, &ctx)
-        } else {
-            crate::fast::write::user_rows(&user_dir.join(format!("part-{i:05}.parquet")), rows[i], &cats)
-        };
-        if let Err(e) = r {
-            errors.lock().unwrap().push(e);
-        }
-    });
-    if let Some(e) = errors.into_inner().unwrap().into_iter().next() {
-        return Err(e);
-    }
+    crate::fast::write::campaigns(&campaign_dir.join("part-00000.parquet"), &camp, &ctx)?;
     clock.mark("write");
     if timing {
         eprintln!(

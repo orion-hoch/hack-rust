@@ -339,21 +339,15 @@ fn run(cfg: &Config) -> io::Result<()> {
 /// cheap), when the defrag mode cannot stall, or when nothing can be read; then every mapping.
 /// Otherwise (blocks short and free memory tight) a budget of 80% of the free blocks, first come
 /// first served (the token table and the parse buffers come first). THP never: none.
-/// RT_HUGE=on|off|<MB> overrides (measurements).
-fn huge_pages(cfg: &Config) {
-    use std::os::unix::ffi::OsStrExt;
+/// RT_HUGE=on|off|<MB> overrides (measurements). Called by the fast path once the inputs are
+/// mapped (one directory scan only); the v1 path keeps the default (every mapping).
+pub fn huge_pages(input_bytes: u64) {
     let budget = match env::var("RT_HUGE").as_deref() {
         Ok("on") => usize::MAX,
         Ok("off") => 0,
         Ok(mb) if mb.parse::<usize>().is_ok() => mb.parse::<usize>().unwrap_or(0) << 20,
         _ => {
-            let mut bytes = 0u64;
-            for sub in ["events", "clicks", "links"] {
-                if let Ok(l) = rt::input::scan(cfg.data.join(sub).as_os_str().as_bytes()) {
-                    bytes += l.files().iter().chain(l.dots()).map(|e| e.size).sum::<u64>();
-                }
-            }
-            let v = rt::arena::huge_verdict((bytes as usize) / 10 * 7);
+            let v = rt::arena::huge_verdict((input_bytes as usize) / 10 * 7);
             if v.enabled == b'n' {
                 0
             } else if v.use_huge {
@@ -371,7 +365,6 @@ fn main() {
     // waits an RCU grace period, 11 to 22 ms measured on the x86 box) and start the stage clock.
     rt::init(0);
     let cfg = config();
-    huge_pages(&cfg);
     if env::var_os("ENGINE_PATH").is_some_and(|v| v == "v1") {
         // Possibly started by rt's fallback after a fault: no fast-path thread exists any more,
         // so this removes whatever partial output it left, race-free.
@@ -395,7 +388,13 @@ fn main() {
         let why = match fast {
             // Done: release input and memory in parallel, then exit_group (no destructors); with
             // everything still mapped the kernel's single-thread teardown took 80 to 90 ms.
-            Ok(fast::Outcome::Done) => rt::exit::leave(0, &rt::exit::Release::ALL),
+            // Done: release input, regions and tables on the engine's own pool (madvise, no
+            // allocation), then exit_group at once: no destructors, no second pool.
+            Ok(fast::Outcome::Done) => {
+                let plan = rt::exit::plan(64 << 20);
+                crate::par::run(cfg.threads, plan.tasks(), |_| (), |_, t| plan.run(t));
+                rt::sys::exit_group(0)
+            }
             Ok(fast::Outcome::Fallback(why)) => why,
             Err(e) => format!("I/O error: {e}"),
         };

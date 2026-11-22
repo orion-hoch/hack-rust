@@ -104,6 +104,7 @@ impl Table {
             unsafe { madvise(a as *mut core::ffi::c_void, bytes.next_multiple_of(4096), MADV_HUGEPAGE) };
         }
         prefault(a as *mut u8, bytes);
+        rt::exit::register(a, bytes.next_multiple_of(4096));
         Table { map: p as *mut u8, map_len, ptr: a as *const AtomicU64, len: n }
     }
 }

@@ -184,6 +184,83 @@ pub fn release(rel: &Release) -> usize {
     total
 }
 
+static EXTRA_N: AtomicUsize = AtomicUsize::new(0);
+static EXTRA: [(AtomicUsize, AtomicUsize); 16] = [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; 16];
+
+/// Registers `[ptr, ptr + len)` as memory nobody uses after the last stage (a table on its own
+/// mapping), for `plan`. At most 16.
+pub fn register(ptr: usize, len: usize) {
+    let i = EXTRA_N.fetch_add(1, Relaxed);
+    if i < EXTRA.len() {
+        EXTRA[i].0.store(ptr, Relaxed);
+        EXTRA[i].1.store(len, Relaxed);
+    }
+}
+
+/// The bare exit for a binary with its own thread pool: `plan` gathers the ranges once, the
+/// caller runs `run(t)` for t in 0..tasks() on its threads (madvise only; nothing allocated),
+/// then calls `sys::exit_group`. Inputs, regions and registered ranges; never the allocator's.
+pub struct Plan {
+    n: usize,
+    step: usize,
+    tasks: usize,
+}
+
+pub fn plan(task_bytes: usize) -> Plan {
+    let mut n = 0;
+    let mut total = 0;
+    let mut add = |a: usize, l: usize| {
+        if l > 0 && n < MAX_RANGES {
+            RANGES[n].0.store(a, Relaxed);
+            RANGES[n].1.store(l, Relaxed);
+            n += 1;
+            total += l;
+        }
+    };
+    if let Some(inp) = crate::input::registered() {
+        for f in inp.files() {
+            add(f.ptr as usize, sys::up(f.len, PAGE));
+        }
+    }
+    for i in 0..16 {
+        if let Some(r) = crate::arena::registered(i) {
+            let (b, used) = r.used_range();
+            add(b, used);
+        }
+    }
+    for e in EXTRA.iter().take(EXTRA_N.load(Relaxed).min(EXTRA.len())) {
+        add(e.0.load(Relaxed), e.1.load(Relaxed));
+    }
+    let tasks = if total == 0 { 0 } else { total.div_ceil(task_bytes.max(1 << 20)) };
+    let step = if tasks == 0 { 0 } else { sys::up(total.div_ceil(tasks), PAGE) };
+    Plan { n, step, tasks }
+}
+
+impl Plan {
+    pub fn tasks(&self) -> usize {
+        self.tasks
+    }
+    /// Releases bytes [t * step, (t + 1) * step) of the gathered ranges.
+    pub fn run(&self, t: usize) {
+        let lo = t * self.step;
+        let hi = lo + self.step;
+        let mut pos = 0;
+        for r in RANGES.iter().take(self.n) {
+            let (a, l) = (r.0.load(Relaxed), r.1.load(Relaxed));
+            let (s, e) = (pos.max(lo), (pos + l).min(hi));
+            if s < e {
+                unsafe {
+                    let _ = sys::madvise(a + (s - pos), e - s, sys::MADV_DONTNEED);
+                }
+            }
+            pos += l;
+            if pos >= hi {
+                break;
+            }
+        }
+    }
+}
+
 /// Releases per `rel` in parallel (starting this crate's pool if it is not running: about
 /// 0.35 ms), writes the report when enabled, and ends the process with `code`.
 pub fn leave(code: i32, rel: &Release) -> ! {
