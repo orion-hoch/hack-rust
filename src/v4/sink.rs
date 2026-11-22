@@ -448,6 +448,9 @@ impl<'a> EvSink<'a, '_> {
                 p.add(1).write(r1[k]);
                 p.add(2).write(r2[k]);
                 (*f)[0] = p.add(3);
+                // As `store_lanes2`: the line after the new front (48 bytes on, the 2-unit
+                // lane's prefetches leave one line in four of this bin unasked).
+                _mm_prefetch::<_MM_HINT_T0>((p.add(3) as *const i8).wrapping_add(64));
             }
             m &= m - 1;
         }

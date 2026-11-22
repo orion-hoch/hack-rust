@@ -118,23 +118,7 @@ pub fn run(cx: &Cx, blocks: &Blocks, links: &Links, out: &Path) -> Stage<()> {
                 w.bad = true;
                 return;
             }
-            // Rows with the person names (k -> pk -> name).
-            let (wr, r) = (&w.wrows, &mut w.rows);
-            let mut r0 = 0u32;
-            for (k, &r1) in wr.row_end.iter().enumerate() {
-                if r1 > r0 {
-                    name_of(q, w.g.pks[k], links, blocks, &mut r.names);
-                    r.name_offsets.push(r.names.len() as u32);
-                    r.runs.push(r1 - r0);
-                }
-                r0 = r1;
-            }
-            let d0 = day0 as i32;
-            r.day.extend(wr.day.iter().map(|&d| d0 + d as i32));
-            r.sessions.extend_from_slice(&wr.sessions);
-            r.events.extend_from_slice(&wr.events);
-            r.revenue.extend(wr.revenue.iter().map(|&x| x as i64));
-            r.top.extend_from_slice(&wr.top);
+            rows_pass(q, &w.wrows, &mut w.rows, &w.g.pks, links, blocks, day0 as i32);
             if w.write_err.is_none() && w.rows.len() >= ROWS_PER_FILE {
                 flush(w, &user_dir, &cats);
             }
@@ -177,6 +161,42 @@ pub fn run(cx: &Cx, blocks: &Blocks, links: &Links, out: &Path) -> Stage<()> {
         crate::fast::write::user_rows(&user_dir.join("part-00000.parquet"), &Rows::new(), &cats).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Rows with the person names (k -> pk -> name), appended to the worker's rows. Its own function:
+/// inside the task closure its loops spilled the closure's values.
+#[inline(never)]
+fn rows_pass(q: usize, wr: &sortlab::walk::Rows, r: &mut Rows, pks: &[u64], links: &Links, blocks: &Blocks, d0: i32) {
+    let np = wr.row_end.len();
+    assert_eq!(pks.len(), np);
+    r.name_offsets.reserve(np);
+    r.runs.reserve(np);
+    let (mut no, mut nr) = (r.name_offsets.len(), r.runs.len());
+    let (nop, nrp) = (r.name_offsets.as_mut_ptr(), r.runs.as_mut_ptr());
+    let mut r0 = 0u32;
+    for (&pk, &r1) in pks.iter().zip(&wr.row_end) {
+        if r1 > r0 {
+            name_of(q, pk, links, blocks, &mut r.names);
+            // SAFETY: room for one more entry per person was reserved above.
+            unsafe {
+                *nop.add(no) = r.names.len() as u32;
+                *nrp.add(nr) = r1 - r0;
+            }
+            no += 1;
+            nr += 1;
+        }
+        r0 = r1;
+    }
+    // SAFETY: the entries up to no and nr were written, within the reserved room.
+    unsafe {
+        r.name_offsets.set_len(no);
+        r.runs.set_len(nr);
+    }
+    r.day.extend(wr.day.iter().map(|&d| d0 + d as i32));
+    r.sessions.extend_from_slice(&wr.sessions);
+    r.events.extend_from_slice(&wr.events);
+    r.revenue.extend(wr.revenue.iter().map(|&x| x as i64));
+    r.top.extend_from_slice(&wr.top);
 }
 
 /// The click_id of the click line at `loc` (its first field, unquoted).

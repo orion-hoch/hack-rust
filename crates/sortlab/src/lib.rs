@@ -96,6 +96,9 @@ pub fn net_bits(width: NetWidth) -> u32 {
                 let (family, model) = net::cpu_family_model();
                 if family == 6 && model == 0x55 && vl { 256 } else { 512 }
             }
+            // no AVX-512: the same network on AVX2 lanes (2 = that path; only the v4 block
+            // kernel takes it, the others fall through to the slots as before)
+            NetWidth::Auto if !f && std::arch::is_x86_feature_detected!("avx2") => 2,
             _ => 0,
         }
     }

@@ -213,6 +213,10 @@ pub fn sessions_blocks(pb: &PersonBlocks, kernel: Kernel, sc: &mut Scratch, out:
                 // SAFETY: bits == 256 only when AVX-512F and AVX-512VL were detected.
                 return unsafe { blocks256(pb, sc, out) };
             }
+            if bits == 2 {
+                // SAFETY: bits == 2 only when AVX2 was detected and AVX-512 is absent or switched off.
+                return unsafe { blocks_avx2(pb, sc, out) };
+            }
         }
     }
     let _ = kernel;
@@ -254,6 +258,37 @@ impl Cut for NetCut256 {
 #[inline(never)]
 unsafe fn net256_call(ts: &[u32], out: &mut Out) {
     unsafe { net::person_net_inl::<net::Y>(ts, out, core::ptr::null_mut()) }
+}
+
+/// The same network on AVX2 lanes, for CPUs without AVX-512.
+#[cfg(target_arch = "x86_64")]
+struct NetCutA;
+#[cfg(target_arch = "x86_64")]
+impl Cut for NetCutA {
+    const MAX: usize = net::MAX_N;
+    const VEC: bool = true;
+    #[inline(always)]
+    unsafe fn net(ts: &[u32], out: &mut Out) {
+        // SAFETY: the caller's contract; blocks_avx2 is only entered when AVX2 was detected.
+        unsafe { neta_call(ts, out) }
+    }
+}
+
+/// # Safety
+/// AVX2 present, and the conditions of `net::person_net_inl`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn neta_call(ts: &[u32], out: &mut Out) {
+    unsafe { net::person_net_inl::<net::A>(ts, out, core::ptr::null_mut()) }
+}
+
+/// # Safety
+/// AVX2 present.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn blocks_avx2(pb: &PersonBlocks, sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
+    unsafe { blocks_partition::<NetCutA>(pb, sc, out) }
 }
 
 /// # Safety

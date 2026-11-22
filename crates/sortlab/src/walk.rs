@@ -352,28 +352,45 @@ pub fn walk<F: FnMut(u64, u64) -> Ordering>(
 
 /// Purchases grouped by session (`sbuy`, by `sb_at`), each session's revenue (`sess_rev`), and
 /// `row_of` sized for the sessions.
+#[inline(never)]
 fn purchases_by_session<P: Fn(usize) -> u32>(npay: usize, pay: P, out: &Out, ws: &mut WalkScratch) -> Result<(), Error> {
     let ns = out.start.len();
+    if npay != out.buy_session.len() {
+        return Err(Error::WalkInput);
+    }
     ws.sb_at.clear();
     ws.sb_at.resize(ns + 2, 0);
+    let sb = ws.sb_at.as_mut_ptr();
     for &s in &out.buy_session {
         if s as usize >= ns {
             return Err(Error::WalkInput);
         }
-        ws.sb_at[s as usize + 2] += 1;
+        // SAFETY: s < ns and sb_at holds ns + 2 counters.
+        unsafe {
+            *sb.add(s as usize + 2) += 1;
+        }
     }
-    for s in 2..ns + 2 {
-        ws.sb_at[s] += ws.sb_at[s - 1];
+    // running sum kept in a register (sb_at[1] is 0)
+    let mut sum = 0u32;
+    for x in &mut ws.sb_at[2..] {
+        sum += *x;
+        *x = sum;
     }
     ws.sbuy.clear();
     ws.sbuy.resize(npay, 0);
     ws.sess_rev.clear();
     ws.sess_rev.resize(ns, 0);
+    let (sb, sbuy, rev) = (ws.sb_at.as_mut_ptr(), ws.sbuy.as_mut_ptr(), ws.sess_rev.as_mut_ptr());
     for (j, &s) in out.buy_session.iter().enumerate() {
-        let at = &mut ws.sb_at[s as usize + 1];
-        ws.sbuy[*at as usize] = j as u32;
-        *at += 1;
-        ws.sess_rev[s as usize] += u64::from(pay(j) >> 8);
+        // SAFETY: every s is below ns (checked above); sb_at[s + 1] starts at the number of
+        // purchases of the sessions below s and grows once per purchase of s, so it stays below
+        // the number of purchases, npay, the length of sbuy; sess_rev holds ns entries.
+        unsafe {
+            let at = sb.add(s as usize + 1);
+            *sbuy.add(*at as usize) = j as u32;
+            *at += 1;
+            *rev.add(s as usize) += u64::from(pay(j) >> 8);
+        }
     }
     ws.row_of.clear();
     ws.row_of.resize(ns, 0);
@@ -383,24 +400,37 @@ fn purchases_by_session<P: Fn(usize) -> u32>(npay: usize, pay: P, out: &Out, ws:
 /// Top category of every user-day row with purchases, from the purchases in session order
 /// (sessions, hence rows, ascending): the largest category sum, ties to the smaller index, any
 /// category with a purchase a candidate (even at price 0). Other rows keep `NO_TOP`.
+#[inline(never)]
 fn top_categories<P: Fn(usize) -> u32>(pay: P, ws: &mut WalkScratch, out: &Out, rows: &mut Rows) {
     let mut cur = u32::MAX;
+    // A row's first purchase is held back: a row with one purchase (most of them) takes that
+    // purchase's category (what `take_top` gives for a single candidate) without the sums.
+    let (mut held, mut many) = (0u32, false);
     for i in 0..ws.sbuy.len() {
         let j = ws.sbuy[i] as usize;
         let row = ws.row_of[out.buy_session[j] as usize];
+        let pay = pay(j);
         if row != cur {
             if cur != u32::MAX {
-                rows.top[cur as usize] = take_top(ws);
+                rows.top[cur as usize] = if many { take_top(ws) } else { (held & 255) as u8 };
             }
             cur = row;
+            held = pay;
+            many = false;
+            continue;
         }
-        let pay = pay(j);
+        if !many {
+            many = true;
+            let cat = (held & 255) as usize;
+            ws.cat_sum[cat] += u64::from(held >> 8);
+            ws.cat_seen[cat >> 6] |= 1 << (cat & 63);
+        }
         let cat = (pay & 255) as usize;
         ws.cat_sum[cat] += u64::from(pay >> 8);
         ws.cat_seen[cat >> 6] |= 1 << (cat & 63);
     }
     if cur != u32::MAX {
-        rows.top[cur as usize] = take_top(ws);
+        rows.top[cur as usize] = if many { take_top(ws) } else { (held & 255) as u8 };
     }
 }
 
@@ -1395,7 +1425,9 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
         return Err(Error::WalkInput);
     }
     let pay = &out.buy_pay;
-    purchases_by_session(pay.len(), |j| pay[j], out, ws)?;
+    // SAFETY (both uses of the closure): j is a purchase index, below buy_session.len() = pay.len()
+    // (checked above; sbuy holds each purchase index once and is not touched in between).
+    purchases_by_session(pay.len(), |j| unsafe { *pay.get_unchecked(j) }, out, ws)?;
     // one row per session at most; sessions, events and revenue are summed in place from 0
     rows.day.reserve(ns);
     rows.sessions.resize(ns, 0);
@@ -1432,12 +1464,15 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
     // current row
     let mut r = usize::MAX;
     let mut s0 = 0usize;
+    // SAFETY (the reads and the write through these in the loop): ck_at holds np + 1 entries and
+    // sess_end np (checked above); row_end was cleared and has room for np.
+    let (ck_at, sess_end, row_end) = (pb.ck_at.as_ptr(), out.sess_end.as_ptr(), rows.row_end.as_mut_ptr());
     for p in 0..np {
         // Click blocks sit wherever P1's streams put them: ask for the first two lines of the
         // click block of the person three ahead (each block read was a miss).
         #[cfg(target_arch = "x86_64")]
         if p + 3 < np {
-            if let Some(nb) = pb.ck.get(pb.ck_at[p + 3] as usize) {
+            if let Some(nb) = pb.ck.get(unsafe { *ck_at.add(p + 3) } as usize) {
                 let q = nb.as_ptr() as *const i8;
                 // SAFETY: a prefetch never faults; the addresses are in or just past a live block.
                 unsafe {
@@ -1446,13 +1481,13 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
                 }
             }
         }
-        let s1 = out.sess_end[p] as usize;
+        let s1 = unsafe { *sess_end.add(p) } as usize;
         if s1 < s0 || s1 > ns {
             res = Err(Error::WalkInput);
             break;
         }
         if s1 > s0 {
-            let (c0, c1) = (pb.ck_at[p] as usize, pb.ck_at[p + 1] as usize);
+            let (c0, c1) = unsafe { (*ck_at.add(p) as usize, *ck_at.add(p + 1) as usize) };
             let mut n = 0usize;
             let mut ks = core::ptr::null_mut();
             if c1 > c0 {
@@ -1485,8 +1520,16 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
             }
             r = r1;
         }
-        rows.row_end.push(r.wrapping_add(1) as u32);
+        unsafe {
+            *row_end.add(p) = r.wrapping_add(1) as u32;
+        }
         s0 = s1;
+    }
+    if res.is_ok() {
+        // SAFETY: the loop wrote the np entries (room reserved above).
+        unsafe {
+            rows.row_end.set_len(np);
+        }
     }
     ws.stats.clicks_kept += kept;
     ws.stats.clicks_dropped += kv.dropped;
@@ -1507,6 +1550,6 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
     rows.events.truncate(nr);
     rows.revenue.truncate(nr);
     rows.top.resize(nr, NO_TOP);
-    top_categories(|j| pay[j], ws, out, rows);
+    top_categories(|j| unsafe { *pay.get_unchecked(j) }, ws, out, rows);
     Ok(())
 }

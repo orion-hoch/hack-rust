@@ -1263,7 +1263,59 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
     }
     let mut base_ok = [false; LANES];
     let mut purchase = [false; LANES];
+    // AVX2: the type, window, lateness and non-empty tests four lanes a vector (the 64-bit
+    // product by 1000 from two 32-bit multiplies, wrapping as the scalar code does).
+    #[cfg(target_arch = "x86_64")]
+    let vecv = ISA == fast::ISA_AVX2;
+    #[cfg(not(target_arch = "x86_64"))]
+    let vecv = false;
+    #[cfg(target_arch = "x86_64")]
+    if vecv {
+        unsafe {
+            use std::arch::x86_64::*;
+            let ld32 = |a: &[u32; LANES]| _mm256_loadu_si256(a.as_ptr() as *const __m256i);
+            let tlen = _mm256_sub_epi32(ld32(&ln.ve[4]), ld32(&ln.vs[4]));
+            let t8 = _mm256_cmpeq_epi32(tlen, _mm256_set1_epi32(8));
+            let t4 = _mm256_cmpeq_epi32(tlen, _mm256_set1_epi32(4));
+            // an empty user or an empty product
+            let empty = _mm256_or_si256(_mm256_cmpeq_epi32(ld32(&ln.ve[1]), ld32(&ln.vs[1])), _mm256_cmpeq_epi32(ld32(&ln.ve[5]), ld32(&ln.vs[5])));
+            let lo32 = _mm256_set1_epi64x(0xFFFF_FFFF);
+            let k1000 = _mm256_set1_epi64x(1000);
+            let (mut bm, mut pmk) = (0u32, 0u32);
+            for h in 0..2 {
+                let o = 4 * h;
+                let half = |v: __m256i| if h == 0 { _mm256_castsi256_si128(v) } else { _mm256_extracti128_si256::<1>(v) };
+                let w = _mm256_loadu_si256(tw.as_ptr().add(o) as *const __m256i);
+                let p = _mm256_and_si256(_mm256_cvtepi32_epi64(half(t8)), _mm256_cmpeq_epi64(w, _mm256_set1_epi64x(i64::from_le_bytes(*b"purchase"))));
+                let w4 = _mm256_and_si256(w, lo32);
+                let vc = _mm256_or_si256(
+                    _mm256_cmpeq_epi64(w4, _mm256_set1_epi64x(i64::from(u32::from_le_bytes(*b"view")))),
+                    _mm256_cmpeq_epi64(w4, _mm256_set1_epi64x(i64::from(u32::from_le_bytes(*b"cart")))),
+                );
+                let typ = _mm256_or_si256(p, _mm256_and_si256(_mm256_cvtepi32_epi64(half(t4)), vc));
+                let ts = _mm256_loadu_si256(ts_rel.as_ptr().add(o) as *const __m256i);
+                let ts_ok = _mm256_and_si256(_mm256_cmpgt_epi64(ts, _mm256_set1_epi64x(-1)), _mm256_cmpgt_epi64(_mm256_set1_epi64x(f.win_ms), ts));
+                let x = _mm256_sub_epi64(_mm256_loadu_si256(ingest.as_ptr().add(o) as *const __m256i), _mm256_set1_epi64x(f.ingest_add));
+                let prod = _mm256_add_epi64(_mm256_mul_epu32(x, k1000), _mm256_slli_epi64::<32>(_mm256_mul_epu32(_mm256_srli_epi64::<32>(x), k1000)));
+                let late = _mm256_cmpgt_epi64(_mm256_sub_epi64(_mm256_sub_epi64(prod, _mm256_set1_epi64x(f.ws_frac)), ts), _mm256_set1_epi64x(DAY_MS));
+                let ok = _mm256_andnot_si256(_mm256_or_si256(late, _mm256_cvtepi32_epi64(half(empty))), _mm256_and_si256(ts_ok, typ));
+                bm |= (_mm256_movemask_pd(_mm256_castsi256_pd(ok)) as u32) << o;
+                pmk |= (_mm256_movemask_pd(_mm256_castsi256_pd(p)) as u32) << o;
+            }
+            // 8 mask bits to 8 bools: bit k of the mask selected in byte k, then normalised to 0 or 1
+            let spread = |m: u32| -> [bool; LANES] {
+                let x = (u64::from(m) * 0x0101_0101_0101_0101) & 0x8040_2010_0804_0201;
+                let y = ((x + 0x7F7F_7F7F_7F7F_7F7F) >> 7) & 0x0101_0101_0101_0101;
+                core::mem::transmute::<[u8; 8], [bool; 8]>(y.to_le_bytes())
+            };
+            base_ok = spread(bm);
+            purchase = spread(pmk);
+        }
+    }
     for l in 0..LANES {
+        if vecv {
+            break;
+        }
         let tlen = ln.ve[4][l] - ln.vs[4][l];
         let p = (tlen == 8) & (tw[l] == u64::from_le_bytes(*b"purchase"));
         let v = (tlen == 4) & (tw[l] as u32 == u32::from_le_bytes(*b"view"));
@@ -1283,16 +1335,51 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
     // arrays go into the batch whole and its four masks are built once (no push per lane). Nothing
     // reaches the sink before that is known; any other batch takes the lane loop below.
     if ISA == fast::ISA_AVX2 {
-        let mut all = true;
-        let mut pm = 0u32; // valid purchases (the price decides whether they survive)
-        let mut sv = 0u32; // surviving lanes
-        for l in 0..LANES {
-            let ing_ok = (ingest[l] >= 0) & (ingest[l] < INGEST_LIMIT as i64);
-            let ev_ok = (x_e[l] != NONE40) | e_long[l];
-            all &= ts_fast[l] & ing_fast[l] & (ln.ve[0][l] != ln.vs[0][l]) & ev_ok & ing_ok;
-            pm |= ((purchase[l] & base_ok[l]) as u32) << l;
-            sv |= (base_ok[l] as u32) << l;
-        }
+        // The batch tests as 8-bit masks: the bool arrays as one word each, the key and ingest
+        // tests by vector compares (pm: valid purchases, the price decides whether they survive;
+        // sv: surviving lanes; u_wide: lanes whose user key is not SHORT).
+        #[cfg(target_arch = "x86_64")]
+        let (all, mut pm, mut sv, u_wide) = unsafe {
+            use std::arch::x86_64::*;
+            let wb = |a: &[bool; LANES]| u64::from_le_bytes(core::mem::transmute::<[bool; LANES], [u8; LANES]>(*a));
+            // bytes of 0 or 1 to 8 bits (byte k to bit k)
+            let bits = |x: u64| (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) as u32;
+            let ones = _mm256_set1_epi64x(-1);
+            let lim = _mm256_set1_epi64x(INGEST_LIMIT as i64);
+            let (mut rng, mut e_wide, mut u_wide) = (0u32, 0u32, 0u32);
+            for h in 0..2 {
+                let o = 4 * h;
+                let ing = _mm256_loadu_si256(ingest.as_ptr().add(o) as *const __m256i);
+                let r = _mm256_and_si256(_mm256_cmpgt_epi64(ing, ones), _mm256_cmpgt_epi64(lim, ing));
+                rng |= (_mm256_movemask_pd(_mm256_castsi256_pd(r)) as u32) << o;
+                let xe = _mm256_loadu_si256(x_e.as_ptr().add(o) as *const __m256i);
+                e_wide |= (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(xe, ones))) as u32) << o;
+                let xu = _mm256_loadu_si256(x_u.as_ptr().add(o) as *const __m256i);
+                u_wide |= (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(xu, ones))) as u32) << o;
+            }
+            let ev_ok = (!e_wide & 0xFF) | bits(wb(&e_long));
+            let empty0 = _mm256_cmpeq_epi32(
+                _mm256_loadu_si256(ln.ve[0].as_ptr() as *const __m256i),
+                _mm256_loadu_si256(ln.vs[0].as_ptr() as *const __m256i),
+            );
+            let nonempty = !(_mm256_movemask_ps(_mm256_castsi256_ps(empty0)) as u32) & 0xFF;
+            let fast = bits(wb(&ts_fast) & wb(&ing_fast));
+            let sv = bits(wb(&base_ok));
+            ((fast & nonempty & ev_ok & rng) == 0xFF, bits(wb(&purchase)) & sv, sv, u_wide)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let (all, mut pm, mut sv, u_wide) = {
+            let (mut all, mut pm, mut sv, mut u_wide) = (true, 0u32, 0u32, 0u32);
+            for l in 0..LANES {
+                let ing_ok = (ingest[l] >= 0) & (ingest[l] < INGEST_LIMIT as i64);
+                let ev_ok = (x_e[l] != NONE40) | e_long[l];
+                all &= ts_fast[l] & ing_fast[l] & (ln.ve[0][l] != ln.vs[0][l]) & ev_ok & ing_ok;
+                pm |= ((purchase[l] & base_ok[l]) as u32) << l;
+                sv |= (base_ok[l] as u32) << l;
+                u_wide |= ((x_u[l] == NONE40) as u32) << l;
+            }
+            (all, pm, sv, u_wide)
+        };
         if all {
             let mut out = EvBatch::default();
             let mut pp = pm;
@@ -1316,11 +1403,12 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
                     pm &= !(1u32 << l);
                 }
             }
-            let mut users_ok = true;
+            // every surviving lane has a keyed user: SHORT, or LONG
+            let mut ul = 0u32;
             for l in 0..LANES {
-                let s = (sv >> l) & 1 != 0;
-                users_ok &= !s | (x_u[l] != NONE40) | u_long[l];
+                ul |= (u_long[l] as u32) << l;
             }
+            let users_ok = sv & u_wide & !ul == 0;
             if users_ok {
                 let mut pp = pm;
                 while pp != 0 {
@@ -1328,20 +1416,59 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
                     pp &= pp - 1;
                     out.cat[l] = fast::category(f, &buf.data[ln.vs[5][l] as usize..ln.ve[5][l] as usize]);
                 }
-                let (mut evl, mut usl) = (0u32, 0u32);
-                for l in 0..LANES {
-                    let s = (sv >> l) & 1 != 0;
-                    let e_short = x_e[l] != NONE40;
-                    out.ev_a[l] = if e_short { x_e[l] } else { e_la[l] };
-                    out.ev_b[l] = if e_short { 0 } else { e_lb[l] };
-                    evl |= (!e_short as u32) << l;
-                    let u_short = x_u[l] != NONE40;
-                    out.user_a[l] = if !s { 0 } else if u_short { x_u[l] } else { u_la[l] };
-                    out.user_b[l] = if !s | u_short { 0 } else { u_lb[l] };
-                    usl |= ((s & !u_short) as u32) << l;
-                    out.ts[l] = if s { ts_rel[l] as u32 } else { 0 };
-                    out.ingest[l] = ingest[l] as u32;
-                }
+                // The record arrays, four lanes a vector: SHORT or LONG key by compare with NONE40
+                // (all ones), the user and ts zeroed where the lane does not survive.
+                #[cfg(target_arch = "x86_64")]
+                let (evl, usl) = unsafe {
+                    use std::arch::x86_64::*;
+                    let ones = _mm256_set1_epi64x(-1);
+                    let bits = _mm256_setr_epi64x(1, 2, 4, 8);
+                    let low = _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0);
+                    let (mut evl, mut usl) = (0u32, 0u32);
+                    for h in 0..2 {
+                        let o = 4 * h;
+                        let ld = |a: &[u64; LANES]| _mm256_loadu_si256(a.as_ptr().add(o) as *const __m256i);
+                        let ldi = |a: &[i64; LANES]| _mm256_loadu_si256(a.as_ptr().add(o) as *const __m256i);
+                        let xe = ld(&x_e);
+                        let el = _mm256_cmpeq_epi64(xe, ones); // not SHORT
+                        _mm256_storeu_si256(out.ev_a.as_mut_ptr().add(o) as *mut __m256i, _mm256_blendv_epi8(xe, ld(&e_la), el));
+                        _mm256_storeu_si256(out.ev_b.as_mut_ptr().add(o) as *mut __m256i, _mm256_and_si256(el, ld(&e_lb)));
+                        evl |= (_mm256_movemask_pd(_mm256_castsi256_pd(el)) as u32) << o;
+                        let sm = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_set1_epi64x(i64::from(sv >> o)), bits), bits);
+                        let xu = ld(&x_u);
+                        let ul = _mm256_and_si256(sm, _mm256_cmpeq_epi64(xu, ones)); // survives, not SHORT
+                        _mm256_storeu_si256(
+                            out.user_a.as_mut_ptr().add(o) as *mut __m256i,
+                            _mm256_and_si256(sm, _mm256_blendv_epi8(xu, ld(&u_la), ul)),
+                        );
+                        _mm256_storeu_si256(out.user_b.as_mut_ptr().add(o) as *mut __m256i, _mm256_and_si256(ul, ld(&u_lb)));
+                        usl |= (_mm256_movemask_pd(_mm256_castsi256_pd(ul)) as u32) << o;
+                        // the low 32 bits of each 64-bit lane
+                        let t = _mm256_permutevar8x32_epi32(_mm256_and_si256(sm, ldi(&ts_rel)), low);
+                        _mm_storeu_si128(out.ts.as_mut_ptr().add(o) as *mut __m128i, _mm256_castsi256_si128(t));
+                        let g = _mm256_permutevar8x32_epi32(ldi(&ingest), low);
+                        _mm_storeu_si128(out.ingest.as_mut_ptr().add(o) as *mut __m128i, _mm256_castsi256_si128(g));
+                    }
+                    (evl, usl)
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let (evl, usl) = {
+                    let (mut evl, mut usl) = (0u32, 0u32);
+                    for l in 0..LANES {
+                        let s = (sv >> l) & 1 != 0;
+                        let e_short = x_e[l] != NONE40;
+                        out.ev_a[l] = if e_short { x_e[l] } else { e_la[l] };
+                        out.ev_b[l] = if e_short { 0 } else { e_lb[l] };
+                        evl |= (!e_short as u32) << l;
+                        let u_short = x_u[l] != NONE40;
+                        out.user_a[l] = if !s { 0 } else if u_short { x_u[l] } else { u_la[l] };
+                        out.user_b[l] = if !s | u_short { 0 } else { u_lb[l] };
+                        usl |= ((s & !u_short) as u32) << l;
+                        out.ts[l] = if s { ts_rel[l] as u32 } else { 0 };
+                        out.ingest[l] = ingest[l] as u32;
+                    }
+                    (evl, usl)
+                };
                 out.n = LANES as u32;
                 out.ev_long = evl as u8;
                 out.user_long = usl as u8;

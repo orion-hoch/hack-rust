@@ -237,6 +237,141 @@ impl Lanes for Y {
     }
 }
 
+/// Compress tables for the AVX2 lanes: PERM[m] lists the set bits of m in order (then zeros);
+/// KEEP[k] has the first k lanes all-ones.
+const fn perm_table() -> [[u32; 8]; 256] {
+    let mut t = [[0u32; 8]; 256];
+    let mut m = 0usize;
+    while m < 256 {
+        let (mut l, mut k) = (0usize, 0usize);
+        while l < 8 {
+            if m >> l & 1 != 0 {
+                t[m][k] = l as u32;
+                k += 1;
+            }
+            l += 1;
+        }
+        m += 1;
+    }
+    t
+}
+const fn keep_table() -> [[u32; 8]; 9] {
+    let mut t = [[0u32; 8]; 9];
+    let mut k = 0usize;
+    while k < 9 {
+        let mut l = 0usize;
+        while l < k {
+            t[k][l] = u32::MAX;
+            l += 1;
+        }
+        k += 1;
+    }
+    t
+}
+static A_PERM: [[u32; 8]; 256] = perm_table();
+static A_KEEP: [[u32; 8]; 9] = keep_table();
+
+/// 8 lanes with AVX2 only (no AVX-512): the same network on CPUs without AVX-512. Masks become
+/// vectors (bit l of m -> lane l all-ones), compress is a permute by table.
+#[derive(Clone, Copy)]
+pub struct A(__m256i);
+
+impl A {
+    /// Lane l all-ones where bit l of m is set.
+    #[inline(always)]
+    unsafe fn mask(m: u32) -> __m256i {
+        let bits = _mm256_set_epi32(128, 64, 32, 16, 8, 4, 2, 1);
+        _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(m as i32), bits), bits)
+    }
+}
+
+impl Lanes for A {
+    const W: usize = 8;
+    const LOG: u32 = 3;
+    #[inline(always)]
+    unsafe fn splat(x: u32) -> Self {
+        A(_mm256_set1_epi32(x as i32))
+    }
+    #[inline(always)]
+    unsafe fn iota() -> Self {
+        A(_mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0))
+    }
+    #[inline(always)]
+    unsafe fn load_pad(p: *const u32, valid: u32) -> Self {
+        let m = A::mask(valid);
+        // unselected lanes: zero from the masked load, then all-ones from !m
+        A(_mm256_or_si256(_mm256_maskload_epi32(p as *const i32, m), _mm256_xor_si256(m, _mm256_set1_epi32(-1))))
+    }
+    #[inline(always)]
+    unsafe fn load(p: *const u32) -> Self {
+        A(_mm256_loadu_si256(p as *const _))
+    }
+    #[inline(always)]
+    unsafe fn minu(a: Self, b: Self) -> Self {
+        A(_mm256_min_epu32(a.0, b.0))
+    }
+    #[inline(always)]
+    unsafe fn maxu(a: Self, b: Self) -> Self {
+        A(_mm256_max_epu32(a.0, b.0))
+    }
+    #[inline(always)]
+    unsafe fn perm(idx: Self, v: Self) -> Self {
+        A(_mm256_permutevar8x32_epi32(v.0, idx.0))
+    }
+    #[inline(always)]
+    unsafe fn blend(m: u32, a: Self, b: Self) -> Self {
+        A(_mm256_blendv_epi8(a.0, b.0, A::mask(m)))
+    }
+    #[inline(always)]
+    unsafe fn xor(a: Self, b: Self) -> Self {
+        A(_mm256_xor_si256(a.0, b.0))
+    }
+    #[inline(always)]
+    unsafe fn sub(a: Self, b: Self) -> Self {
+        A(_mm256_sub_epi32(a.0, b.0))
+    }
+    #[inline(always)]
+    unsafe fn add(a: Self, b: Self) -> Self {
+        A(_mm256_add_epi32(a.0, b.0))
+    }
+    #[inline(always)]
+    unsafe fn gt(a: Self, b: Self) -> u32 {
+        // unsigned compare: flip the sign bits, then the signed compare
+        let s = _mm256_set1_epi32(i32::MIN);
+        let c = _mm256_cmpgt_epi32(_mm256_xor_si256(a.0, s), _mm256_xor_si256(b.0, s));
+        _mm256_movemask_ps(_mm256_castsi256_ps(c)) as u32
+    }
+    #[inline(always)]
+    unsafe fn compress(m: u32, v: Self) -> Self {
+        let m = (m & 0xFF) as usize;
+        let idx = _mm256_loadu_si256(A_PERM[m].as_ptr() as *const _);
+        let keep = _mm256_loadu_si256(A_KEEP[m.count_ones() as usize].as_ptr() as *const _);
+        A(_mm256_and_si256(_mm256_permutevar8x32_epi32(v.0, idx), keep))
+    }
+    #[inline(always)]
+    unsafe fn compress_store(p: *mut u32, m: u32, v: Self) {
+        let m = (m & 0xFF) as usize;
+        let idx = _mm256_loadu_si256(A_PERM[m].as_ptr() as *const _);
+        let keep = _mm256_loadu_si256(A_KEEP[m.count_ones() as usize].as_ptr() as *const _);
+        // writes exactly popcount(m) lanes, as the AVX-512 compress-store does
+        _mm256_maskstore_epi32(p as *mut i32, keep, _mm256_permutevar8x32_epi32(v.0, idx))
+    }
+    #[inline(always)]
+    unsafe fn store(p: *mut u32, m: u32, v: Self) {
+        _mm256_maskstore_epi32(p as *mut i32, A::mask(m), v.0)
+    }
+    #[inline(always)]
+    unsafe fn prev_lane(v: Self, q: Self) -> Self {
+        let rot = _mm256_permutevar8x32_epi32(v.0, _mm256_set_epi32(6, 5, 4, 3, 2, 1, 0, 7));
+        let q7 = _mm256_permutevar8x32_epi32(q.0, _mm256_set1_epi32(7));
+        A(_mm256_blend_epi32::<1>(rot, q7))
+    }
+    #[inline(always)]
+    unsafe fn reverse(v: Self) -> Self {
+        A(_mm256_permutevar8x32_epi32(v.0, _mm256_set_epi32(0, 1, 2, 3, 4, 5, 6, 7)))
+    }
+}
+
 /// Comparators (i, i ^ m) for m whose highest set bit is `hb`: the lane with bit hb set takes the
 /// max.
 #[inline(always)]

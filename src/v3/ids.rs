@@ -76,8 +76,11 @@ pub fn short_bytes(prefix: u8, v: u64, out: &mut Vec<u8>) {
     let (hi, lo) = ((v / P36[4]) as usize, (v % P36[4]) as usize);
     let d = [&PAIR36[hi / 1296], &PAIR36[hi % 1296], &PAIR36[lo / 1296], &PAIR36[lo % 1296]];
     let word = u64::from_le_bytes([d[0][0], d[0][1], d[1][0], d[1][1], d[2][0], d[2][1], d[3][0], d[3][1]]);
-    let len = 1 + (1..8).map(|i| usize::from(v >= P36[i])).sum::<usize>();
-    let word = word >> (8 * (8 - len));
+    // The leading zero digits are the low bytes equal to b'0' (the first digit is the lowest
+    // byte); the last digit always stays, so 0 is "0". One bit scan instead of seven compares.
+    let skip = ((word ^ 0x3030_3030_3030_3030) | (1 << 56)).trailing_zeros() & 56;
+    let len = 8 - (skip >> 3) as usize;
+    let word = word >> skip;
     out.reserve(9);
     // SAFETY: 9 bytes reserved past the length; the 8-byte store covers the len <= 8 digits.
     unsafe {
