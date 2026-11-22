@@ -167,6 +167,12 @@ impl Region {
 
     /// `bytes` rounded up to whole chunks, from the free list (first fit) or the top.
     pub fn take(&self, bytes: usize) -> *mut u8 {
+        self.take_tell(bytes).0
+    }
+
+    /// As `take`, and whether the memory is fresh (from the top: never touched, so zero) rather
+    /// than recycled from the free list (whatever its last owner left).
+    pub fn take_tell(&self, bytes: usize) -> (*mut u8, bool) {
         let n = (sys::up(bytes.max(1), CHUNK) / CHUNK) as u32;
         let base = self.base();
         let mut got = None;
@@ -204,7 +210,7 @@ impl Region {
         };
         let l = self.live.fetch_add(bytes, Relaxed) + bytes;
         self.peak.fetch_max(l, Relaxed);
-        p as *mut u8
+        (p as *mut u8, got.is_none())
     }
 
     /// Returns chunks from `take` (same pointer and byte count).

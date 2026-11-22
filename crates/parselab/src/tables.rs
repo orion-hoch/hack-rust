@@ -124,6 +124,181 @@ fn pairs<'a>(data: &'a [u8], mut f: impl FnMut(&'a [u8], &'a [u8])) {
 /// promised clean). A repeated product_id is outside the contract and refuses the fast path.
 /// When every product_id is `p` + canonical decimal, the direct table is the only lookup.
 pub fn products(data: &[u8]) -> Result<Products, Fallback> {
+    if let Some((names, mut by_number)) = products_numbered(data) {
+        let (categories, code_of_name, unknown) = category_codes(&names)?;
+        for v in by_number.iter_mut() {
+            if *v != NumberedIds::NONE {
+                *v = code_of_name[*v as usize] as u16;
+            }
+        }
+        let numbered = Some(NumberedIds { prefix: b"p".to_vec(), by_number });
+        return Ok(Products { categories, unknown, map: HashMap::new(), numbered });
+    }
+    products_general(data)
+}
+
+/// Sorted category names (plus `unknown`), each first-seen name's code, and `unknown`'s code.
+fn category_codes(names: &[&[u8]]) -> Result<(Vec<Vec<u8>>, Vec<u8>, u8), Fallback> {
+    let mut categories: Vec<Vec<u8>> = names.iter().map(|n| n.to_vec()).collect();
+    categories.push(b"unknown".to_vec());
+    categories.sort_unstable();
+    categories.dedup();
+    if categories.len() > 255 {
+        return Err(Fallback::TooManyCategories(categories.len()));
+    }
+    let code_of_name: Vec<u8> =
+        names.iter().map(|n| categories.binary_search_by(|c| c.as_slice().cmp(n)).unwrap() as u8).collect();
+    let unknown = categories.binary_search_by(|c| c.as_slice().cmp(b"unknown")).unwrap() as u8;
+    Ok((categories, code_of_name, unknown))
+}
+
+/// One pass over the common products.csv: after the header, every line `p<canonical decimal
+/// below 2^24>,<category>` with exactly one comma and no quote, the numbers distinct, at most
+/// 1,000 names. Gives the first-seen names and, by number, each product's name index (NONE
+/// where absent): what `products_general` computes on such a file. None on anything else (the
+/// general path then decides, errors included). 64-byte blocks: newline, comma and quote masks.
+fn products_numbered(data: &[u8]) -> Option<(Vec<&[u8]>, Vec<u16>)> {
+    let hdr = data.iter().position(|&c| c == b'\n')? + 1;
+    let mut names: Vec<&[u8]> = Vec::new();
+    // By a hash of the name, 2,048 slots for at most 1,000 names: (first 8 bytes, last 8 bytes,
+    // length << 16 | index + 1); 0 in the last = empty. Up to 16 bytes the three are the name.
+    let mut slots = vec![(0u64, 0u64, 0u32); 2048];
+    // By number, grown by doubling (NONE-filled); cut to the largest number + 1 at the end.
+    let mut by: Vec<u16> = vec![NumberedIds::NONE; data.len() / 12 + 16];
+    let mut top = 0usize;
+    let mut take = |ls: usize, comma: usize, end: usize| -> Option<()> {
+        let id = &data[ls..comma];
+        let digits = id.strip_prefix(b"p")?;
+        if digits.is_empty() || digits.len() > 9 || (digits.len() > 1 && digits[0] == b'0') {
+            return None;
+        }
+        let mut n = 0usize;
+        for &c in digits {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            n = n * 10 + d as usize;
+        }
+        if n as u64 >= NumberedIds::MAX_NUMBER {
+            return None;
+        }
+        let cat = &data[comma + 1..end];
+        let (a, z) = ends8(data, comma + 1, end);
+        let tag = (cat.len() as u32) << 16;
+        let mut h = ((a ^ z.rotate_left(29) ^ cat.len() as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 53) as usize;
+        let at = loop {
+            let (sa, sz, st) = slots[h];
+            if st == 0 {
+                if names.len() >= 1000 || cat.len() >= 1 << 15 {
+                    return None;
+                }
+                names.push(cat);
+                slots[h] = (a, z, tag | names.len() as u32);
+                break names.len() as u16 - 1;
+            }
+            if st & !0xFFFF == tag && sa == a && sz == z && (cat.len() <= 16 || names[(st & 0xFFFF) as usize - 1] == cat) {
+                break (st & 0xFFFF) as u16 - 1;
+            }
+            h = (h + 1) & 2047;
+        };
+        if n >= by.len() {
+            by.resize((n + 1).max(2 * by.len()), NumberedIds::NONE);
+        }
+        if by[n] != NumberedIds::NONE {
+            return None;
+        }
+        by[n] = at;
+        top = top.max(n + 1);
+        Some(())
+    };
+    let (mut ls, mut comma) = (hdr, usize::MAX);
+    let mut b = hdr;
+    while b < data.len() {
+        let (nl, cm, qt) = masks64(&data[b..]);
+        if qt != 0 {
+            return None;
+        }
+        let mut m = nl | cm;
+        while m != 0 {
+            let pos = b + m.trailing_zeros() as usize;
+            m &= m - 1;
+            if data[pos] == b',' {
+                if comma != usize::MAX {
+                    return None;
+                }
+                comma = pos;
+            } else {
+                if comma == usize::MAX {
+                    return None;
+                }
+                take(ls, comma, pos)?;
+                ls = pos + 1;
+                comma = usize::MAX;
+            }
+        }
+        b += 64;
+    }
+    if ls < data.len() {
+        // A final line without a newline.
+        if comma == usize::MAX {
+            return None;
+        }
+        take(ls, comma, data.len())?;
+    }
+    by.truncate(top);
+    Some((names, by))
+}
+
+/// The first and last eight bytes of `data[from..to]`, zero-padded when shorter (then both are
+/// the whole name). Plain 8-byte loads while they stay inside `data`.
+#[inline]
+fn ends8(data: &[u8], from: usize, to: usize) -> (u64, u64) {
+    let len = to - from;
+    let at = |i: usize| u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+    if len >= 8 {
+        return (at(from), at(to - 8));
+    }
+    let a = if from + 8 <= data.len() {
+        at(from) & ((1u64 << (8 * len)) - 1)
+    } else {
+        let mut b = [0u8; 8];
+        b[..len].copy_from_slice(&data[from..to]);
+        u64::from_le_bytes(b)
+    };
+    (a, a)
+}
+
+/// Newline, comma and quote masks of up to 64 bytes from the start of `d` (bit i: byte i).
+#[inline]
+fn masks64(d: &[u8]) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    if d.len() >= 64 {
+        use core::arch::x86_64::*;
+        // SAFETY: SSE2 is in every x86-64; the four loads are inside `d` (64 bytes or more).
+        unsafe {
+            let (nl, cm, qt) = (_mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8));
+            let (mut a, mut c, mut q) = (0u64, 0u64, 0u64);
+            for k in 0..4 {
+                let v = _mm_loadu_si128(d.as_ptr().add(16 * k) as *const __m128i);
+                a |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, nl)) as u16 as u64) << (16 * k);
+                c |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, cm)) as u16 as u64) << (16 * k);
+                q |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, qt)) as u16 as u64) << (16 * k);
+            }
+            return (a, c, q);
+        }
+    }
+    let (mut a, mut c, mut q) = (0u64, 0u64, 0u64);
+    for (i, &x) in d.iter().take(64).enumerate() {
+        a |= ((x == b'\n') as u64) << i;
+        c |= ((x == b',') as u64) << i;
+        q |= ((x == b'"') as u64) << i;
+    }
+    (a, c, q)
+}
+
+/// products.csv by the general rules (any id, quoting, dropped lines, every refusal).
+fn products_general(data: &[u8]) -> Result<Products, Fallback> {
     // Distinct category names in first-seen order (at most a few hundred), and per row its index.
     let mut names: Vec<&[u8]> = Vec::new();
     let mut index: HashMap<&[u8], u16> = HashMap::new();
@@ -145,16 +320,7 @@ pub fn products(data: &[u8]) -> Result<Products, Fallback> {
     if names.len() > 1000 {
         return Err(Fallback::TooManyCategories(names.len()));
     }
-    let mut categories: Vec<Vec<u8>> = names.iter().map(|n| n.to_vec()).collect();
-    categories.push(b"unknown".to_vec());
-    categories.sort_unstable();
-    categories.dedup();
-    if categories.len() > 255 {
-        return Err(Fallback::TooManyCategories(categories.len()));
-    }
-    let code_of_name: Vec<u8> =
-        names.iter().map(|n| categories.binary_search_by(|c| c.as_slice().cmp(n)).unwrap() as u8).collect();
-    let unknown = categories.binary_search_by(|c| c.as_slice().cmp(b"unknown")).unwrap() as u8;
+    let (categories, code_of_name, unknown) = category_codes(&names)?;
     // Direct table when every id is numbered.
     let mut by_number: Vec<u16> = Vec::new();
     let mut numbered_ok = true;
@@ -267,5 +433,82 @@ impl Ctx {
             products,
             campaigns,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn same(data: &[u8]) {
+        let a = products(data);
+        let b = products_general(data);
+        match (a, b) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a.categories, b.categories);
+                assert_eq!(a.unknown, b.unknown);
+                assert_eq!(a.map, b.map);
+                let (na, nb) = (a.numbered.map(|n| (n.prefix, n.by_number)), b.numbered.map(|n| (n.prefix, n.by_number)));
+                assert_eq!(na, nb, "{:?}", String::from_utf8_lossy(&data[..data.len().min(200)]));
+            }
+            (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+            (a, b) => panic!("one path refused: {:?} vs {:?}", a.err(), b.err()),
+        }
+    }
+
+    #[test]
+    fn products_one_pass_is_the_general_rule() {
+        for d in [
+            &b"product_id,category\np1,pets\np2,baby\np3,pets\n"[..],
+            b"product_id,category\np1,pets\np2,baby\np3,pets",
+            b"product_id,category\n",
+            b"product_id,category",
+            b"",
+            b"product_id,category\np1,pets\n\np2,baby\n",
+            b"product_id,category\np1,\"pets\"\np2,baby\n",
+            b"\"product\"_id,category\np1,pets\np2,baby\n",
+            b"product_id,category\np1,pets\np1,baby\n",
+            b"product_id,category\np01,pets\n",
+            b"product_id,category\np0,pets\np1,a,b\n",
+            b"product_id,category\nq1,pets\np2,baby\n",
+            b"product_id,category\np1,pets\r\np2,baby\r\n",
+            b"product_id,category\np16777216,pets\n",
+            b"product_id,category\np16777215,pets\np5,\n",
+            b"product_id,category\np1234567890,pets\n",
+            b"product_id,category\np,pets\n",
+        ] {
+            same(d);
+        }
+        // Many names, long names, every block boundary.
+        let mut s = b"product_id,category\n".to_vec();
+        for i in 0..5000u32 {
+            let name = format!("category-number-{}-{}", i % 300, "x".repeat((i % 23) as usize));
+            s.extend_from_slice(format!("p{},{}\n", (i * 7919) % 100_003, name).as_bytes());
+        }
+        same(&s);
+        let mut t = b"product_id,category\n".to_vec();
+        for i in 0..1100u32 {
+            t.extend_from_slice(format!("p{i},c{i}\n").as_bytes());
+        }
+        same(&t);
+        // Random small mutations of a clean file.
+        let base = s[..4000].to_vec();
+        let mut x = 0x1234_5678_9abc_def0u64;
+        for _ in 0..3000 {
+            let mut d = base.clone();
+            for _ in 0..3 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let at = (x as usize >> 8) % d.len();
+                d[at] = b",\n\"p0x9"[(x % 7) as usize];
+            }
+            same(&d);
+        }
+        if let Ok(dir) = std::env::var("V4_DATA") {
+            let real = std::fs::read(std::path::Path::new(&dir).join("products.csv")).unwrap();
+            assert!(products_numbered(&real).is_some(), "the real file takes the one-pass path");
+            same(&real);
+        }
     }
 }

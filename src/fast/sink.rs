@@ -61,7 +61,8 @@ impl<T: Copy> Bins<T> {
     /// taken for pool participant `w`: an index no other thread uses with `src` at the same time.
     pub fn from_blocks(n: usize, src: &'static rt::arena::Blocks, w: usize) -> Self {
         let (bs, sz) = (src.block_size(), std::mem::size_of::<T>());
-        assert!(bs >= sz && bs % sz == 0, "block class of {bs} bytes for records of {sz}");
+        // As many records as fit: a size that does not divide the block leaves its tail unused.
+        assert!(bs >= sz, "block class of {bs} bytes for records of {sz}");
         let mut b = Self::with_chunk(n, 1, bs / sz);
         b.src = Some((src, w));
         b
@@ -90,6 +91,71 @@ impl<T: Copy> Bins<T> {
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = (b, bytes);
+    }
+
+    /// `push` for the hot scatter loops: no bounds check, and the front's next line prefetched
+    /// for writing.
+    ///
+    /// # Safety
+    /// `b` is below the number of bins.
+    #[inline(always)]
+    pub unsafe fn push_fast(&mut self, b: usize, x: T) {
+        // SAFETY: b < bins (caller).
+        let [mut p, e] = unsafe { *self.ce.get_unchecked(b) };
+        if p == e {
+            self.refill(b);
+            p = unsafe { self.ce.get_unchecked(b)[0] };
+        }
+        // SAFETY: p lies in [chunk start, chunk end) of a live chunk.
+        unsafe {
+            p.write(x);
+            self.ce.get_unchecked_mut(b)[0] = p.add(1);
+            #[cfg(target_arch = "x86_64")]
+            core::arch::x86_64::_mm_prefetch((p as *const i8).wrapping_add(64), core::arch::x86_64::_MM_HINT_ET0);
+        }
+    }
+
+    /// Appends the `N` records of `xs` to bin `b` inside one chunk: when they do not fit in the
+    /// current chunk, it is closed at its written length first (a reader never sees a group cut
+    /// by a chunk boundary).
+    ///
+    /// # Safety
+    /// `b` is below the number of bins; N is at most the chunk's record count.
+    #[inline(always)]
+    pub unsafe fn push_all<const N: usize>(&mut self, b: usize, xs: [T; N]) {
+        // SAFETY: b < bins (caller).
+        let [mut p, e] = unsafe { *self.ce.get_unchecked(b) };
+        if (e as usize).wrapping_sub(p as usize) < N * std::mem::size_of::<T>() {
+            self.close_short(b);
+            p = unsafe { self.ce.get_unchecked(b)[0] };
+        }
+        // SAFETY: the chunk has room for N records from p.
+        unsafe {
+            for (i, x) in xs.into_iter().enumerate() {
+                p.add(i).write(x);
+            }
+            self.ce.get_unchecked_mut(b)[0] = p.add(N);
+            #[cfg(target_arch = "x86_64")]
+            core::arch::x86_64::_mm_prefetch((p.add(N) as *const i8).wrapping_add(64), core::arch::x86_64::_MM_HINT_ET0);
+        }
+    }
+
+    /// Closes bin `b`'s current chunk at its written length (if any) and opens the next.
+    #[cold]
+    #[inline(never)]
+    fn close_short(&mut self, b: usize) {
+        let [cur, end] = self.ce[b];
+        if !cur.is_null() {
+            // SAFETY: end is `chunk` records past the start of the same chunk; cur within it.
+            let start = unsafe { end.sub(self.chunk) };
+            let len = (cur as usize - start as usize) / std::mem::size_of::<T>();
+            if len > 0 {
+                self.full[b].push((start, len as u32));
+            }
+            // An empty chunk too small for the group cannot happen (N <= chunk); it would leak.
+            self.ce[b] = [std::ptr::null_mut(); 2];
+        }
+        self.refill(b);
     }
 
     /// Appends and returns where the record was written. The address stays valid for the life

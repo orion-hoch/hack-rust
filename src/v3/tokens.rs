@@ -101,6 +101,8 @@ pub struct Table {
     map_len: usize,
     ptr: *const AtomicU64,
     len: usize,
+    /// Chunks of this region instead of a mapping of its own (`new_in`).
+    reg: Option<&'static rt::arena::Region>,
 }
 
 // SAFETY: the mapping is owned by the table; shared access is through atomics only.
@@ -123,7 +125,26 @@ impl Table {
         }
         prefault(a as *mut u8, bytes);
         rt::exit::register(a, bytes.next_multiple_of(4096));
-        Table { map: p as *mut u8, map_len, ptr: a as *const AtomicU64, len: n }
+        Table { map: p as *mut u8, map_len, ptr: a as *const AtomicU64, len: n, reg: None }
+    }
+
+    /// A zeroed table in chunks of `reg` (huge pages by the region's verdict), given back to it on
+    /// drop: a table that dies early (v4's link-user tables, at the end of the link parse) leaves
+    /// its faulted pages to the region's next takes (the event chunks) instead of to the kernel.
+    pub fn new_in(n: usize, reg: &'static rt::arena::Region) -> Table {
+        if reg.cap() == 0 {
+            // No region (unit tests): a mapping of its own.
+            return Table::new(n, false);
+        }
+        let bytes = (n * 8).max(8);
+        let (p, fresh) = reg.take_tell(bytes);
+        if fresh {
+            prefault(p, bytes);
+        } else {
+            // SAFETY: `bytes` of the region's chunks, ours since the take.
+            unsafe { std::ptr::write_bytes(p, 0, bytes) };
+        }
+        Table { map: p, map_len: bytes, ptr: p as *const AtomicU64, len: n, reg: Some(reg) }
     }
 }
 
@@ -138,6 +159,10 @@ impl std::ops::Deref for Table {
 
 impl Drop for Table {
     fn drop(&mut self) {
+        if let Some(reg) = self.reg {
+            reg.give(self.map, self.map_len);
+            return;
+        }
         // SAFETY: the table's own mapping; no reference to it outlives the table.
         unsafe { munmap(self.map as *mut core::ffi::c_void, self.map_len) };
     }

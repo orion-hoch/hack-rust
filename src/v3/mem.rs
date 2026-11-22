@@ -39,6 +39,12 @@ pub fn init(expected_peak: usize) -> bool {
     if READY.load(Ordering::Acquire) {
         return true;
     }
+    // One initialiser at a time (tests on parallel threads call this concurrently).
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if READY.load(Ordering::Acquire) {
+        return true;
+    }
     let ok = REG.init(RESERVE, Huge::Auto(expected_peak)).is_ok()
         && B8K.attach(&REG, 8 << 10).is_ok()
         && B2K.attach(&REG, 2 << 10).is_ok()

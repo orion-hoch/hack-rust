@@ -1,0 +1,442 @@
+//! P2 (owners: B for the adapter, C for the walk on blocks). Per home partition: group the person
+//! blocks by person key, concatenate a person's events, then today's session kernel, walk and
+//! rows (unchanged in what they compute); user_daily written by the workers as they go, then
+//! campaign_daily. Names: unlinked = unmix of its own key; linked = the name key from I4.
+
+use std::path::Path;
+
+use parselab::{Dataset, Stream};
+
+use super::links::Links;
+use super::p1::Blocks;
+use super::{Cx, Stage};
+use crate::fast::agg::FastAgg;
+use crate::fast::scan::Rows;
+use crate::sessions::CampaignAgg;
+use crate::ts::DAY;
+
+/// Rows per user_daily file written during P2 (about 1 MB of output).
+const ROWS_PER_FILE: usize = 1 << 16;
+
+
+struct Worker<'a> {
+    index: usize,
+    files: u32,
+    wrote: bool,
+    write_err: Option<std::io::Error>,
+    bad: bool,
+    rows: Rows,
+    agg: FastAgg,
+    gs: GroupScratch,
+    g: Grouped<'a>,
+    sc: sortlab::Scratch,
+    out: sortlab::Out,
+    ws: sortlab::walk::WalkScratch,
+    wrows: sortlab::walk::Rows,
+}
+
+fn flush(w: &mut Worker, dir: &Path, cats: &[&[u8]]) {
+    let path = dir.join(format!("part-{:03}-{:05}.parquet", w.index, w.files));
+    w.write_err = crate::fast::write::user_rows(&path, &w.rows, cats).err();
+    w.files += 1;
+    w.wrote = true;
+    w.rows.clear();
+}
+
+/// P2 over every home partition; user_daily written by the workers as they go, then
+/// campaign_daily from the merged counters.
+pub fn run(cx: &Cx, blocks: &Blocks, links: &Links, out: &Path) -> Stage<()> {
+    let ctx = cx.ctx;
+    let day0 = ctx.window_start_ms.div_euclid(DAY);
+    let span = ((ctx.window_end_ms - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
+    let campaigns = ctx.campaigns.ids.len() + 1;
+    let organic = ctx.campaigns.ids.len() as u32;
+    let prm = sortlab::walk::Params {
+        base: ctx.click_base_ms - ctx.window_start_ms,
+        day_shift: ctx.window_start_ms.rem_euclid(DAY) as u32,
+        days: span,
+        campaigns,
+        organic,
+    };
+    let user_dir = out.join("user_daily");
+    let campaign_dir = out.join("campaign_daily");
+    std::fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&campaign_dir).map_err(|e| e.to_string())?;
+    let cats: Vec<&[u8]> = ctx.products.categories.iter().map(|c| c.as_slice()).collect();
+    let ds = cx.ds;
+    let threads = cx.plan.threads;
+    // Rows are flushed every ROWS_PER_FILE, so a worker holds at most that plus one partition's
+    // rows (a partition has a few thousand); about one person per 3 rows, names of about 10 bytes.
+    let keep = ROWS_PER_FILE + (cx.plan.est_events >> cx.plan.b2) / 4 + 4096;
+    // campaign_daily inside the pool's finish step: each worker adds its cells as it finishes and
+    // the last one writes the file (it was a serial step after the pool: 3 ms at 60M, the other
+    // workers idle). run_fin has min(threads, tasks) participants, each finishing once.
+    let parts = 1usize << cx.plan.b2;
+    let participants = threads.clamp(1, parts.max(1));
+    let camp = std::sync::Mutex::new(CampaignAgg::new(campaigns, day0, span));
+    let finished = std::sync::atomic::AtomicUsize::new(0);
+    let camp_err: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::new(None);
+    let mut workers = crate::par::run_fin(
+        threads,
+        1usize << cx.plan.b2,
+        |t| {
+            let mut rows = Rows::new();
+            rows.reserve(keep, keep / 2, keep / 2 * 12);
+            Worker {
+                index: t,
+                files: 0,
+                wrote: false,
+                write_err: None,
+                bad: false,
+                rows,
+                agg: FastAgg::new(campaigns, day0, span),
+                gs: GroupScratch::default(),
+                g: Grouped::default(),
+                sc: sortlab::Scratch::new(),
+                out: sortlab::Out::default(),
+                ws: sortlab::walk::WalkScratch::new(),
+                wrows: sortlab::walk::Rows::default(),
+            }
+        },
+        |w, q| {
+            if w.bad {
+                return;
+            }
+            let chunks = blocks.chunks(q);
+            if group(&chunks, &mut w.gs, &mut w.g).is_none() {
+                w.bad = true;
+                return;
+            }
+            let pb = sortlab::PersonBlocks { ev: &w.g.ev, ev_at: &w.g.ev_at, ck: &w.g.ck, ck_at: &w.g.ck_at };
+            if sortlab::sessions_blocks(&pb, sortlab::Kernel::Net, &mut w.sc, &mut w.out).is_err() {
+                w.bad = true;
+                return;
+            }
+            let mut tie = |a: u64, b: u64| click_id(ds, parselab::Locator(a)).cmp(click_id(ds, parselab::Locator(b)));
+            let (hot, buy) = w.agg.cells_mut();
+            if sortlab::walk::walk_blocks(&pb, &prm, &mut tie, &mut w.ws, &w.out, hot, buy, &mut w.wrows).is_err() {
+                w.bad = true;
+                return;
+            }
+            // Rows with the person names (k -> pk -> name).
+            let (wr, r) = (&w.wrows, &mut w.rows);
+            let mut r0 = 0u32;
+            for (k, &r1) in wr.row_end.iter().enumerate() {
+                if r1 > r0 {
+                    name_of(q, w.g.pks[k], links, blocks, &mut r.names);
+                    r.name_offsets.push(r.names.len() as u32);
+                    r.runs.push(r1 - r0);
+                }
+                r0 = r1;
+            }
+            let d0 = day0 as i32;
+            r.day.extend(wr.day.iter().map(|&d| d0 + d as i32));
+            r.sessions.extend_from_slice(&wr.sessions);
+            r.events.extend_from_slice(&wr.events);
+            r.revenue.extend(wr.revenue.iter().map(|&x| x as i64));
+            r.top.extend_from_slice(&wr.top);
+            if w.write_err.is_none() && w.rows.len() >= ROWS_PER_FILE {
+                flush(w, &user_dir, &cats);
+            }
+        },
+        |w, _| {
+            if !w.bad && w.write_err.is_none() && w.rows.len() > 0 {
+                flush(w, &user_dir, &cats);
+            }
+            {
+                let mut c = camp.lock().unwrap_or_else(|e| e.into_inner());
+                if !w.bad {
+                    w.agg.add_into(&mut c);
+                }
+                if finished.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1 == participants {
+                    // the last to finish: every worker's cells are in (a bad run declines anyway)
+                    if let Err(e) = crate::fast::write::campaigns(&campaign_dir.join("part-00000.parquet"), &c, ctx) {
+                        *camp_err.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                    }
+                }
+            }
+        },
+    );
+    if workers.iter().any(|w| w.bad) {
+        return Err("a person partition did not fit the session kernel".into());
+    }
+    let mut wrote = false;
+    for w in workers.iter_mut() {
+        if let Some(e) = w.write_err.take() {
+            return Err(e.to_string());
+        }
+        wrote |= w.wrote;
+    }
+    if let Some(e) = camp_err.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        return Err(e.to_string());
+    }
+    if finished.into_inner() != participants {
+        return Err("a P2 worker did not finish".into());
+    }
+    if !wrote {
+        crate::fast::write::user_rows(&user_dir.join("part-00000.parquet"), &Rows::new(), &cats).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The click_id of the click line at `loc` (its first field, unquoted).
+fn click_id(ds: &Dataset, loc: parselab::Locator) -> &[u8] {
+    let data = ds.stream(Stream::Clicks)[loc.file() as usize].bytes();
+    let rest = &data[loc.offset() as usize..];
+    let end = rest.iter().position(|&c| c == b',' || c == b'\n').unwrap_or(rest.len());
+    let f = &rest[..end];
+    parselab::csv::unquote(f).unwrap_or(f)
+}
+
+/// The id text of a SHORT key mu (a mixed user key): 'u' and the base-36 digits of its value.
+pub fn short_name(mu: u64, out: &mut Vec<u8>) {
+    crate::v3::ids::short_bytes(b'u', super::keys::unmix40(mu), out);
+}
+
+/// The user_daily name of person key pk of home partition q (RECORDS-V4 sections 6-7): SHORT pk
+/// = 'u' + base36(unmix40(pk)); a links-wide pk (bit 63, bit 60 clear) through links.wide_key;
+/// a P1-local wide pk (bit 60) through blocks.wide(q). LONG = 'u' + 32 hex digits; FOREIGN =
+/// the interned bytes.
+pub fn name_of(q: usize, pk: u64, links: &Links, blocks: &Blocks, out: &mut Vec<u8>) {
+    if pk >> 63 == 0 {
+        return short_name(pk, out);
+    }
+    let kind = (pk >> 61) & 3;
+    let (a, b) = if pk >> 60 & 1 != 0 {
+        let w = blocks.wide(q)[(pk & 0xFFFF_FFFF) as usize];
+        (w[0], w[1])
+    } else {
+        let (_, a, b) = links.wide_key(pk);
+        (a, b)
+    };
+    if kind == 2 {
+        out.extend_from_slice(super::keys::bytes((a & !(1 << 63)) as u32));
+    } else {
+        crate::v3::ids::long_bytes(b'u', a, b, out);
+    }
+}
+
+
+/// A person's blocks of one partition, grouped by person key (RECORDS-V4.md section 8), as
+/// references into the chunks P1 wrote: nothing is copied.
+#[derive(Default)]
+pub struct Grouped<'a> {
+    /// Person key of each local person k (0..np).
+    pub pks: Vec<u64>,
+    /// Person blocks of person k: ev[ev_at[k]..ev_at[k + 1]].
+    pub ev: Vec<&'a [u64]>,
+    pub ev_at: Vec<u32>,
+    /// Click blocks of person k: ck[ck_at[k]..ck_at[k + 1]].
+    pub ck: Vec<&'a [u64]>,
+    pub ck_at: Vec<u32>,
+}
+
+const CLICK_MARK: u64 = 1 << 62;
+const N24: u64 = (1 << 24) - 1;
+
+/// Length in words of the block at the start of `w`, whether it is a click block, and its person
+/// key; None when the header does not fit in `w` (a malformed stream: the run falls back).
+#[inline(always)]
+fn block_at(w: &[u64]) -> Option<(usize, bool, u64)> {
+    let (&h0, &pk) = (w.first()?, w.get(1)?);
+    let click = h0 & CLICK_MARK != 0;
+    let len = if click {
+        2 + 2 * (h0 & N24) as usize
+    } else {
+        let (n_ev, n_purch) = ((h0 & N24) as usize, ((h0 >> 24) & N24) as usize);
+        2 + n_ev.div_ceil(2) + n_purch
+    };
+    (len <= w.len()).then_some((len, click, pk))
+}
+
+/// Reusable state of `group` (kept between partitions; nothing is allocated once warm).
+#[derive(Default)]
+pub struct GroupScratch {
+    keys: Vec<u64>,
+    vals: Vec<u32>,
+    /// Slots taken in this partition (only those are reset).
+    used: Vec<u32>,
+    /// Blocks in input order: (person, click, block).
+    refs: Vec<(u32, bool, (*const u64, usize))>,
+    ev_cur: Vec<u32>,
+    ck_cur: Vec<u32>,
+}
+
+// SAFETY: the raw block pointers in `refs` are only used inside `group`, while the chunks they
+// point into are borrowed.
+unsafe impl Send for GroupScratch {}
+
+const NO_KEY: u64 = u64::MAX;
+
+/// Doubles the person map and re-inserts `pks` (person k at its key); returns the new mask.
+#[cold]
+fn grow(gs: &mut GroupScratch, pks: &[u64]) -> usize {
+    let n = gs.keys.len() * 2;
+    gs.keys.clear();
+    gs.keys.resize(n, NO_KEY);
+    gs.vals.clear();
+    gs.vals.resize(n, 0);
+    gs.used.clear();
+    let mask = n - 1;
+    for (k, &pk) in pks.iter().enumerate() {
+        let mut h = (pk ^ (pk >> 29)) as usize & mask;
+        while gs.keys[h] != NO_KEY {
+            h = (h + 1) & mask;
+        }
+        gs.keys[h] = pk;
+        gs.vals[h] = k as u32;
+        gs.used.push(h as u32);
+    }
+    mask
+}
+
+/// Groups the blocks of `chunks` (each holding whole blocks, ended by its last word or a zero
+/// header word) by person key. None when a block does not fit its chunk.
+pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a>) -> Option<()> {
+    g.pks.clear();
+    gs.refs.clear();
+    // Sized for about one block per 8 words (generator data: one per 13), so the map stays in L1
+    // or L2; it doubles if it passes half full.
+    let words: usize = chunks.iter().map(|c| c.len()).sum();
+    let want = (words / 4 + 64).next_power_of_two();
+    if gs.keys.len() != want {
+        gs.keys.clear();
+        gs.keys.resize(want, NO_KEY);
+        gs.vals.clear();
+        gs.vals.resize(want, 0);
+        gs.used.clear();
+    }
+    let mut mask = gs.keys.len() - 1;
+    let (mut nev, mut nck) = (0u32, 0u32);
+    for c in chunks {
+        let mut at = 0usize;
+        while at < c.len() && c[at] != 0 {
+            let (len, click, pk) = block_at(&c[at..])?;
+            if pk == NO_KEY {
+                return None;
+            }
+            // pk is a mixed key (uniform low bits) or a wide index: its low bits hash it.
+            let mut h = (pk ^ (pk >> 29)) as usize & mask;
+            let k = loop {
+                let key = gs.keys[h];
+                if key == pk {
+                    break gs.vals[h];
+                }
+                if key == NO_KEY {
+                    let k = g.pks.len() as u32;
+                    gs.keys[h] = pk;
+                    gs.vals[h] = k;
+                    gs.used.push(h as u32);
+                    g.pks.push(pk);
+                    if 2 * g.pks.len() > gs.keys.len() {
+                        mask = grow(gs, &g.pks);
+                    }
+                    break k;
+                }
+                h = (h + 1) & mask;
+            };
+            gs.refs.push((k, click, (c[at..].as_ptr(), len)));
+            if click {
+                nck += 1;
+            } else {
+                nev += 1;
+            }
+            at += len;
+        }
+    }
+    for &h in &gs.used {
+        gs.keys[h as usize] = NO_KEY;
+    }
+    gs.used.clear();
+    // Counting sort of the block references by person, person blocks and click blocks apart.
+    let np = g.pks.len();
+    g.ev_at.clear();
+    g.ev_at.resize(np + 1, 0);
+    g.ck_at.clear();
+    g.ck_at.resize(np + 1, 0);
+    for &(k, click, _) in &gs.refs {
+        if click {
+            g.ck_at[k as usize + 1] += 1;
+        } else {
+            g.ev_at[k as usize + 1] += 1;
+        }
+    }
+    for k in 1..=np {
+        g.ev_at[k] += g.ev_at[k - 1];
+        g.ck_at[k] += g.ck_at[k - 1];
+    }
+    gs.ev_cur.clear();
+    gs.ev_cur.extend_from_slice(&g.ev_at[..np]);
+    gs.ck_cur.clear();
+    gs.ck_cur.extend_from_slice(&g.ck_at[..np]);
+    g.ev.clear();
+    g.ev.resize(nev as usize, &[]);
+    g.ck.clear();
+    g.ck.resize(nck as usize, &[]);
+    for &(k, click, (p, len)) in &gs.refs {
+        // SAFETY: (p, len) is a block inside one of `chunks` (borrowed for 'a), read above.
+        let b: &'a [u64] = unsafe { std::slice::from_raw_parts(p, len) };
+        if click {
+            let at = &mut gs.ck_cur[k as usize];
+            g.ck[*at as usize] = b;
+            *at += 1;
+        } else {
+            let at = &mut gs.ev_cur[k as usize];
+            g.ev[*at as usize] = b;
+            *at += 1;
+        }
+    }
+    Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn person(pk: u64, ts: &[u32], pays: &[u64]) -> Vec<u64> {
+        let mut v = vec![ts.len() as u64 | (pays.len() as u64) << 24, pk];
+        for p in ts.chunks(2) {
+            v.push(u64::from(p[0]) | u64::from(*p.get(1).unwrap_or(&u32::MAX)) << 32);
+        }
+        v.extend_from_slice(pays);
+        v
+    }
+
+    fn clicks(pk: u64, n: usize) -> Vec<u64> {
+        let mut v = vec![n as u64 | CLICK_MARK, pk];
+        for i in 0..n {
+            v.push(7 << 52 | i as u64);
+            v.push(1000 + i as u64);
+        }
+        v
+    }
+
+    #[test]
+    fn groups_blocks_by_person_without_copies() {
+        let mut c0 = person(5, &[2, 4, 6], &[9]);
+        c0.extend(clicks(7, 2));
+        c0.extend(person(7, &[8], &[]));
+        let mut c1 = person(5, &[10, 12], &[]);
+        c1.extend(clicks(5, 1));
+        let chunks: Vec<&[u64]> = vec![&c0, &c1];
+        let (mut gs, mut g) = (GroupScratch::default(), Grouped::default());
+        group(&chunks, &mut gs, &mut g).unwrap();
+        assert_eq!(g.pks, vec![5, 7]);
+        assert_eq!(g.ev_at, vec![0, 2, 3]);
+        assert_eq!(g.ck_at, vec![0, 1, 2]);
+        assert_eq!(g.ev[0][1], 5);
+        assert_eq!(g.ev[1].len(), 2 + 1);
+        assert_eq!(g.ev[2][1], 7);
+        assert_eq!(g.ck[0][1], 5);
+        assert_eq!(g.ck[1][0] & N24, 2);
+        // a zero header word ends a chunk
+        let mut c2 = person(9, &[1], &[]);
+        c2.extend([0u64, 77, 77]);
+        group(&[&c2], &mut gs, &mut g).unwrap();
+        assert_eq!(g.pks, vec![9]);
+        // a block longer than its chunk is refused
+        let bad = vec![10u64, 3];
+        assert!(group(&[&bad], &mut gs, &mut g).is_none());
+    }
+}
+
