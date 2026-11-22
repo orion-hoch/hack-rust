@@ -137,10 +137,33 @@ macro_rules! asm256 {
 /// is not rewritten into a 512-bit vpmullq.
 #[inline(always)]
 unsafe fn opaque<const S: bool>(v: __m512i) -> __m512i {
-    if !S {
-        return v;
-    }
+    // Both paths: on the 512-bit path too LLVM folded (x << 3) + (x << 1) into vpmullq (3 uops,
+    // latency 15).
     unsafe { opaque512(v) }
+}
+
+/// A chain of multiplies on one value, done whole on 512 bits or (`S`) once per 256-bit half:
+/// one split and one join for the chain instead of one per multiply.
+#[inline(always)]
+unsafe fn chain<const S: bool>(x: __m512i, f512: impl Fn(__m512i) -> __m512i, f256: impl Fn(__m256i) -> __m256i) -> __m512i {
+    if !S {
+        return f512(x);
+    }
+    let lo = f256(_mm512_castsi512_si256(x));
+    let hi = f256(_mm512_extracti64x4_epi64::<1>(x));
+    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
+}
+
+/// x * 60 as (x << 6) - (x << 2) (light 512-bit work).
+#[inline(always)]
+unsafe fn times60(x: __m512i) -> __m512i {
+    _mm512_sub_epi64(unsafe { opaque512(_mm512_slli_epi64::<6>(x)) }, _mm512_slli_epi64::<2>(x))
+}
+
+/// x * 10 by shifts (light 512-bit work, both paths).
+#[inline(always)]
+unsafe fn times10(x: __m512i) -> __m512i {
+    _mm512_add_epi64(unsafe { opaque512(_mm512_slli_epi64::<3>(x)) }, _mm512_slli_epi64::<1>(x))
 }
 
 #[target_feature(enable = "avx512f")]
@@ -152,6 +175,15 @@ unsafe fn opaque512(v: __m512i) -> __m512i {
 }
 
 asm256!(mul_epu32_256, "vpmuludq", "avx2");
+
+/// vpmuludq on 512 bits as written (LLVM otherwise rewrites some into 3-uop vpmullq).
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn mul_epu32_512(a: __m512i, b: __m512i) -> __m512i {
+    let r: __m512i;
+    unsafe { std::arch::asm!("vpmuludq {r}, {a}, {b}", r = lateout(zmm_reg) r, a = in(zmm_reg) a, b = in(zmm_reg) b, options(pure, nomem, nostack, preserves_flags)) };
+    r
+}
 asm256!(mul_epi32_256, "vpmuldq", "avx2");
 asm256!(maddubs_256, "vpmaddubsw", "avx2");
 asm256!(madd_256, "vpmaddwd", "avx2");
@@ -194,9 +226,20 @@ unsafe fn ids<const S: bool>(w: __m512i, k: __m512i, prefix_ok: __mmask8) -> __m
     let all = _mm512_cmpeq_epi64_mask(_mm512_movm_epi8(digit | lower), _mm512_set1_epi64(-1));
     let v = _mm512_sub_epi8(w, c30);
     let v = _mm512_mask_sub_epi8(v, lower, v, _mm512_set1_epi8(39));
-    let t = maddubs::<S>(v, _mm512_set1_epi16(0x0124)); // bytes [36, 1]
-    let t = madd::<S>(t, _mm512_set1_epi32(0x0001_0510)); // i16 [1296, 1]
-    let value = _mm512_add_epi64(mul_epu32::<S>(t, _mm512_set1_epi64(1_679_616)), _mm512_srli_epi64::<32>(t));
+    // bytes [36, 1] -> i16 [1296, 1] -> u32 pairs -> hi * 36^4 + lo
+    let value = unsafe {
+        chain::<S>(
+            v,
+            |v| {
+                let t = _mm512_madd_epi16(_mm512_maddubs_epi16(v, _mm512_set1_epi16(0x0124)), _mm512_set1_epi32(0x0001_0510));
+                _mm512_add_epi64(mul_epu32_512(t, _mm512_set1_epi64(1_679_616)), _mm512_srli_epi64::<32>(t))
+            },
+            |v| {
+                let t = madd_256(maddubs_256(v, _mm256_set1_epi16(0x0124)), _mm256_set1_epi32(0x0001_0510));
+                _mm256_add_epi64(mul_epu32_256(t, _mm256_set1_epi64x(1_679_616)), _mm256_srli_epi64::<32>(t))
+            },
+        )
+    };
     let first = _mm512_and_si512(_mm512_srlv_epi64(v, sh), _mm512_set1_epi64(0xFF));
     let first_ok = _mm512_cmpneq_epi64_mask(first, _mm512_setzero_si512()) | _mm512_cmpeq_epi64_mask(k, one);
     let k_ok = _mm512_cmpge_epi64_mask(k, one) & _mm512_cmple_epi64_mask(k, eight);
@@ -232,16 +275,18 @@ unsafe fn date<const S: bool>(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m5
     let xd = _mm512_and_si512(x, unsafe { c64(0x00FF_FF00_FFFF_FFFF) });
     // bytes [10,1,10,1,0,10,1,0] -> i16 [Y12, Y34, 10*M1, M2] -> i32 [year, month]
     let w_ym = unsafe { c64(0x0001_0A00_010A_010A) };
-    let t = maddubs::<S>(xd, w_ym);
-    let t = madd::<S>(t, unsafe { c64(0x0001_0001_0001_0064) });
+    let t = unsafe {
+        chain::<S>(
+            xd,
+            |x| _mm512_madd_epi16(_mm512_maddubs_epi16(x, w_ym), c64(0x0001_0001_0001_0064)),
+            |x| madd_256(maddubs_256(x, _mm512_castsi512_si256(w_ym)), _mm256_set1_epi64x(0x0001_0001_0001_0064)),
+        )
+    };
     let year = _mm512_and_si512(t, unsafe { c64(0xFFFF_FFFF) });
     let month = _mm512_srli_epi64::<32>(t);
     let xm = _mm512_xor_si512(mid, c30);
     let mdig = unsafe { digits_ok(xm, 0xFFFF) };
-    let d = _mm512_add_epi64(
-        mul_epu32::<S>(unsafe { byte_at(xm, 0) }, _mm512_set1_epi64(10)),
-        unsafe { byte_at(xm, 1) },
-    );
+    let d = _mm512_add_epi64(unsafe { times10(byte_at(xm, 0)) }, unsafe { byte_at(xm, 1) });
     let yy = _mm512_sub_epi64(year, _mm512_set1_epi64(dates.y0_()));
     let one = _mm512_set1_epi64(1);
     let in_range = dig
@@ -252,8 +297,9 @@ unsafe fn date<const S: bool>(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m5
         & _mm512_cmple_epi64_mask(month, _mm512_set1_epi64(12))
         & _mm512_cmpge_epi64_mask(d, one)
         & _mm512_cmple_epi64_mask(d, _mm512_set1_epi64(31));
+    // yy * 416 as (0 - yy) & 416: exact for yy in {0, 1}, and other lanes are masked out below.
     let idx = _mm512_add_epi64(
-        _mm512_add_epi64(opaque::<S>(mul_epu32::<S>(yy, _mm512_set1_epi64(416))), opaque::<S>(_mm512_slli_epi64::<5>(month))),
+        _mm512_add_epi64(_mm512_and_si512(_mm512_sub_epi64(_mm512_setzero_si512(), yy), _mm512_set1_epi64(416)), opaque::<S>(_mm512_slli_epi64::<5>(month))),
         d,
     );
     // In bounds: masked to DATE_SLOTS - 1, and lanes out of range read slot 0 (never a date).
@@ -283,10 +329,13 @@ unsafe fn hms<const S: bool>(t: __m512i) -> (__m512i, __mmask8) {
         & _mm512_cmple_epu64_mask(h, _mm512_set1_epi64(23))
         & _mm512_cmple_epu64_mask(m, _mm512_set1_epi64(59))
         & _mm512_cmple_epu64_mask(s, _mm512_set1_epi64(59));
-    let secs = _mm512_add_epi64(
-        _mm512_add_epi64(mul_epu32::<S>(h, _mm512_set1_epi64(3600)), mul_epu32::<S>(m, _mm512_set1_epi64(60))),
-        s,
-    );
+    let secs = if S {
+        // (h * 60 + m) * 60 + s, each * 60 as (x << 6) - (x << 2): light work, no split.
+        let hm = _mm512_add_epi64(times60(h), m);
+        _mm512_add_epi64(times60(hm), s)
+    } else {
+        _mm512_add_epi64(_mm512_add_epi64(_mm512_mul_epu32(h, _mm512_set1_epi64(3600)), _mm512_mul_epu32(m, _mm512_set1_epi64(60))), s)
+    };
     (secs, ok)
 }
 
@@ -295,9 +344,20 @@ unsafe fn hms<const S: bool>(t: __m512i) -> (__m512i, __mmask8) {
 unsafe fn dec8<const S: bool>(w: __m512i) -> (__m512i, __mmask8) {
     let x = _mm512_xor_si512(w, unsafe { c64(0x3030_3030_3030_3030) });
     let ok = unsafe { digits_ok(x, u64::MAX) };
-    let t = maddubs::<S>(x, _mm512_set1_epi16(0x010A)); // bytes [10, 1]
-    let t = madd::<S>(t, _mm512_set1_epi32(0x0001_0064)); // i16 [100, 1]
-    let v = _mm512_add_epi64(mul_epu32::<S>(t, _mm512_set1_epi64(10_000)), _mm512_srli_epi64::<32>(t));
+    // bytes [10, 1] -> i16 [100, 1] -> u32 pairs -> hi * 10^4 + lo
+    let v = unsafe {
+        chain::<S>(
+            x,
+            |x| {
+                let t = _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_set1_epi16(0x010A)), _mm512_set1_epi32(0x0001_0064));
+                _mm512_add_epi64(mul_epu32_512(t, _mm512_set1_epi64(10_000)), _mm512_srli_epi64::<32>(t))
+            },
+            |x| {
+                let t = madd_256(maddubs_256(x, _mm256_set1_epi16(0x010A)), _mm256_set1_epi32(0x0001_0064));
+                _mm256_add_epi64(mul_epu32_256(t, _mm256_set1_epi64x(10_000)), _mm256_srli_epi64::<32>(t))
+            },
+        )
+    };
     (v, ok)
 }
 
@@ -312,7 +372,8 @@ unsafe fn offset<const S: bool>(o: __m512i) -> (__m512i, __mmask8) {
     let ff = _mm512_set1_epi64(0xFF);
     let h = _mm512_and_si512(_mm512_srli_epi64::<24>(v), ff);
     let m = _mm512_and_si512(_mm512_srli_epi64::<48>(v), ff);
-    let mag = mul_epu32::<S>(_mm512_add_epi64(mul_epu32::<S>(h, _mm512_set1_epi64(60)), m), _mm512_set1_epi64(60_000));
+    let hm = if S { _mm512_add_epi64(unsafe { times60(h) }, m) } else { _mm512_add_epi64(_mm512_mul_epu32(h, _mm512_set1_epi64(60)), m) };
+    let mag = mul_epu32::<S>(hm, _mm512_set1_epi64(60_000));
     let plus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'+' as i64));
     let minus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'-' as i64));
     let off = _mm512_mask_sub_epi64(mag, !plus, _mm512_setzero_si512(), mag);
@@ -333,8 +394,14 @@ unsafe fn hex8<const S: bool>(w: __m512i) -> (__m512i, __mmask8) {
     let ok = _mm512_cmpeq_epi64_mask(_mm512_movm_epi8(digit | letter), _mm512_set1_epi64(-1));
     let v = _mm512_sub_epi8(w, _mm512_set1_epi8(b'0' as i8));
     let v = _mm512_mask_sub_epi8(v, letter, v, _mm512_set1_epi8(39));
-    let t = maddubs::<S>(v, _mm512_set1_epi16(0x0110)); // bytes [16, 1]
-    let t = madd::<S>(t, _mm512_set1_epi32(0x0001_0100)); // i16 [256, 1]
+    // bytes [16, 1] -> i16 [256, 1], split once on the 256-bit path
+    let t = unsafe {
+        chain::<S>(
+            v,
+            |v| _mm512_madd_epi16(_mm512_maddubs_epi16(v, _mm512_set1_epi16(0x0110)), _mm512_set1_epi32(0x0001_0100)),
+            |v| madd_256(maddubs_256(v, _mm256_set1_epi16(0x0110)), _mm256_set1_epi32(0x0001_0100)),
+        )
+    };
     let val = _mm512_or_si512(_mm512_slli_epi64::<16>(_mm512_and_si512(t, _mm512_set1_epi64(0xFFFF_FFFF))), _mm512_srli_epi64::<32>(t));
     (val, ok)
 }

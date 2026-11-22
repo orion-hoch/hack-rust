@@ -29,7 +29,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use super::persons::People;
-use super::sink::{Special, mix};
+use super::sink::Special;
 use super::super::v3::Abort;
 use crate::fast::sink::Bins;
 
@@ -136,6 +136,8 @@ pub struct Tables {
     /// nonzero second word, `buy | PURCH_MARK`); joined with the side streams' records.
     pin_s: Vec<[u64; 2]>,
     pin_l: Vec<[u64; 4]>,
+    /// LONG records found in the SHORT stream (one-stream layout), for the LONG table.
+    long_in: Vec<[u64; 4]>,
 }
 
 /// Marks an inline purchase side record's last word (a dead copy's is 0, a live one has surv).
@@ -157,6 +159,7 @@ impl Tables {
             poisoned: false,
             pin_s: Vec::new(),
             pin_l: Vec::new(),
+            long_in: Vec::new(),
         }
     }
 
@@ -460,6 +463,9 @@ pub struct Move2 {
     pub bits: u32,
     /// Block-class mode (`new_in`): the pool participant index, else NO_ARENA.
     w: usize,
+    /// Person partitions are token ranges: partition = person token >> shift (tokens are hash
+    /// slots, so names spread evenly; no mixing needed).
+    shift: u32,
 }
 
 impl Move2 {
@@ -470,8 +476,9 @@ impl Move2 {
     /// are whole blocks of `mem::B8K` (SHORT), `mem::B2K` (LONG) and `mem::B256` (purchases), each
     /// in exactly one partition's lists and read by nobody after its partition (the sink's
     /// `Bins::from_blocks` chunks, as the driver hands them over).
-    pub fn new_in(bits: u32, hint: usize, w: usize) -> Self {
+    pub fn new_in(bits: u32, hint: usize, w: usize, shift: u32) -> Self {
         let mut m = Move2::new(bits, hint);
+        m.shift = shift;
         let parts = 1usize << bits;
         m.ev = Out::new_in(parts, w);
         if m.ev.arena == w && super::mem::B256.block_size() == 256 {
@@ -488,12 +495,14 @@ impl Move2 {
             buys: Bins::with_chunk(parts, 1 << 12, (hint / parts / 64).clamp(4, 64)),
             bits,
             w: NO_ARENA,
+            shift: 0,
         }
     }
 
     #[inline(always)]
     pub fn part(&self, person: u32) -> usize {
-        (mix(u64::from(person) | 0xabcd_0000_0000_0000) >> (64 - self.bits)) as usize
+        // Below 2^bits: the driver picks shift so that every token's range has its partition.
+        (person >> self.shift) as usize
     }
 
     /// One survivor: `w` is its survivor word (token | ts << 32 | purchase << 63).
@@ -617,77 +626,85 @@ unsafe fn put_short(tab: *mut [u64; 2], bshift: u32, bmask: usize, r: [u64; 2]) 
     }
 }
 
-/// Inserts SHORT records; returns (the least complemented ingest field seen, so 0 means a record
-/// had the impossible field 2^23 - 1; new keys). `GROW`: the partition may hold more distinct keys
-/// than 3/4 of the slots, so the table doubles before passing that load. Without `GROW` the caller
-/// has shown that it cannot.
+/// Inserts SHORT records; returns the new keys. `GROW`: the partition may hold more distinct
+/// keys than 3/4 of the slots, so the table doubles before passing that load. Without `GROW` the
+/// caller has shown that it cannot.
+///
+/// The stream may also carry LONG records as two units (one-stream layout): unit 1 has the
+/// ingest field 2^23 - 1, which no SHORT record has, and holds [ingest | surv << 63 in the low
+/// bits, w3]; unit 2 is [a, b]. They go to `t.long_in` as [a, b, w2, w3] for the LONG table.
+/// A LONG may straddle two chunks of one sink (they come consecutive); a lone unit 1 at the end
+/// is a failed check.
 #[inline(always)]
-fn insert_short<const GROW: bool>(t: &mut Tables, bits: &mut u32, chunks: &[&[[u64; 2]]]) -> Result<(u64, usize), Abort> {
-    let mut low = X0;
+fn insert_short<const GROW: bool>(t: &mut Tables, bits: &mut u32, chunks: &[&[[u64; 2]]]) -> Result<usize, Abort> {
     let mut distinct = 0usize;
+    let mut pend: Option<[u64; 2]> = None;
     for c in chunks {
         let n = c.len();
         let p = c.as_ptr();
-        if !GROW {
-            let bshift = 64 - (*bits - 2);
-            let bmask = (1usize << (*bits - 2)) - 1;
-            let tab = t.s_ptr();
-            let pre = n.saturating_sub(DT);
-            for j in 0..pre {
+        let mut j = 0usize;
+        if let Some(u1) = pend.take() {
+            if n == 0 {
+                pend = Some(u1);
+                continue;
+            }
+            long_unit(t, u1, c[0]);
+            j = 1;
+        }
+        let bshift = 64 - (*bits - 2);
+        let bmask = (1usize << (*bits - 2)) - 1;
+        let mut tab = t.s_ptr();
+        while j < n {
+            if j + DT < n {
                 // SAFETY: j + DT < n = c.len().
                 let ka = unsafe { (*p.add(j + DT))[0] } & KEY40;
                 // Address only (wrapping): a prefetch never faults.
-                prefetch(tab.wrapping_add(4 * slot_of(ka, bshift)));
-                // SAFETY: j < n.
-                let r = unsafe { *p.add(j) };
-                if r[0] & TOP == 0 && r[1] != 0 {
-                    // An inline purchase side record: joined after the inserts.
-                    t.pin_s.push(r);
-                    continue;
-                }
-                low = low.min(!r[0] & X0);
-                // SAFETY: bits <= log2(t.s_len()), and the caller's bound keeps 3/4 free.
-                distinct += usize::from(unsafe { put_short(tab, bshift, bmask, r) });
-            }
-            for j in pre..n {
-                // SAFETY: j < n.
-                let r = unsafe { *p.add(j) };
-                if r[0] & TOP == 0 && r[1] != 0 {
-                    t.pin_s.push(r);
-                    continue;
-                }
-                low = low.min(!r[0] & X0);
-                // SAFETY: as above.
-                distinct += usize::from(unsafe { put_short(tab, bshift, bmask, r) });
-            }
-            continue;
-        }
-        for j in 0..n {
-            let bshift = 64 - (*bits - 2);
-            let bmask = (1usize << (*bits - 2)) - 1;
-            let tab = t.s_ptr();
-            if j + DT < n {
-                // SAFETY: j + DT < n.
-                let ka = unsafe { (*p.add(j + DT))[0] } & KEY40;
-                prefetch(tab.wrapping_add(4 * slot_of(ka, bshift)));
+                prefetch(tab.wrapping_add(4 * slot_of(ka, if GROW { 64 - (*bits - 2) } else { bshift })));
             }
             // SAFETY: j < n.
             let r = unsafe { *p.add(j) };
+            j += 1;
+            if !r[0] & X0 == 0 {
+                // LONG unit 1 (cold): with its unit 2 here or at the next chunk's start.
+                if j < n {
+                    long_unit(t, r, c[j]);
+                    j += 1;
+                } else {
+                    pend = Some(r);
+                }
+                continue;
+            }
             if r[0] & TOP == 0 && r[1] != 0 {
+                // An inline purchase side record: joined after the inserts.
                 t.pin_s.push(r);
                 continue;
             }
-            low = low.min(!r[0] & X0);
+            if !GROW {
+                // SAFETY: bits <= log2(t.s_len()), and the caller's bound keeps 3/4 free.
+                distinct += usize::from(unsafe { put_short(tab, bshift, bmask, r) });
+                continue;
+            }
             // SAFETY: bits <= log2(t.s_len()); growth below keeps at most 3/4 used.
-            if unsafe { put_short(tab, bshift, bmask, r) } {
+            if unsafe { put_short(tab, 64 - (*bits - 2), (1usize << (*bits - 2)) - 1, r) } {
                 distinct += 1;
                 if distinct * 4 > 3 << *bits {
                     t.grow_short(bits)?;
+                    tab = t.s_ptr();
                 }
             }
         }
     }
-    Ok((low, distinct))
+    if pend.is_some() {
+        return Err(Abort("a LONG record's first unit without its second".into()));
+    }
+    Ok(distinct)
+}
+
+/// A LONG record from its two units in the SHORT stream (one-stream layout).
+#[cold]
+#[inline(never)]
+fn long_unit(t: &mut Tables, u1: [u64; 2], u2: [u64; 2]) {
+    t.long_in.push([u2[0], u2[1], u1[0] & (ING | TOP), u1[1]]);
 }
 
 #[inline(always)]
@@ -839,12 +856,21 @@ pub fn partition(
     let ns: usize = short.iter().map(|c| c.len()).sum::<usize>() + specials.len();
     let nl: usize = long.iter().map(|c| c.len()).sum::<usize>() + specials.len();
     let mut sb = bits_for(ns, 3, t.s_len());
-    let mut lb = bits_for(nl, 6, t.l.len());
     // Every record (specials included) a new key still leaves a quarter of the slots empty:
     // no growth check needed.
-    let (low_s, mut sd) = if ns * 4 <= 3 << sb { insert_short::<false>(t, &mut sb, short)? } else { insert_short::<true>(t, &mut sb, short)? };
-    let (bad_l, mut ld) = if nl * 4 <= 3 << lb { insert_long::<false>(t, &mut lb, long)? } else { insert_long::<true>(t, &mut lb, long)? };
-    if low_s == 0 || bad_l != 0 {
+    t.long_in.clear();
+    let mut sd = if ns * 4 <= 3 << sb { insert_short::<false>(t, &mut sb, short)? } else { insert_short::<true>(t, &mut sb, short)? };
+    // LONG records met in the SHORT stream join the LONG stream's (sized for both).
+    let long_in = std::mem::take(&mut t.long_in);
+    let nl = nl + long_in.len();
+    let mut lb = bits_for(nl, 6, t.l.len());
+    let mut lc: Vec<&[[u64; 4]]> = long.to_vec();
+    lc.push(&long_in);
+    let r = if nl * 4 <= 3 << lb { insert_long::<false>(t, &mut lb, &lc) } else { insert_long::<true>(t, &mut lb, &lc) };
+    drop(lc);
+    t.long_in = long_in;
+    let (bad_l, mut ld) = r?;
+    if bad_l != 0 {
         return Err(Abort("an event record with an ingest field of 2^23 - 1".into()));
     }
     insert_specials(t, &mut sb, &mut lb, &mut sd, &mut ld, specials, cx.ingest_base_ms)?;

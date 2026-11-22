@@ -329,14 +329,19 @@ unsafe fn person_regs<L: Lanes, const R: usize>(ts: &[u32], out: &mut Out, ends:
     let end_all = ((cut_all >> 1) | (1u128 << (n - 1))) & valid;
     let k = cut_all.count_ones() as usize;
     let base = out.start.len();
-    // sessions <= n
-    out.start.reserve(n);
-    out.events.reserve(n);
-    // SAFETY: base + n <= capacity (reserved above).
+    // SAFETY: base + n <= capacity (the caller reserved room; sessions <= n).
     let st = out.start.as_mut_ptr().add(base);
     let ev = out.events.as_mut_ptr().add(base);
-    let mut spos = [0u32; 128];
-    let mut epos = [0u32; 128];
+    // Start and end positions of the sessions: only the R * W entries this person can use are
+    // zeroed (not all 128 on every call).
+    let mut spos_buf = core::mem::MaybeUninit::<[u32; 128]>::uninit();
+    let mut epos_buf = core::mem::MaybeUninit::<[u32; 128]>::uninit();
+    core::ptr::write_bytes(spos_buf.as_mut_ptr() as *mut u32, 0, R * w);
+    core::ptr::write_bytes(epos_buf.as_mut_ptr() as *mut u32, 0, R * w);
+    // SAFETY: the first R * W <= 128 entries are initialised just above, and nothing past them is
+    // read or written below (k <= n <= R * W).
+    let spos = &mut *(spos_buf.as_mut_ptr() as *mut [u32; 128]);
+    let epos = &mut *(epos_buf.as_mut_ptr() as *mut [u32; 128]);
     let (mut ks, mut ke) = (0usize, 0usize);
     let wm: u128 = (1u128 << w) - 1;
     for i in 0..R {
@@ -386,10 +391,8 @@ unsafe fn person_reg<L: Lanes>(ts: &[u32], out: &mut Out, ends: *mut u32, phases
     let ep = L::compress(end, L::iota());
     let cnt = L::add(L::sub(ep, sp), L::splat(1));
     let base = out.start.len();
-    out.start.reserve(L::W);
-    out.events.reserve(L::W);
-    // SAFETY: k <= n <= W lanes written after base, inside the reserved room; `ends` has room for
-    // base + n entries (caller).
+    // SAFETY: k <= n <= W lanes written after base, inside the room the caller reserved; `ends`
+    // has room for base + n entries (caller).
     L::store(out.start.as_mut_ptr().add(base), keep, starts);
     L::store(out.events.as_mut_ptr().add(base), keep, cnt);
     if !ends.is_null() {
@@ -405,8 +408,9 @@ pub const MAX_N: usize = 128;
 /// Sessions of one person of 1..=MAX_N events with register type L.
 ///
 /// # Safety
-/// L's target features present; 1 <= ts.len() <= MAX_N; each ts < 2^31; `ends` null or writable
-/// for base + ts.len() entries (base = out.start.len()).
+/// L's target features present; 1 <= ts.len() <= MAX_N; each ts < 2^31; `out.start` and
+/// `out.events` with room for base + max(ts.len(), W) entries and `ends` null or writable for
+/// base + ts.len() entries (base = out.start.len()).
 #[inline(always)]
 pub unsafe fn person_net_inl<L: Lanes>(ts: &[u32], out: &mut Out, ends: *mut u32) {
     let n = ts.len();
@@ -435,6 +439,8 @@ pub unsafe fn person_net_inl<L: Lanes>(ts: &[u32], out: &mut Out, ends: *mut u32
 /// AVX-512F present, and the conditions of `person_net_inl`.
 #[target_feature(enable = "avx512f")]
 pub unsafe fn person_net512(ts: &[u32], out: &mut Out, ends: *mut u32) {
+    out.start.reserve(ts.len().max(Z::W));
+    out.events.reserve(ts.len().max(Z::W));
     person_net_inl::<Z>(ts, out, ends)
 }
 
@@ -444,6 +450,8 @@ pub unsafe fn person_net512(ts: &[u32], out: &mut Out, ends: *mut u32) {
 /// AVX-512F and AVX-512VL present, and the conditions of `person_net_inl`.
 #[target_feature(enable = "avx512f,avx512vl")]
 pub unsafe fn person_net256(ts: &[u32], out: &mut Out, ends: *mut u32) {
+    out.start.reserve(ts.len().max(Y::W));
+    out.events.reserve(ts.len().max(Y::W));
     person_net_inl::<Y>(ts, out, ends)
 }
 

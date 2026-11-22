@@ -37,8 +37,12 @@ pub struct Tokens<'a> {
     long_used: AtomicU64,
     short_step: u32,
     long_step: u32,
+    /// Every token whose person is not itself carries its stamp (set by persons; see `stamp`).
+    stamped: AtomicBool,
     /// FOREIGN IDs interned so far (written under the lock, read without it by `occupied`).
     foreign_n: std::sync::atomic::AtomicU32,
+    /// AVX-512F and DQ present: `homes8` hashes a whole batch in zmm registers.
+    avx512: bool,
 }
 
 /// Tables sized from the bound on distinct users (`Tokens::with_bound`) only while they stay this
@@ -46,6 +50,13 @@ pub struct Tokens<'a> {
 const BOUND_TABLES_MAX: usize = 64 << 20;
 
 pub const NO_TOKEN: u32 = u32::MAX;
+
+/// A SHORT slot: bits 0-40 the key (value + 1; value < 2^40), bits 41-63 its person stamp F
+/// (`stamp`): 0 = the person is the token itself, 1 to 2^23 - 2 = person + 1, all ones = the person
+/// is in the persons map. A LONG slot's fourth word: 0 or person + 1. Every key compare masks.
+const KEY: u64 = (1 << 41) - 1;
+const STAMP_SHIFT: u32 = 41;
+const STAMP_FAR: u64 = (1 << 23) - 1;
 
 /// Inserts are counted per thread and published to the shared counters in steps: one shared
 /// atomic increment per insert bounced its cache line between all workers (links and clicks took
@@ -202,6 +213,17 @@ pub fn prefault(p: *mut u8, len: usize) {
     });
 }
 
+fn avx512_dq() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512dq")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 #[inline(always)]
 fn mix(x: u64) -> u64 {
     let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -273,8 +295,10 @@ impl<'a> Tokens<'a> {
             long_home: (long_cap - 1) & !1,
             foreign: Mutex::new((HashMap::new(), Vec::new())),
             full: AtomicBool::new(false),
+            stamped: AtomicBool::new(false),
             short_used: AtomicU64::new(0),
             long_used: AtomicU64::new(0),
+            avx512: avx512_dq(),
             short_step: ((short_cap as u64) >> 8).clamp(1, STEP_MAX) as u32,
             long_step: ((long_cap as u64) >> 8).clamp(1, STEP_MAX) as u32,
             foreign_n: std::sync::atomic::AtomicU32::new(0),
@@ -334,14 +358,15 @@ impl<'a> Tokens<'a> {
             use core::arch::x86_64::*;
             let p = self.short.as_ptr().add(home) as *const __m256i;
             let w = _mm256_set1_epi64x(want as i64);
-            let lo = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256(p), w)));
-            let hi = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256(p.add(1)), w)));
+            let k = _mm256_set1_epi64x(KEY as i64);
+            let lo = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256(p), k), w)));
+            let hi = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(_mm256_load_si256(p.add(1)), k), w)));
             let m = (lo | (hi << 4)) as u32;
             if m != 0 { Some(home + m.trailing_zeros() as usize) } else { None }
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         {
-            (home..home + 8).find(|&i| self.short[i].load(Relaxed) == want)
+            (home..home + 8).find(|&i| self.short[i].load(Relaxed) & KEY == want)
         }
     }
 
@@ -354,7 +379,7 @@ impl<'a> Tokens<'a> {
         let start = i;
         loop {
             let cur = self.short[i].load(Relaxed);
-            if cur == want {
+            if cur & KEY == want {
                 return i as u32;
             }
             if cur == 0 {
@@ -374,7 +399,7 @@ impl<'a> Tokens<'a> {
                         }
                         return i as u32;
                     }
-                    Err(now) if now == want => return i as u32,
+                    Err(now) if now & KEY == want => return i as u32,
                     Err(_) => {}
                 }
             }
@@ -447,6 +472,54 @@ impl<'a> Tokens<'a> {
         Pending { long, a, b, slot }
     }
 
+    /// `home` for lanes 0..n of a batch at once (`long` bit k: lane k is LONG): slots into `out`
+    /// (lanes n.. hold garbage), their lines prefetched (for writing with W, as `start_hint`).
+    /// With AVX-512 the eight mixes run in zmm
+    /// registers (about 30 instructions a batch against about 27 a lane for the scalar loop).
+    #[inline(always)]
+    pub fn homes8<const W: bool>(&self, long: u8, a: &[u64; 8], b: &[u64; 8], n: usize, out: &mut [u32; 8]) {
+        #[cfg(target_arch = "x86_64")]
+        if self.avx512 {
+            // SAFETY: avx512 only when AVX-512F and DQ were detected (Tokens construction).
+            unsafe { self.homes512::<W>(long, a, b, n, out) };
+            return;
+        }
+        for k in 0..n {
+            out[k] = self.start_hint::<W>(long >> k & 1 != 0, a[k], b[k]).slot as u32;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512dq")]
+    unsafe fn homes512<const W: bool>(&self, long: u8, a: &[u64; 8], b: &[u64; 8], n: usize, out: &mut [u32; 8]) {
+        use core::arch::x86_64::*;
+        unsafe {
+            let va = _mm512_loadu_si512(a.as_ptr() as *const _);
+            let vb = _mm512_loadu_si512(b.as_ptr() as *const _);
+            // as `home`: the key is a, or a ^ b.rotate_left(29) for LONG lanes; then `mix`
+            let x = _mm512_mask_xor_epi64(va, long, va, _mm512_rol_epi64::<29>(vb));
+            let mut z = _mm512_add_epi64(x, _mm512_set1_epi64(0x9e37_79b9_7f4a_7c15u64 as i64));
+            z = _mm512_mullo_epi64(_mm512_xor_si512(z, _mm512_srli_epi64::<30>(z)), _mm512_set1_epi64(0xbf58_476d_1ce4_e5b9u64 as i64));
+            z = _mm512_mullo_epi64(_mm512_xor_si512(z, _mm512_srli_epi64::<27>(z)), _mm512_set1_epi64(0x94d0_49bb_1331_11ebu64 as i64));
+            z = _mm512_xor_si512(z, _mm512_srli_epi64::<31>(z));
+            let hm = _mm512_mask_blend_epi64(long, _mm512_set1_epi64(self.short_home as i64), _mm512_set1_epi64(self.long_home as i64));
+            let slot = _mm512_and_si512(z, hm);
+            _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, _mm512_cvtepi64_epi32(slot));
+            // line addresses: short + 8 * slot, long + 32 * slot (4 words a LONG slot)
+            let off = _mm512_mask_slli_epi64::<5>(_mm512_slli_epi64::<3>(slot), long, slot);
+            let bases = _mm512_mask_blend_epi64(long, _mm512_set1_epi64(self.short.as_ptr() as i64), _mm512_set1_epi64(self.long.as_ptr() as i64));
+            let mut at = [0u64; 8];
+            _mm512_storeu_si512(at.as_mut_ptr() as *mut _, _mm512_add_epi64(bases, off));
+            for &p in &at[..n.min(8)] {
+                if W {
+                    _mm_prefetch(p as *const i8, _MM_HINT_ET0);
+                } else {
+                    _mm_prefetch(p as *const i8, _MM_HINT_T0);
+                }
+            }
+        }
+    }
+
     /// Home slot of a key (SHORT or LONG), its line prefetched (shared). Branchless.
     #[inline(always)]
     pub fn home(&self, long: bool, a: u64, b: u64) -> u32 {
@@ -497,7 +570,7 @@ impl<'a> Tokens<'a> {
             }
             loop {
                 let cur = self.short[i].load(Relaxed);
-                if cur == want {
+                if cur & KEY == want {
                     return i as u32;
                 }
                 if cur == 0 {
@@ -576,6 +649,52 @@ impl<'a> Tokens<'a> {
         }
     }
 
+    /// Records the person of token `t` in its own slot (persons, once per linked token, after the
+    /// person is final; no other writer changes an occupied slot). Then `set_stamped`.
+    #[inline]
+    pub fn stamp(&self, t: u32, person: u32) {
+        let t = t as usize;
+        if t < self.short.len() {
+            let f = if u64::from(person) + 1 < STAMP_FAR { u64::from(person) + 1 } else { STAMP_FAR };
+            let w = self.short[t].load(Relaxed) & KEY;
+            self.short[t].store(w | (f << STAMP_SHIFT), Relaxed);
+        } else if t < self.short.len() + self.long_cap {
+            self.long[4 * (t - self.short.len()) + 3].store(u64::from(person) + 1, Relaxed);
+        }
+    }
+
+    /// Every token whose person is not itself is stamped (persons calls this last; readers that
+    /// see it may use `person_at`).
+    pub fn set_stamped(&self) {
+        self.stamped.store(true, Release);
+    }
+
+    pub fn stamped(&self) -> bool {
+        self.stamped.load(Acquire)
+    }
+
+    /// The person of token `t` from its slot (the line a find just read), or None when it is in
+    /// the persons map (FOREIGN tokens, a person too large for the stamp). Only after `stamped`.
+    #[inline(always)]
+    pub fn person_at(&self, t: u32) -> Option<u32> {
+        let i = t as usize;
+        if i < self.short.len() {
+            let f = self.short[i].load(Relaxed) >> STAMP_SHIFT;
+            if f == 0 {
+                Some(t)
+            } else if f == STAMP_FAR {
+                None
+            } else {
+                Some((f - 1) as u32)
+            }
+        } else if i < self.short.len() + self.long_cap {
+            let v = self.long[4 * (i - self.short.len()) + 3].load(Relaxed);
+            Some(if v == 0 { t } else { (v - 1) as u32 })
+        } else {
+            None
+        }
+    }
+
     /// Starts loading the key of a token (prefetch).
     #[inline(always)]
     pub fn prefetch_key(&self, t: u32) {
@@ -591,7 +710,7 @@ impl<'a> Tokens<'a> {
     pub fn key_of(&self, t: u32) -> (Key, Option<&'a [u8]>) {
         let t = t as usize;
         if t < self.short.len() {
-            (Key::Short(self.short[t].load(Relaxed) - 1), None)
+            (Key::Short((self.short[t].load(Relaxed) & KEY) - 1), None)
         } else if t < self.short.len() + self.long_cap {
             let i = t - self.short.len();
             (Key::Long(self.long[4 * i + 1].load(Relaxed), self.long[4 * i + 2].load(Relaxed)), None)

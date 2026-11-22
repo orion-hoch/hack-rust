@@ -26,6 +26,8 @@ pub struct PeopleCtx<'a, 'b> {
     pub walk: sortlab::walk::Params,
     /// Absolute day number of relative day 0.
     pub day0: i32,
+    /// Person partition q holds the person tokens q << shift .. (q + 1) << shift.
+    pub shift: u32,
 }
 
 pub struct Worker {
@@ -99,7 +101,7 @@ impl Worker {
     }
 
     /// One person partition: survivor records, purchase records and click records of it.
-    pub fn partition(&mut self, ev: &[&[u64]], buys: &[&[[u64; 2]]], clicks: &[&[[u64; 2]]], cx: &PeopleCtx) {
+    pub fn partition(&mut self, ev: &[&[u64]], buys: &[&[[u64; 2]]], clicks: &[&[[u64; 2]]], cx: &PeopleCtx, q: usize) {
         let nev: usize = ev.iter().map(|c| c.len()).sum();
         if nev == 0 {
             if buys.iter().any(|c| !c.is_empty()) {
@@ -112,7 +114,9 @@ impl Worker {
             self.buys.extend_from_slice(c);
         }
         // Sessions per person (start, event count, in time order) and each purchase's session.
-        if sortlab::sessions_chunks(ev, &self.buys, cx.kernel, &mut self.sc, &mut self.out).is_err() {
+        // Person ids are root tokens and partition q holds the tokens q << shift .. (q + 1) << shift:
+        // grouping indexes them directly (a token outside the range is an error: the run falls back).
+        if sortlab::sessions_chunks(ev, &self.buys, cx.kernel, Some(((q as u32) << cx.shift, cx.shift)), &mut self.sc, &mut self.out).is_err() {
             self.bad = true;
             return;
         }

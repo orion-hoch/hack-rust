@@ -170,6 +170,15 @@ pub struct Scratch {
     ends: Vec<u32>,
     /// Network widths available: (512-bit, 256-bit, Auto's choice), as `net_bits`.
     nets: [u32; 3],
+    /// Direct mode (`sessions_chunks` with `Some((base, shift))`): person tokens of the partition
+    /// are base + local, local < 2^shift; dshift = 0 when off. dcnt: per local its count, then its
+    /// cursor (all zero between partitions); dmap: per local its output index (EMPTY when absent);
+    /// dloc: the present locals in output order.
+    dbase: u32,
+    dshift: u32,
+    dcnt: Vec<u32>,
+    dmap: Vec<u32>,
+    dloc: Vec<u32>,
 }
 
 impl Default for Scratch {
@@ -220,6 +229,11 @@ impl Scratch {
             rtmp: Vec::new(),
             ends: Vec::new(),
             nets: [net_bits(NetWidth::W512), net_bits(NetWidth::W256), net_bits(NetWidth::Auto)],
+            dbase: 0,
+            dshift: 0,
+            dcnt: Vec::new(),
+            dmap: Vec::new(),
+            dloc: Vec::new(),
         }
     }
 
@@ -302,6 +316,16 @@ impl Scratch {
     }
 
     fn lookup(&self, tok: u32) -> Option<u32> {
+        if self.dshift != 0 {
+            // direct mode: the local is the token's low bits inside this partition's range
+            let l = tok.wrapping_sub(self.dbase);
+            if l >> self.dshift != 0 {
+                return None;
+            }
+            // SAFETY: l < 2^dshift = dmap.len() (checked just above).
+            let k = unsafe { *self.dmap.get_unchecked(l as usize) };
+            return if k == EMPTY { None } else { Some(k) };
+        }
         let mask = (1usize << self.tbits) - 1;
         let mut h = self.hash(tok);
         loop {
@@ -565,15 +589,105 @@ fn group_chunks(ev: &[&[u64]], buys: &[[u64; 2]], sc: &mut Scratch, out: &mut Ou
     Ok(np)
 }
 
-/// `sessions` in token mode over the partition's records in pieces (no gather copy).
-pub fn sessions_chunks(ev: &[&[u64]], buys: &[[u64; 2]], kernel: Kernel, sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
+/// `group` for a partition whose person tokens are `base + local`, local < 2^shift (person id =
+/// root token, partition = token >> shift): the table is indexed by the local directly, no hash,
+/// no probe, no index array. Pass 1 per record: token, one xor-or into the range check, one
+/// count; a scan of the 2^shift counts hands out the output indices (present locals ascending);
+/// pass 2: cursor, store. A token outside the range is an error (the run falls back).
+fn group_direct(ev: &[&[u64]], buys: &[[u64; 2]], base: u32, shift: u32, sc: &mut Scratch, out: &mut Out) -> Result<usize, Error> {
+    let size = 1usize << shift;
+    if sc.dcnt.len() != size {
+        sc.dcnt = vec![0; size];
+        sc.dmap = vec![EMPTY; size];
+        sc.dloc.clear();
+    }
+    for &l in &sc.dloc {
+        sc.dmap[l as usize] = EMPTY;
+    }
+    sc.dloc.clear();
+    sc.dbase = base;
+    sc.dshift = shift;
+    let mask = (size - 1) as u32;
+    let n: usize = ev.iter().map(|c| c.len()).sum();
+    let mut acc = 0u32;
+    {
+        let cnt = sc.dcnt.as_mut_ptr();
+        for c in ev {
+            for &r in c.iter() {
+                let tok = (r >> 32) as u32;
+                acc |= tok ^ base;
+                // SAFETY: tok & mask < size = dcnt.len().
+                unsafe { *cnt.add((tok & mask) as usize) += 1 };
+            }
+        }
+    }
+    if acc >> shift != 0 {
+        sc.dcnt.fill(0);
+        sc.dshift = 0;
+        return Err(Error::BadPerson(0));
+    }
+    sc.first.clear();
+    let mut sum = 0u32;
+    for l in 0..size {
+        let c = sc.dcnt[l];
+        if c != 0 {
+            sc.dmap[l] = sc.dloc.len() as u32;
+            sc.dloc.push(l as u32);
+            sc.first.push(sum);
+            sc.dcnt[l] = sum;
+            sum += c;
+        }
+    }
+    let np = sc.dloc.len();
+    out.persons.extend(sc.dloc.iter().map(|&l| base + l));
+    sc.grouped.clear();
+    sc.grouped.reserve(n);
+    {
+        let cur = sc.dcnt.as_mut_ptr();
+        let grouped = sc.grouped.as_mut_ptr();
+        for c in ev {
+            for &r in c.iter() {
+                // SAFETY: the local is masked below size; its cursor runs inside its person's
+                // range of 0..n (prefix sums of the counts, which total n).
+                unsafe {
+                    let at = cur.add(((r >> 32) as u32 & mask) as usize);
+                    *grouped.add(*at as usize) = ts_of(r);
+                    *at += 1;
+                }
+            }
+        }
+        // SAFETY: the cursors cover 0..n exactly once.
+        unsafe { sc.grouped.set_len(n) };
+    }
+    sc.cur.clear();
+    for k in 0..np {
+        let l = sc.dloc[k] as usize;
+        sc.cur.push(sc.dcnt[l]);
+        sc.dcnt[l] = 0;
+    }
+    group_buys(buys, None, np, sc)?;
+    Ok(np)
+}
+
+/// `sessions` in token mode over the partition's records in pieces (no gather copy). With
+/// `direct = Some((base, shift))` the partition's person tokens are base + local, local below
+/// 2^shift, and the grouping indexes by the local (`group_direct`); `Scratch::local_of` /
+/// lookups then answer from that map until the next call.
+pub fn sessions_chunks(ev: &[&[u64]], buys: &[[u64; 2]], kernel: Kernel, direct: Option<(u32, u32)>, sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
     if let Kernel::Radix = kernel {
+        sc.dshift = 0;
         let flat: Vec<u64> = ev.iter().flat_map(|c| c.iter().copied()).collect();
         return sessions(&flat, buys, kernel, None, sc, out);
     }
     out.clear();
     out.buy_session.resize(buys.len(), u32::MAX);
-    let np = group_chunks(ev, buys, sc, out)?;
+    let np = match direct {
+        Some((base, shift)) if (1..=16).contains(&shift) => group_direct(ev, buys, base, shift, sc, out)?,
+        _ => {
+            sc.dshift = 0;
+            group_chunks(ev, buys, sc, out)?
+        }
+    };
     finish(np, buys, kernel, sc, out)
 }
 
@@ -622,7 +736,6 @@ fn person_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out, ends: *mut u32) {
     let mark = !ends.is_null();
     let slots = sc.slots.as_mut_ptr();
     let bits = sc.sbits.as_mut_ptr();
-    let mut summary = 0u64;
     for &t in ts {
         // t < 2^31, so s < NSLOT and s >> 6 < NWORD
         let s = (t / SLOT) as usize;
@@ -636,7 +749,13 @@ fn person_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out, ends: *mut u32) {
             e.cnt += 1;
             *bits.add(s >> 6) |= 1 << (s & 63);
         }
-        summary |= 1 << (s >> 6);
+    }
+    // Words with an occupied slot, from the bitmap (persons here have over 128 events, so a scan
+    // of the NWORD words is cheaper than a summary bit per event).
+    let mut summary = 0u64;
+    for w in 0..NWORD {
+        // SAFETY: w < NWORD.
+        summary |= u64::from(unsafe { *bits.add(w) } != 0) << w;
     }
     let serial = sc.serial;
     let sid = sc.sid.as_mut_ptr();
@@ -826,6 +945,7 @@ pub fn sessions_counted(ev: &[u64], buys: &[[u64; 2]], kernel: Kernel, counts: &
     }
     out.clear();
     out.buy_session.resize(buys.len(), u32::MAX);
+    sc.dshift = 0;
     let np = group_with(ev, buys, Some(counts.len()), Some(counts), true, sc, out)?;
     finish(np, buys, kernel, sc, out)
 }
@@ -841,6 +961,7 @@ pub fn sessions(
 ) -> Result<(), Error> {
     out.clear();
     out.buy_session.resize(buys.len(), u32::MAX);
+    sc.dshift = 0;
     if let Kernel::Radix = kernel {
         return radix_partition(ev, buys, dense, sc, out);
     }
@@ -1023,20 +1144,36 @@ fn radix_partition(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, sc: &mut
 unsafe fn net_partition<L: net::Lanes>(np: usize, max: usize, buys: &[[u64; 2]], sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
     let grouped = std::mem::take(&mut sc.grouped);
     let bj = std::mem::take(&mut sc.bgrouped);
+    let n = grouped.len();
+    // One reservation for the partition (sessions <= events; W lanes of slack for the widest
+    // masked store), so the per-person paths never check capacity; `ends` sized once when
+    // any person has purchases.
+    out.start.reserve(n + 64);
+    out.events.reserve(n + 64);
+    out.sess_end.reserve(np);
+    let any_buys = !bj.is_empty();
+    if any_buys && sc.ends.len() < n + 64 {
+        sc.ends.resize(n + 64, 0);
+    }
+    let ends_all = if any_buys { sc.ends.as_mut_ptr() } else { core::ptr::null_mut() };
+    // The per-person bounds, as locals (nothing reloaded through `sc` in the loop).
+    let (first, cur, bfirst, bcur) = (core::mem::take(&mut sc.first), core::mem::take(&mut sc.cur), core::mem::take(&mut sc.bfirst), core::mem::take(&mut sc.bcur));
     let mut res = Ok(());
+    let se = out.sess_end.as_mut_ptr();
+    let mut np_done = 0usize;
     for p in 0..np {
-        let (a, z) = (sc.first[p] as usize, sc.cur[p] as usize);
-        let (ba, bz) = (sc.bfirst[p] as usize, sc.bcur[p] as usize);
+        let (a, z) = (*first.get_unchecked(p) as usize, *cur.get_unchecked(p) as usize);
+        let (ba, bz) = (*bfirst.get_unchecked(p) as usize, *bcur.get_unchecked(p) as usize);
         if a < z {
-            let ts = &grouped[a..z];
+            let ts = grouped.get_unchecked(a..z);
             let s0 = out.start.len();
-            let ends = sc.ends_for(s0, ts.len(), ba < bz);
+            let ends = if ba < bz { ends_all } else { core::ptr::null_mut() };
             if ts.len() <= max {
                 // SAFETY: 1 <= ts.len() <= max <= MAX_N; L's features (caller); ts < 2^31 (31-bit
-                // field); `ends` null or with room for s0 + ts.len() entries (ends_for).
+                // field); room for s0 + ts.len() sessions in start/events/ends (reserved above).
                 net::person_net_inl::<L>(ts, out, ends);
                 if ba < bz {
-                    if let Err(e) = buys_by_start(&bj[ba..bz], buys, s0, out, &sc.ends) {
+                    if let Err(e) = buys_by_start(bj.get_unchecked(ba..bz), buys, s0, out, &sc.ends) {
                         res = Err(e);
                         break;
                     }
@@ -1045,7 +1182,7 @@ unsafe fn net_partition<L: net::Lanes>(np: usize, max: usize, buys: &[[u64; 2]],
                 sc.next_serial();
                 person_slots(ts, sc, out, ends);
                 if ba < bz {
-                    if let Err(e) = buys_by_slot(&bj[ba..bz], buys, sc, out) {
+                    if let Err(e) = buys_by_slot(bj.get_unchecked(ba..bz), buys, sc, out) {
                         res = Err(e);
                         break;
                     }
@@ -1055,8 +1192,15 @@ unsafe fn net_partition<L: net::Lanes>(np: usize, max: usize, buys: &[[u64; 2]],
             res = Err(Error::BuyWithoutPerson(bj[ba] as usize));
             break;
         }
-        out.sess_end.push(out.start.len() as u32);
+        // SAFETY: np entries reserved above.
+        *se.add(p) = out.start.len() as u32;
+        np_done = p + 1;
     }
+    out.sess_end.set_len(out.sess_end.len() + np_done);
+    sc.first = first;
+    sc.cur = cur;
+    sc.bfirst = bfirst;
+    sc.bcur = bcur;
     sc.grouped = grouped;
     sc.bgrouped = bj;
     res

@@ -1,6 +1,6 @@
 //! The v3 sink, one per parser worker: user tokens for every batch (probes batched), event
 //! records into move-1 partitions by a mix of the event key (purchases as side records in the same
-//! bins), clicks and link edges appended flat, and every rare line (locator) read exactly and turned into the
+//! bins), link edges appended flat (clicks go to `ClickSink`, after dedup), and every rare line (locator) read exactly and turned into the
 //! same records or into a "special" record that carries its ingest in milliseconds.
 //!
 //! Record shapes (all u64 words):
@@ -10,9 +10,7 @@
 //!   clear); buy = category | price << 8 (price below 2^24: a larger one reaching the sink sets
 //!   `bad`, a fallback, never a wrap)
 //! - LONG purchase, in the LONG bins [a, b, ingest, buy | PURCHASE_SIDE]
-//! - click [w0, w1]: w0 = token | ts << 32 (ts since window_start - 7 days); w1 = locator (48 bits:
-//!   file 12, offset 36) | campaign << 48
-//! - edge: token_a | token_b << 32
+//! - edge: two consecutive words, token of side a, token of side b
 
 use parselab::reference::{click_line, event_line};
 use parselab::{ClickBatch, Ctx, Dataset, EvBatch, LinkBatch, Locator, Sink, Stream};
@@ -56,25 +54,23 @@ pub fn part_of(a: u64, b: u64, bits: u32) -> usize {
 /// partitions every purchase push missed on its own front.
 pub const PURCHASE_SIDE: u64 = 1 << 62;
 
-/// Lookups are resolved this many records after they start, so the prefetch has time to land.
-const RING: usize = 64;
-
 /// Event lookups prefetch shared: they are mostly hits, and a line taken for writing is taken
 /// away from every other core that reads it. Links and clicks bring most new IDs: for writing.
 const EVENT_PREFETCH_W: bool = false;
 
-/// A started lookup and the word its token goes into (clicks and links: the record is already in
-/// its bin, a sequential one, so its line is still cached when the token is OR-ed in).
-#[derive(Clone, Copy)]
-struct Pend {
-    user: Pending,
-    at: *mut u64,
-}
+/// Link batches wait here, LD deep: each copied whole on arrival, both sides' home slots computed
+/// and prefetched for writing (links bring most new IDs). The oldest is resolved when the ring is
+/// full, in three passes: every side found with loads only; the sides not found inserted in one
+/// burst (each insert's locked compare-exchange waits for all older stores, so none are left
+/// pending); the batch's edge words written once, complete.
+const LD: usize = 4;
 
-impl Default for Pend {
-    fn default() -> Self {
-        Pend { user: Pending::default(), at: std::ptr::null_mut() }
-    }
+struct LinkRing {
+    b: [LinkBatch; LD],
+    /// Home slots: side a of lane k at 2 k, side b at 2 k + 1.
+    slot: [[u32; 16]; LD],
+    head: usize,
+    n: usize,
 }
 
 /// Event batches wait here, D deep: each batch is copied whole on arrival and its users' home
@@ -135,7 +131,6 @@ pub struct V3Sink<'a, 'b> {
     pub long: Bins<[u64; 4]>,
     pub pshort: Bins<[u64; 2]>,
     pub plong: Bins<[u64; 4]>,
-    pub clicks: Bins<[u64; 2]>,
     pub edges: Bins<u64>,
     pub special: Vec<Special<'a>>,
     pub bad: bool,
@@ -143,11 +138,7 @@ pub struct V3Sink<'a, 'b> {
     /// batches, 2 skips the token lookups of events, 3 skips their bin writes.
     mode: u8,
     mbits: u32,
-    /// Heap word for mode 3's tokens (stays put when the sink moves).
-    scratch: Box<u64>,
-    ring: Box<[Pend; RING]>,
-    ring_n: usize,
-    ring_at: usize,
+    lnk: Box<LinkRing>,
     evr: Box<EvRing>,
     /// 2^13 partitions or more: the grouped path (blocks of G staged records), no next-line
     /// prefetch on the event bins; below, the ring of D batches with it (see `new`).
@@ -179,16 +170,12 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             // Empty: purchases go into the event bins (PURCHASE_SIDE); dedup still takes these.
             pshort: Bins::from_blocks(parts, &B256, w),
             plong: Bins::from_blocks(parts, &B256, w),
-            clicks: Bins::from_blocks(1, &B2M, w),
             edges: Bins::from_blocks(1, &B2M, w),
             special: Vec::new(),
             bad: false,
             mode: if cfg!(feature = "measure") { std::env::var("ENGINE_SINK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 },
-            scratch: Box::new(0),
             mbits: std::env::var("ENGINE_SINK_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(bits).min(bits),
-            ring: Box::new([Pend::default(); RING]),
-            ring_n: 0,
-            ring_at: 0,
+            lnk: Box::new(LinkRing { b: [LinkBatch::default(); LD], slot: [[0; 16]; LD], head: 0, n: 0 }),
             big: bits >= BIG_BITS,
             grp: Box::new(Groups { blk: [[EvPend::default(); G]; 2], cur: 0, n: [0; 2] }),
             evr: Box::new(EvRing { b: [EvBatch::default(); D], slot: [[0; 8]; D], head: 0, n: 0 }),
@@ -277,40 +264,47 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         *bad |= nb;
     }
 
-    /// Starts a lookup whose token is to be OR-ed into `*at` (bits 0-31) later (prefetched for
-    /// writing when `W`).
+    /// Resolves link ring entry `j`: finds (loads only), then the inserts in one burst, then the
+    /// complete edge words (side a, side b), in lane order.
     #[inline(always)]
-    fn defer<const W: bool>(&mut self, user: Pending, at: *mut u64) {
-        let p = Pend { user: self.tok.start_hint::<W>(user.long, user.a, user.b), at };
-        if self.ring_n == RING {
-            self.resolve(self.ring_at);
-            self.ring[self.ring_at] = p;
-            self.ring_at = (self.ring_at + 1) % RING;
-        } else {
-            self.ring[(self.ring_at + self.ring_n) % RING] = p;
-            self.ring_n += 1;
+    fn resolve_links(&mut self, j: usize) {
+        let V3Sink { tok, lnk, edges, bad, .. } = self;
+        let b = &lnk.b[j];
+        let sl = &lnk.slot[j];
+        let n = b.n as usize;
+        let mut t = [NO_TOKEN; 16];
+        let side = |i: usize| -> Pending {
+            let k = i >> 1;
+            if i & 1 == 0 {
+                Pending { long: b.a_long >> k & 1 != 0, a: b.a_a[k], b: b.a_b[k], slot: sl[i] as usize }
+            } else {
+                Pending { long: b.b_long >> k & 1 != 0, a: b.b_a[k], b: b.b_b[k], slot: sl[i] as usize }
+            }
+        };
+        for i in 0..2 * n {
+            t[i] = tok.find(&side(i));
         }
-    }
-
-    #[inline(always)]
-    fn resolve(&mut self, i: usize) {
-        let p = self.ring[i];
-        let t = self.tok.finish(&p.user);
-        if t == NO_TOKEN {
-            self.bad = true;
+        let mut nb = false;
+        for i in 0..2 * n {
+            if t[i] == NO_TOKEN {
+                t[i] = tok.finish(&side(i));
+                nb |= t[i] == NO_TOKEN;
+            }
         }
-        // SAFETY: `at` points at a word of a record in this sink's bins (or at `scratch`); chunks
-        // never move.
-        unsafe { *p.at |= u64::from(t) };
+        for &x in &t[..2 * n] {
+            edges.push(0, u64::from(x));
+        }
+        *bad |= nb;
     }
 
     /// Resolves every pending lookup. Call after the last delivery of a phase.
     pub fn drain(&mut self) {
-        for k in 0..self.ring_n {
-            self.resolve((self.ring_at + k) % RING);
+        let first = (self.lnk.head + LD - self.lnk.n) % LD;
+        for k in 0..self.lnk.n {
+            self.resolve_links((first + k) % LD);
         }
-        self.ring_n = 0;
-        self.ring_at = 0;
+        self.lnk.n = 0;
+        self.lnk.head = 0;
         let r = &mut *self.evr;
         let first = (r.head + D - r.n) % D;
         for k in 0..r.n {
@@ -329,12 +323,10 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         self.long.finish();
         self.pshort.finish();
         self.plong.finish();
-        self.clicks.finish();
         self.edges.finish();
     }
 
-    /// ENGINE_SINK=1: nothing; 2: records without token lookups; 3: lookups without records
-    /// (tokens OR-ed into a scratch word); 4: only the per-lane field work. ENGINE_SINK_BITS lowers the partition bits of mode 2.
+    /// ENGINE_SINK=1: nothing; 2: records without token lookups; 4: only the per-lane field work. ENGINE_SINK_BITS lowers the partition bits of mode 2.
     #[cold]
     #[inline(never)]
     fn events_measure(&mut self, b: &EvBatch) {
@@ -344,7 +336,6 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             return;
         }
         let bits = self.mbits;
-        let scratch: *mut u64 = &mut *self.scratch;
         for k in 0..n {
             let surv = b.surv >> k & 1 != 0;
             let ing = u64::from(b.ingest[k]);
@@ -354,13 +345,6 @@ impl<'a, 'b> V3Sink<'a, 'b> {
                 let a = b.ev_a[k];
                 let bb = if b.ev_long >> k & 1 == 0 { 0 } else { b.ev_b[k] };
                 std::hint::black_box((part_of(a, bb, bits), ing, w1, b.user_a[k] ^ b.user_b[k].rotate_left(29)));
-                continue;
-            }
-            if self.mode == 3 {
-                if surv {
-                    let user = Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: 0 };
-                    self.defer::<EVENT_PREFETCH_W>(user, scratch);
-                }
                 continue;
             }
             if b.ev_long >> k & 1 == 0 {
@@ -406,8 +390,12 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         let b = &r.b[i];
         let n = b.n as usize;
         let notab = cfg!(feature = "measure") && self.mode == 5;
-        for k in 0..n {
-            r.slot[i][k] = if notab { (b.user_a[k] ^ b.user_b[k]) as u32 & 0xff_ffff } else { self.tok.home(b.user_long >> k & 1 != 0, b.user_a[k], b.user_b[k]) };
+        if notab {
+            for k in 0..n {
+                r.slot[i][k] = (b.user_a[k] ^ b.user_b[k]) as u32 & 0xff_ffff;
+            }
+        } else {
+            self.tok.homes8::<false>(b.user_long, &b.user_a, &b.user_b, n, &mut r.slot[i]);
         }
         r.head = (i + 1) % D;
         r.n += 1;
@@ -417,6 +405,9 @@ impl<'a, 'b> V3Sink<'a, 'b> {
     #[inline(never)]
     fn events_grouped(&mut self, b: &EvBatch) {
         let n = b.n as usize;
+        // all lanes' home slots at once (a dead copy's is unused: one spare prefetch)
+        let mut home = [0u32; 8];
+        self.tok.homes8::<EVENT_PREFETCH_W>(b.user_long, &b.user_a, &b.user_b, n, &mut home);
         for k in 0..n {
             let surv = b.surv >> k & 1 != 0;
             let purch = surv && b.purch >> k & 1 != 0;
@@ -443,7 +434,7 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             let w: [u64; 4] = if ev_long { [a, bb, ing | (u64::from(surv) << 63), w1] } else { [a | (ing << 40) | (u64::from(surv) << 63), w1, 0, 0] };
             if surv {
                 let ul = b.user_long >> k & 1 != 0;
-                let slot = self.tok.start_hint::<EVENT_PREFETCH_W>(ul, b.user_a[k], b.user_b[k]).slot;
+                let slot = home[k] as usize;
                 self.group(EvPend { ua: b.user_a[k], ub: b.user_b[k], slot, w, part: p as u32, flags: u32::from(ul) | (u32::from(ev_long) << 1) });
             } else if ev_long {
                 // A dead copy only shadows: its key, ingest and dead bit; no token needed.
@@ -468,35 +459,28 @@ impl<'a> Sink for V3Sink<'a, '_> {
         if self.big { self.events_grouped(b) } else { self.events_ring(b) }
     }
 
-    #[inline]
-    fn clicks(&mut self, b: &ClickBatch) {
-        let n = b.n as usize;
-        // The appends' lines, owned before they are written: an insert's lock cmpxchg waits for
-        // every older store, and a store to a line not yet owned held it ~100 cycles.
-        self.clicks.prefetch_ahead(0, 512);
-        self.clicks.prefetch_ahead(0, 576);
-        for k in 0..n {
-            if b.loc[k] >> 48 != 0 {
-                self.bad = true;
-            }
-            let r = self.clicks.push_at(0, [u64::from(b.ts[k]) << 32, b.loc[k] | (u64::from(b.campaign[k]) << 48)]);
-            self.defer::<true>(Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: 0 }, r as *mut u64);
-        }
+    /// Clicks are parsed after dedup by `ClickSink`.
+    fn clicks(&mut self, _: &ClickBatch) {
+        self.bad = true;
     }
 
     #[inline]
     fn links(&mut self, b: &LinkBatch) {
-        let n = b.n as usize;
-        // As in `clicks`: 44% of this function's cycles sat on the insert CAS, waiting for stores.
-        self.edges.prefetch_ahead(0, 512);
-        self.edges.prefetch_ahead(0, 576);
-        for k in 0..n {
-            let r = self.edges.push_at(0, 0);
-            self.defer::<true>(Pending { long: b.a_long >> k & 1 != 0, a: b.a_a[k], b: b.a_b[k], slot: 0 }, r);
-            // The second side's token goes into the high half: resolve it through a shifted word.
-            let r2 = self.edges.push_at(0, 0);
-            self.defer::<true>(Pending { long: b.b_long >> k & 1 != 0, a: b.b_a[k], b: b.b_b[k], slot: 0 }, r2);
+        let i = self.lnk.head;
+        if self.lnk.n == LD {
+            self.resolve_links(i);
+        } else {
+            self.lnk.n += 1;
         }
+        // The appends' lines, owned before they are written.
+        self.edges.prefetch_ahead(0, 512);
+        let l = &mut *self.lnk;
+        l.b[i] = *b;
+        for k in 0..b.n as usize {
+            l.slot[i][2 * k] = self.tok.start_hint::<true>(b.a_long >> k & 1 != 0, b.a_a[k], b.a_b[k]).slot as u32;
+            l.slot[i][2 * k + 1] = self.tok.start_hint::<true>(b.b_long >> k & 1 != 0, b.b_a[k], b.b_b[k]).slot as u32;
+        }
+        l.head = (i + 1) % LD;
     }
 
     fn foreign_event(&mut self, at: Locator) {
@@ -527,19 +511,8 @@ impl<'a> Sink for V3Sink<'a, '_> {
         });
     }
 
-    fn foreign_click(&mut self, at: Locator) {
-        let line = self.ds.line(Stream::Clicks, at);
-        let mut fields = Vec::with_capacity(8);
-        let Some(c) = click_line(self.ctx, line, &mut fields) else {
-            self.bad = true;
-            return;
-        };
-        let token = self.user_token(c.user_id);
-        let ts = (c.ts - self.ctx.click_base_ms) as u64;
-        if at.0 >> 48 != 0 {
-            self.bad = true;
-        }
-        self.clicks.push(0, [u64::from(token) | (ts << 32), at.0 | (u64::from(c.campaign) << 48)]);
+    fn foreign_click(&mut self, _: Locator) {
+        self.bad = true;
     }
 
     fn foreign_link(&mut self, at: Locator) {
@@ -570,6 +543,8 @@ pub struct ClickSink<'a, 'b> {
     pub bad: bool,
     pub dropped: u64,
     pbits: u32,
+    /// Person partition = person token >> pshift (as Move2::part).
+    pshift: u32,
     /// Lookups started: [block being filled, block waiting for its token lines].
     blk: Box<[[ClickPend; CG]; 2]>,
     cur: usize,
@@ -591,7 +566,7 @@ struct ClickPend {
 impl<'a, 'b> ClickSink<'a, 'b> {
     /// `w`: the pool participant index (the person partitions' chunks are B8K blocks under it:
     /// region memory, not 512 KB allocator blocks on 4 KB pages, which cost 20K faults).
-    pub fn new(tok: &'b Tokens<'a>, people: &'b People, ds: &'a Dataset, ctx: &'b Ctx, pbits: u32, w: usize) -> Self {
+    pub fn new(tok: &'b Tokens<'a>, people: &'b People, ds: &'a Dataset, ctx: &'b Ctx, pbits: u32, pshift: u32, w: usize) -> Self {
         ClickSink {
             tok,
             people,
@@ -601,6 +576,7 @@ impl<'a, 'b> ClickSink<'a, 'b> {
             bad: false,
             dropped: 0,
             pbits,
+            pshift,
             blk: Box::new([[ClickPend::default(); CG]; 2]),
             cur: 0,
             n: [0; 2],
@@ -611,22 +587,46 @@ impl<'a, 'b> ClickSink<'a, 'b> {
 
     #[inline(always)]
     fn part(&self, person: u32) -> usize {
-        (mix(u64::from(person) | 0xabcd_0000_0000_0000) >> (64 - self.pbits)) as usize
+        // Masked to the bins (a token past the driver's capacity would set `bad` in push_person).
+        ((person >> self.pshift) as usize) & ((1 << self.pbits) - 1)
     }
 
     #[inline(always)]
-    fn push_person(&mut self, t: u32, ts: u64, w1: u64) {
-        let person = self.people.person_of(t);
+    fn push_person(&mut self, person: u32, ts: u64, w1: u64) {
+        self.bad |= (person >> self.pshift) >> self.pbits != 0;
         let p = self.part(person);
         self.bins.push(p, [(u64::from(person) << 32) | ts, w1]);
     }
 
-    /// Pushes the ready block, then resolves block `k` into the ready block.
+    /// Pushes the ready block, then resolves block `k`: with persons stamped in the user table, a
+    /// find's line holds the person too and the click is written at once; else into the ready
+    /// block, its person-map line prefetched.
     #[inline(always)]
     fn advance(&mut self, k: usize) {
         for i in 0..self.nready {
             let (t, ts, w1) = self.ready[i];
-            self.push_person(t, ts, w1);
+            let person = self.people.person_of(t);
+            self.push_person(person, ts, w1);
+        }
+        self.nready = 0;
+        if self.tok.stamped() {
+            let mut lost = 0;
+            for i in 0..self.n[k] {
+                let c = self.blk[k][i];
+                let t = self.tok.find(&c.user);
+                if t == NO_TOKEN {
+                    lost += 1;
+                    continue;
+                }
+                let person = match self.tok.person_at(t) {
+                    Some(p) => p,
+                    None => self.people.person_of(t),
+                };
+                self.push_person(person, c.ts, c.w1);
+            }
+            self.dropped += lost;
+            self.n[k] = 0;
+            return;
         }
         let mut r = 0;
         for i in 0..self.n[k] {
@@ -704,6 +704,7 @@ impl<'a> Sink for ClickSink<'a, '_> {
             return;
         }
         let ts = (c.ts - self.ctx.click_base_ms) as u64;
-        self.push_person(t, ts, at.0 | (u64::from(c.campaign) << 48));
+        let person = self.people.person_of(t);
+        self.push_person(person, ts, at.0 | (u64::from(c.campaign) << 48));
     }
 }

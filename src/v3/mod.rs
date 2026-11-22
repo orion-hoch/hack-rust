@@ -378,7 +378,13 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let est_surv = est_events;
     // Move-2 (person) partitions: likewise one bit coarser, at most 2^11 (swept with move 1).
     let p2_raw = (est_surv / 24_000).max(1).next_power_of_two().trailing_zeros();
-    let p2_bits = p2_raw.saturating_sub(1).min(11).clamp(4, 13);
+    let p2_want = p2_raw.saturating_sub(1).min(11).clamp(4, 13);
+    // Person partitions are token ranges of 2^pshift tokens (at most 2^13: the session stage's
+    // per-partition tables), about 2^p2_want of them; p2_bits covers every range.
+    let cap = tok.capacity().max(2);
+    let cbits = usize::BITS - (cap - 1).leading_zeros();
+    let pshift = cbits.saturating_sub(p2_want).min(13);
+    let p2_bits = (((cap - 1) >> pshift) + 1).next_power_of_two().trailing_zeros();
     let cx3 = Ctx3 { people: &people, ingest_base_ms: ctx.ingest_base_s * 1000 };
     let sinks_ref = &sinks;
     let spec_ref = &spec_by_part;
@@ -392,10 +398,10 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         |w| {
             (
                 Tables::new((typical_short.min(max_short) * 3 / 2).next_power_of_two().max(16), (typical_long.min(max_long) * 3 / 2).next_power_of_two().max(16)),
-                Move2::new_in(p2_bits, est_surv / threads.max(1), w),
+                Move2::new_in(p2_bits, est_surv / threads.max(1), w, pshift),
                 0usize,
                 None::<Abort>,
-                ClickSink::new(&tok, &people, &ds, &ctx, p2_bits, w),
+                ClickSink::new(&tok, &people, &ds, &ctx, p2_bits, pshift, w),
             )
         },
         |(t, m2, n, err, cs), i| {
@@ -465,7 +471,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         campaigns: campaigns_with_organic,
         organic,
     };
-    let pcx = PeopleCtx { ds: &ds, tok: &tok, kernel, walk, day0: day0 as i32 };
+    let pcx = PeopleCtx { ds: &ds, tok: &tok, kernel, walk, day0: day0 as i32, shift: pshift };
     let (m2s_ref, ck_ref) = (&m2s, &ck_parts);
     // Each worker writes its own user_daily file as soon as the queue is empty for it, while the
     // others finish their partitions (no write stage for these rows).
@@ -490,7 +496,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             let ev: Vec<&[u64]> = m2s_ref.iter().flat_map(|m| m.ev.slices(q)).collect();
             let buys: Vec<&[[u64; 2]]> = m2s_ref.iter().flat_map(|m| m.buys.slices(q)).collect();
             let cl: Vec<&[[u64; 2]]> = ck_ref.iter().flat_map(|b| b.slices(q)).collect();
-            w.partition(&ev, &buys, &cl, &pcx);
+            w.partition(&ev, &buys, &cl, &pcx, q);
             // A file per ROWS_PER_FILE rows, written by the worker as it goes, so that at the end
             // of the stage only each worker's remainder is left to write.
             if !w.bad && w.write_err.is_none() && w.rows.len() >= ROWS_PER_FILE {
