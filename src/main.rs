@@ -374,7 +374,36 @@ fn clear_outputs(out: &std::path::Path) {
     }
 }
 
+/// PROBE 4 (not for the trunk): when the engine started.
+static PROBE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// PROBE 4 (not for the trunk): reports three facts about this run on the scorer through the
+/// run time: the process sleeps until 2.0 s after its start plus 40 ms x code, where
+/// code = A + 20 B + 120 C; A = kernel CPU time in tenths of a second (0 to 19); B = idle share
+/// of the workers over the engine's run in steps of 6% (0 to 5); C = page faults that needed the
+/// disk (0 none, 1 under 1,000, 2 more).
+fn probe4(threads: usize, say: bool) {
+    let Some(&t0) = PROBE_T0.get() else { return };
+    let wall = t0.elapsed().as_secs_f64();
+    let (u, s, _minor, major) = v3::usage();
+    let cpu = (u + s) / 1e3;
+    let idle = (1.0 - cpu / (threads.max(1) as f64 * wall)).clamp(0.0, 1.0);
+    let a = ((s / 1e3) / 0.1).floor().clamp(0.0, 19.0) as u64;
+    let b = ((idle * 100.0) / 6.0).floor().clamp(0.0, 5.0) as u64;
+    let c: u64 = if major <= 0 { 0 } else if major < 1000 { 1 } else { 2 };
+    let code = a + 20 * b + 120 * c;
+    if say {
+        eprintln!("probe4: wall {wall:.3} s user {:.3} s sys {:.3} s idle {:.1}% major faults {major}: A {a} B {b} C {c} code {code}", u / 1e3, s / 1e3, idle * 100.0);
+    }
+    let target = 2.0 + code as f64 * 0.04;
+    let now = t0.elapsed().as_secs_f64();
+    if target > now {
+        std::thread::sleep(std::time::Duration::from_secs_f64(target - now));
+    }
+}
+
 fn main() {
+    let _ = PROBE_T0.set(std::time::Instant::now());
     v4::lap("main");
     // First, while single-threaded: grow the descriptor table (growing it once threads share it
     // waits an RCU grace period, 11 to 22 ms measured on the x86 box) and start the stage clock.
@@ -432,6 +461,7 @@ fn main() {
             // Done: release input, regions and tables on the engine's own pool (madvise, no
             // allocation), then exit_group at once: no destructors, no second pool.
             Ok(fast::Outcome::Done) => {
+                probe4(cfg.threads, cfg.timing);
                 let plan = rt::exit::plan(64 << 20);
                 crate::par::run(cfg.threads, plan.tasks(), |_| (), |_, t| plan.run(t));
                 rt::sys::exit_group(0)

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use parselab::{ClickBatch, Dataset, EvBatch, LinkBatch, Locator, Sink, Stream};
 
-use crate::fast::names::order_key;
+use crate::fast::names::POW36;
 use crate::v3::ids::{Key, classify, long_bytes, short_bytes};
 
 use super::keys::{intern, long_hash, mix40, unmix40, FOREIGN_MAX};
@@ -44,6 +44,16 @@ fn long_okey(a: u64) -> u64 {
         x = x * 36 + ((a >> (60 - 4 * i)) & 15);
     }
     (x << 4) | 9
+}
+
+/// `names::order_key` for x < 2^40, counting the digits down from 8 (nearly every id has 8).
+#[inline(always)]
+fn okey40(x: u64) -> u64 {
+    let mut len = 8usize;
+    while len > 1 && x < POW36[len - 1] {
+        len -= 1;
+    }
+    ((x * POW36[8 - len]) << 4) | len as u64
 }
 
 #[inline(always)]
@@ -249,60 +259,62 @@ impl Nodes {
     }
 }
 
-/// A small open-addressing table of one partition's users: key (nonzero) -> node.
+/// A small open-addressing table of one partition's users: key (nonzero) -> node. It is never
+/// cleared: nodes are numbered in partition order, so an entry whose node is below the current
+/// partition's first node is stale and reads as an empty slot.
 struct Small {
-    key: Vec<u64>,
-    node: Vec<u32>,
+    slot: Vec<Slot>,
     mask: usize,
-    /// Slots filled since the last clear (only those are reset).
-    used: Vec<u32>,
+}
+
+/// `n` is the node + 1 (0: never used).
+#[derive(Clone, Copy)]
+struct Slot {
+    k: u64,
+    n: u32,
 }
 
 impl Small {
     fn new(cap: usize) -> Small {
         let n = (2 * cap).next_power_of_two().max(64);
-        Small { key: vec![0; n], node: vec![0; n], mask: n - 1, used: Vec::with_capacity(cap) }
+        Small { slot: vec![Slot { k: 0, n: 0 }; n], mask: n - 1 }
     }
 
-    fn clear(&mut self) {
-        for &i in &self.used {
-            self.key[i as usize] = 0;
-        }
-        self.used.clear();
-    }
-
-    /// The node of `k` (k != 0; `h` its hash), or `fresh()` stored for it.
+    /// The node of `k` (`h` its hash) among the entries of nodes >= `base`, or `fresh()` stored for it.
     #[inline(always)]
-    fn get(&mut self, k: u64, h: u64, fresh: impl FnOnce() -> u32) -> u32 {
+    fn get(&mut self, k: u64, h: u64, base: u32, fresh: impl FnOnce() -> u32) -> u32 {
         let mut i = h as usize & self.mask;
         loop {
-            let c = self.key[i];
-            if c == k {
-                return self.node[i];
-            }
-            if c == 0 {
+            let s = &mut self.slot[i];
+            if s.n <= base {
                 let n = fresh();
-                self.key[i] = k;
-                self.node[i] = n;
-                self.used.push(i as u32);
+                *s = Slot { k, n: n + 1 };
                 return n;
+            }
+            if s.k == k {
+                return s.n - 1;
             }
             i = (i + 1) & self.mask;
         }
     }
 }
 
-/// Root of `x` with path halving.
+/// Root of `x` with path halving. Every node index in `uf` is below its length (nodes are only
+/// ever pushed, and parents are nodes).
 #[inline(always)]
 fn find(uf: &mut [Uf], mut x: u32) -> u32 {
+    let p = uf.as_mut_ptr();
     loop {
-        let p = uf[x as usize].parent;
-        if p == x {
-            return x;
+        // SAFETY: x and every parent are < uf.len().
+        unsafe {
+            let px = (*p.add(x as usize)).parent;
+            if px == x {
+                return x;
+            }
+            let g = (*p.add(px as usize)).parent;
+            (*p.add(x as usize)).parent = g;
+            x = g;
         }
-        let g = uf[p as usize].parent;
-        uf[x as usize].parent = g;
-        x = g;
     }
 }
 
@@ -346,6 +358,11 @@ struct Spent {
     sub: [f64; 4],
 }
 
+#[cfg(test)]
+fn stop() -> u32 {
+    std::env::var("LNK_STOP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 /// Steps 2 to 4 over every task's grouped ends (each end's record is overwritten with its node).
 fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
     let t0 = std::time::Instant::now();
@@ -383,39 +400,36 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
     for q in 0..parts {
         let tq = tsc();
         sbase[q] = nd.uf.len() as u32;
-        tab.clear();
         for te in tasks.iter_mut() {
             for r in &mut te.short[te.soff[q] as usize..te.soff[q + 1] as usize] {
                 let mu = *r >> 24;
                 // ru + 1: nonzero, and the partition's users are told apart by ru alone.
-                let id = tab.get((mu & rmask) + 1, mu, || nd.push(order_key(unmix40(mu)), mu));
+                let id = tab.get((mu & rmask) + 1, mu, sbase[q], || nd.push(okey40(unmix40(mu)), mu));
                 *r = (*r & tag) | (u64::from(id) << 24);
             }
         }
         let tw = tsc();
         t_s += tw - tq;
         wbase[q] = nd.uf.len() as u32;
-        tab.clear();
         for te in tasks.iter_mut() {
             for w in &mut te.wide[te.woff[q] as usize..te.woff[q + 1] as usize] {
                 let (a, b, kind) = (w[0], w[1], w[2] >> 62);
                 // Wide users of one partition: hashed by their key, told apart by comparing it.
                 let h = mix40(a ^ b.rotate_left(17)) | 1;
+                let base = wbase[q];
                 let mut i = h as usize & tab.mask;
                 let id = loop {
-                    let c = tab.key[i];
-                    if c == 0 {
+                    let c = tab.slot[i];
+                    if c.n <= base {
                         let okey = if kind == KIND_LONG { long_okey(a) } else { OKEY_FOREIGN };
                         let widx = nd.wkey.len() as u64;
                         nd.wkey.push([a, b]);
                         let id = nd.push(okey, WIDE | (kind << 61) | (widx << WIDX_SHIFT) | q as u64);
-                        tab.key[i] = h;
-                        tab.node[i] = id;
-                        tab.used.push(i as u32);
+                        tab.slot[i] = Slot { k: h, n: id + 1 };
                         break id;
                     }
-                    if c == h {
-                        let n = tab.node[i];
+                    if c.k == h {
+                        let n = c.n - 1;
                         let p = nd.place[n as usize];
                         if nd.wkey[((p & !(7 << 61)) >> WIDX_SHIFT) as usize] == [a, b] {
                             break n;
@@ -427,6 +441,10 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
             }
         }
         t_w += tsc() - tw;
+    }
+    #[cfg(test)]
+    if stop() == 1 {
+        return Links::default();
     }
     let tp2 = std::time::Instant::now();
     let c1 = tsc();
@@ -443,18 +461,26 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
             en[(eb + (w[2] & tag)) as usize] = w[0] as u32;
         }
     }
+    #[cfg(test)]
+    if stop() == 2 {
+        return Links::default();
+    }
     sbase[parts] = nd.uf.len() as u32;
     wbase[parts] = nd.uf.len() as u32;
     let t1 = std::time::Instant::now();
     sp.sub = [(ta - t0).as_secs_f64() * 1e3, pass1_ms * t_s as f64 / cyc, pass1_ms * t_w as f64 / cyc, (t1 - tp2).as_secs_f64() * 1e3];
     // Union-find, the smaller id's node the root.
     let n = nd.uf.len();
-    for j in 0..lines as usize {
-        if j + AHEAD < lines as usize {
-            prefetch(&nd.uf[en[2 * (j + AHEAD)] as usize]);
-            prefetch(&nd.uf[en[2 * (j + AHEAD) + 1] as usize]);
+    let nl = lines as usize;
+    let ufp = nd.uf.as_ptr();
+    for j in 0..nl {
+        if j + AHEAD < nl {
+            // SAFETY: every en entry is a node < n; prefetch never faults.
+            prefetch(unsafe { ufp.add(*en.get_unchecked(2 * (j + AHEAD)) as usize) });
+            prefetch(unsafe { ufp.add(*en.get_unchecked(2 * (j + AHEAD) + 1) as usize) });
         }
-        let (ra, rb) = (find(&mut nd.uf, en[2 * j]), find(&mut nd.uf, en[2 * j + 1]));
+        let (ea, eb) = (en[2 * j], en[2 * j + 1]);
+        let (ra, rb) = (find(&mut nd.uf, ea), find(&mut nd.uf, eb));
         if ra != rb {
             if nd.less(ra, rb) {
                 nd.uf[rb as usize].parent = ra;
@@ -464,15 +490,9 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
         }
     }
     drop(en);
-    let mut persons = 0;
-    for x in 0..n {
-        if x + AHEAD < n {
-            let p = nd.uf[x + AHEAD].parent as usize;
-            prefetch(&nd.uf[p]);
-        }
-        let r = find(&mut nd.uf, x as u32);
-        persons += usize::from(r == x as u32);
-        nd.uf[x].parent = r;
+    #[cfg(test)]
+    if stop() == 3 {
+        return Links::default();
     }
     let t2 = std::time::Instant::now();
     // Layout: nodes are grouped by partition (SHORT then wide in each), so entries go out in node
@@ -500,11 +520,15 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
         }
         WIDE | (Nodes::kind(p) << 61) | ((p & qmask) << 32) | u64::from(nd.uf[r].wix - 1)
     };
+    let mut persons = 0;
     for x in 0..n {
         if x + AHEAD < n {
-            prefetch(&nd.place[nd.uf[x + AHEAD].parent as usize]);
+            let p = nd.uf[x + AHEAD].parent as usize;
+            prefetch(&nd.uf[p]);
+            prefetch(&nd.place[p]);
         }
-        let r = nd.uf[x].parent as usize;
+        let r = find(&mut nd.uf, x as u32) as usize;
+        persons += usize::from(r == x);
         let pr = nd.place[r];
         let pk = if pr & WIDE == 0 { pr } else { wix_of(&mut nd, &mut l.wkeys, r) };
         let p = nd.place[x];
@@ -774,5 +798,36 @@ mod tests {
                 assert_eq!(k[2], long_hash(k[0], k[1]) >> (64 - b2), "wkeys {i}");
             }
         }
+    }
+
+    /// Instruction-count bench (run under perf stat with LNK_STOP = 0..4): ~20M-event shape.
+    #[test]
+    #[ignore]
+    fn bench_resolve() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let b2 = 9;
+        let nu = 1_200_000usize;
+        let keys: Vec<(bool, u64, u64)> = (0..nu).map(|_| if rnd() % 8 == 0 { (true, rnd(), rnd()) } else { (false, rnd() % (1 << 40), 0) }).collect();
+        let mut tasks: Vec<Ends> = (0..34).map(|_| Ends::default()).collect();
+        for i in 0..888_629usize {
+            let a = if i < nu / 2 { i } else { (rnd() as usize) % nu };
+            let b = (rnd() as usize) % nu;
+            tasks[i % 34].line(keys[a], keys[b]);
+        }
+        for t in tasks.iter_mut() {
+            t.group(b2);
+        }
+        if std::env::var("LNK_STOP").ok().as_deref() == Some("-1") {
+            return;
+        }
+        let mut sp = Spent::default();
+        let l = resolve(&mut tasks, b2, &mut sp);
+        std::hint::black_box(l);
     }
 }
