@@ -12,7 +12,7 @@ COPY src ./src
 # x86-64-v3 = AVX2, BMI2, FMA.
 ARG X86_TARGET_CPU=x86-64-v3
 RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=${X86_TARGET_CPU}"; fi; \
-    cargo build --release --locked && \
+    cargo build --release --locked --features parselab/mul512 && \
     cp target/release/engine /engine
 
 # Run stage: nothing but the binary. No shell, no libc, no network needed.
