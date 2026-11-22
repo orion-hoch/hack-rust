@@ -12,15 +12,13 @@ name = "engine"
 path = "src/main.rs"
 
 [dependencies]
-bytes = "1"
-memchr = "2"
-memmap2 = "0.9"
-mimalloc = { version = "0.1", default-features = false }
-parquet = { version = "60", default-features = false }
+parselab = { path = "crates/parselab" }
+pqw = { path = "crates/pqw" }
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# unwind: a panic in the fast path is caught and the run falls back to v1 (never a crash).
+panic = "unwind"
 debug = false

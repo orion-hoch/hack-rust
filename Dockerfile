@@ -1,11 +1,13 @@
 # Shopping Sessions engine. The scorers build this natively on linux/amd64, so no FROM
 # line pins a platform.
 #
-# Build stage: Alpine's Rust targets musl, so the binary is fully static.
+# Build stage: Alpine's Rust targets musl, so the binary is fully static. Every crate is this
+# team's own; nothing is compiled by a C compiler (the image's gcc only drives the link) and
+# nothing is fetched from crates.io.
 FROM rust:1.99-alpine3.22 AS build
-RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 # x86-64-v3 = AVX2, BMI2, FMA.
 ARG X86_TARGET_CPU=x86-64-v3

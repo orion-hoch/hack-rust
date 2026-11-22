@@ -1,6 +1,5 @@
-//! Stage 7 interface: the two output tables as plain columns. A Parquet writer only sees these
-//! structs, so any writer (the `parquet` crate today, a hand-rolled one later) can be swapped in
-//! behind `write_user_daily` / `write_campaign_daily` in `pq.rs`.
+//! Stage 7 interface: the two output tables as plain columns. The Parquet writer (pqw, behind
+//! `write_user_daily` / `write_campaign_daily` in `pq.rs`) only sees these structs.
 
 /// A string column: row `i` is `data[offsets[i]..offsets[i + 1]]`.
 #[derive(Default)]

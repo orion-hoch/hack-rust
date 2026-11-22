@@ -1,0 +1,20 @@
+[package]
+name = "parselab"
+version = "0.1.0"
+description = "Bytes to records for Shopping Sessions: RECORDS.md shapes, a scalar reference parser and the fast parser."
+edition = "2024"
+license = "MIT"
+publish = false
+
+[features]
+phases = []
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"

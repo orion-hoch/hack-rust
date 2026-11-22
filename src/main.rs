@@ -6,8 +6,11 @@
 //! Usage: `engine [--timing] [DATA_DIR OUTPUT_DIR]`; otherwise `DATA_DIR`, `OUTPUT_DIR` and
 //! `NCPU` come from the environment (defaults /data, /output, all CPUs). Logs go to stderr.
 
+mod alloc;
 mod csv;
 mod dedup;
+mod fast;
+mod v3;
 mod hash;
 mod id;
 mod input;
@@ -38,9 +41,10 @@ use crate::sessions::{CampaignAgg, SessionCtx, Sessionizer};
 use crate::tables::{Campaigns, Products};
 use crate::ts::DAY;
 
-// musl's allocator made the static build twice as slow as the glibc one (see STAGES.md).
+// musl's allocator made the static build twice as slow as the glibc one (see STAGES.md); the
+// engine's own allocator is in alloc.rs.
 #[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOCATOR: alloc::Alloc = alloc::Alloc;
 
 struct Config {
     data: PathBuf,
@@ -331,6 +335,36 @@ fn run(cfg: &Config) -> io::Result<()> {
 
 fn main() {
     let cfg = config();
+    // The dataset-level switch: the fast path when the ID keys are recovered (or forced), v1
+    // otherwise. ENGINE_PATH=v1 forces v1; ENGINE_PATH=fast fails instead of falling back.
+    let path = env::var("ENGINE_PATH").unwrap_or_default();
+    if path != "v1" {
+        // Any refusal, failed check, I/O error or panic in the fast path falls back to v1, after
+        // removing whatever the fast path may have written.
+        let fast = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            v3::try_run(&cfg.data, &cfg.out, cfg.threads, cfg.timing)
+        }));
+        let why = match fast {
+            Ok(Ok(fast::Outcome::Done)) => return,
+            Ok(Ok(fast::Outcome::Fallback(why))) => why,
+            Ok(Err(e)) => format!("I/O error: {e}"),
+            Err(_) => "panic".to_string(),
+        };
+        if path == "fast" {
+            eprintln!("engine: fast path refused: {why}");
+            std::process::exit(2);
+        }
+        eprintln!("engine: fast path declined ({why}); running v1");
+        for table in ["user_daily", "campaign_daily"] {
+            let dir = cfg.out.join(table);
+            if dir.exists() {
+                if let Err(e) = fs::remove_dir_all(&dir) {
+                    eprintln!("engine: cannot clear {}: {e}", dir.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     if let Err(e) = run(&cfg) {
         eprintln!("engine: {e}");
         std::process::exit(1);

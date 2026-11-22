@@ -36,7 +36,7 @@ impl CampaignAgg {
     }
 
     #[inline]
-    fn slot(&mut self, campaign: u32, day: i32) -> &mut Counters {
+    pub(crate) fn slot(&mut self, campaign: u32, day: i32) -> &mut Counters {
         if !self.dense.is_empty() {
             let offset = (i64::from(day) - self.day0) as usize;
             debug_assert!(offset < self.span);

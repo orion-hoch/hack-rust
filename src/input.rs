@@ -1,44 +1,35 @@
 //! Stage 1: find the input files, map them, and cut them into line-aligned byte ranges.
 
-use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use memmap2::Mmap;
+use parselab::dataset::{MapMode, Mapped};
 
+use crate::csv::{find_byte, find_bytes};
 use crate::ts;
 
-/// One mapped input file. Empty files are not mapped.
+/// One input file, mapped read-only by parselab's `Mapped` (a plain `mmap` against the libc the
+/// binary links; empty files are not mapped). The inputs are read-only for the whole run.
 pub struct Source {
-    map: Option<Mmap>,
+    map: Mapped,
 }
 
 impl Source {
     pub fn open(path: PathBuf) -> io::Result<Source> {
-        let with_path = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()));
-        let file = File::open(&path).map_err(with_path)?;
-        let len = file.metadata().map_err(with_path)?.len();
-        let map = if len == 0 {
-            None
-        } else {
-            // SAFETY: the inputs are read-only for the whole run; nobody truncates them.
-            Some(unsafe { Mmap::map(&file) }.map_err(with_path)?)
-        };
+        let map = Mapped::open(&path, MapMode::Lazy)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
         Ok(Source { map })
     }
 
     #[inline]
     pub fn bytes(&self) -> &[u8] {
-        match &self.map {
-            Some(map) => map,
-            None => &[],
-        }
+        self.map.bytes()
     }
 
     /// The offset of the first data line: just past the header's `\n`, or the end.
     pub fn data_start(&self) -> usize {
         let b = self.bytes();
-        match memchr::memchr(b'\n', b) {
+        match find_byte(b'\n', b) {
             Some(i) => i + 1,
             None => b.len(),
         }
@@ -101,7 +92,7 @@ pub fn chunks(sources: &[Source], target: usize, out: &mut Vec<Chunk>) {
             if cut >= end {
                 cut = end;
             } else {
-                cut = match memchr::memchr(b'\n', &bytes[cut..]) {
+                cut = match find_byte(b'\n', &bytes[cut..]) {
                     Some(i) => cut + i + 1,
                     None => end,
                 };
@@ -128,7 +119,7 @@ fn manifest_value<'a>(text: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     quoted.push(b'"');
     quoted.extend_from_slice(key);
     quoted.push(b'"');
-    let at = memchr::memmem::find(text, &quoted)? + quoted.len();
+    let at = find_bytes(text, &quoted)? + quoted.len();
     let mut i = at;
     while i < text.len() && text[i].is_ascii_whitespace() {
         i += 1;
@@ -144,7 +135,7 @@ fn manifest_value<'a>(text: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
         return None;
     }
     let from = i + 1;
-    let len = memchr::memchr(b'"', &text[from..])?;
+    let len = find_byte(b'"', &text[from..])?;
     Some(&text[from..from + len])
 }
 

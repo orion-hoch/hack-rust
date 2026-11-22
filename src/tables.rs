@@ -45,7 +45,7 @@ impl Lookup {
 
 /// Data lines (after the header) of a two-column file, dialect-checked, both fields non-empty.
 fn rows<'a>(bytes: &'a [u8], mut f: impl FnMut(&'a [u8], &'a [u8])) {
-    let start = match memchr::memchr(b'\n', bytes) {
+    let start = match csv::find_byte(b'\n', bytes) {
         Some(i) => i + 1,
         None => bytes.len(),
     };

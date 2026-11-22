@@ -35,8 +35,9 @@ docker run --rm --network none --read-only -v "$PWD/data":/data:ro -v "$PWD/out"
 
 ## Tests
 
-- `cargo test --release`: unit tests for the CSV dialect, timestamps, prices, ID codes,
-  links, lookups and assist counting.
+- `cargo test --release`: unit tests for the CSV dialect and newline search, timestamps,
+  prices, ID codes, links, lookups, assist counting, the Parquet table split, and the allocator
+  (size classes, and a threaded stress test that checks every block's contents).
 - `tests/fixtures/X1..X3`: edge cases in the starter's fixture layout, with expected rows
   derived by hand from rules.md. They cover file endings, dedup across files, and IDs that
   are not plain alphanumerics on every path. `tests/make_fixtures.py` regenerates them.
@@ -44,27 +45,18 @@ docker run --rm --network none --read-only -v "$PWD/data":/data:ro -v "$PWD/out"
 
 ## Dependencies
 
-Direct dependencies, all from crates.io (versions pinned in `Cargo.lock`):
+None. All code in this repository was written by this team; `Cargo.lock` lists no package
+from crates.io. The workspace has three crates, all ours:
 
-| Crate | Version | Use |
+| Crate | Path | What it is |
 | --- | --- | --- |
-| `memmap2` | 0.9.12 | memory-maps the input files |
-| `memchr` | 2.8.3 | finds newlines |
-| `mimalloc` | 0.1.52 (with `libmimalloc-sys` 0.1.49, which bundles Microsoft's mimalloc C library) | global allocator; musl's own allocator made the static build twice as slow |
-| `parquet` | 60.2.0, default features off | writes the Parquet files (low-level column writer, no Arrow) |
-| `bytes` | 1.12.2 | zero-copy string slices for the Parquet writer |
+| `shopping-sessions-engine` | `.` | the engine, including its global allocator (`src/alloc.rs`), input mapping and newline search |
+| `parselab` | `crates/parselab` | the input parser and the read-only file mapping (`mmap` by a plain `extern "C"` declaration) |
+| `pqw` | `crates/pqw` | the Parquet writer |
 
-Transitive dependencies, pulled in by `parquet` and `mimalloc`: ahash, autocfg, bumpalo,
-cc, cfg-if, chrono, const-random, const-random-macro, crunchy, find-msvc-tools,
-futures-core, futures-task, futures-util, getrandom, half, hashbrown, iana-time-zone,
-js-sys, libc, libm, log, num-bigint, num-integer, num-traits, once_cell, pin-project-lite,
-proc-macro2, quote, rustversion, seq-macro, shlex, slab, syn, tiny-keccak, twox-hash,
-unicode-ident, version_check, zerocopy, zerocopy-derive. A few platform crates
-(android_system_properties, core-foundation-sys, iana-time-zone-haiku, r-efi, wasi,
-wasip2, wasm-bindgen*, windows-*, wit-bindgen) are listed in `Cargo.lock` but are not
-compiled on Linux.
-
-Build images: `rust:1.99-alpine3.22`, plus the `musl-dev` package from Alpine.
+System calls go through plain `extern "C"` declarations against the libc that the static
+binary links (musl). Build image: `rust:1.99-alpine3.22` (its gcc only drives the link; no C
+code is compiled).
 
 ## License
 
