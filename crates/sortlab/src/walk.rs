@@ -1015,31 +1015,52 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
     let mut ka = core::mem::take(&mut ws.ka);
     ka.clear();
     ws.cw.clear();
+    // Room for every click (and the sentinel single_core adds) at once: the loop below writes
+    // through raw pointers, with no capacity check per click.
+    ka.reserve(n_in + 1);
+    ws.cw.reserve(n_in + 1);
+    let (kw, cww) = (ka.as_mut_ptr(), ws.cw.as_mut_ptr());
+    let mut m = 0usize;
     let mut dropped = 0u64;
+    let (cn64, org) = (cn as u64, u64::from(prm.organic));
     for p in 0..np {
-        let k0 = ka.len();
+        let k0 = m;
+        let pk = (p as u64) << (32 + kt);
         for blk in &pb.ck[pb.ck_at[p] as usize..pb.ck_at[p + 1] as usize] {
             let n = (blk[0] & 0xFF_FFFF) as usize;
             if blk.len() < 2 + 2 * n {
                 ws.ka = ka;
                 return Err(Error::WalkInput);
             }
-            for pair in blk[2..2 + 2 * n].chunks_exact(2) {
-                let (w0, tc) = (pair[0], pair[1]);
-                let camp = (w0 >> 52) as u32;
-                if camp as usize >= cn || camp == prm.organic {
-                    ws.ka = ka;
-                    return Err(Error::BadCampaign(ws.cw.len()));
+            let mut q = blk[2..].as_ptr();
+            for _ in 0..n {
+                // SAFETY: 2 + 2 * n <= blk.len() (checked above), so both words are in the block;
+                // m < n_in (n_in counts every click of every block) is within the reserved room.
+                unsafe {
+                    let (w0, tc) = (*q, *q.add(1));
+                    q = q.add(2);
+                    let camp = w0 >> 52;
+                    if camp >= cn64 || camp == org {
+                        ka.set_len(0);
+                        ws.ka = ka;
+                        return Err(Error::BadCampaign(m));
+                    }
+                    if tc > TS_MAX {
+                        // after every session start (starts are below 2^31 - base): credits
+                        // and assists nothing
+                        dropped += 1;
+                        continue;
+                    }
+                    *kw.add(m) = pk | (tc << kt) | m as u64;
+                    *cww.add(m) = w0;
+                    m += 1;
                 }
-                if tc > TS_MAX {
-                    // after every session start (starts are below 2^31 - base): credits and
-                    // assists nothing
-                    dropped += 1;
-                    continue;
-                }
-                ka.push(((p as u64) << (32 + kt)) | (tc << kt) | ws.cw.len() as u64);
-                ws.cw.push(w0);
             }
+        }
+        // SAFETY: entries 0..m were written above.
+        unsafe {
+            ka.set_len(m);
+            ws.cw.set_len(m);
         }
         // the person's clicks by (ts, index): the keys are already grouped by person
         let g = &mut ka[k0..];

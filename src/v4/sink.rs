@@ -180,9 +180,11 @@ impl<'a> Sink for EvSink<'a, '_> {
 }
 
 impl<'a> EvSink<'a, '_> {
-    /// One batch with AVX-512: the 8 lanes' mixes, partitions and both words packed in zmm
-    /// registers; then one push per common lane (SHORT event, SHORT or dead user, no purchase),
-    /// and the purchase and wide lanes after (a record's own units stay together).
+    /// One batch with AVX-512. Every lane's plain unit, and every lane's rare record (header,
+    /// second word, event key, user key, partition, form), is built in zmm registers for the 8
+    /// lanes at once; then each plain lane is a load of its front, a 16-byte store and the front
+    /// advanced, and each rare lane the same with its 2 or 3 units. Lanes are taken by mask (the
+    /// order of records inside a stream is free).
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl,bmi1,bmi2")]
     #[inline(never)]
@@ -191,43 +193,149 @@ impl<'a> EvSink<'a, '_> {
         let n = (b.n as usize).min(8);
         let all = ((1u32 << n) - 1) as u8;
         let live: __mmask8 = b.surv;
-        let purch: __mmask8 = b.purch & b.surv;
-        let wide = b.ev_long | (b.user_long & b.surv);
+        let purch: __mmask8 = b.purch & live;
+        let uwide: __mmask8 = b.user_long & live;
+        let elong: __mmask8 = b.ev_long;
+        let rare = (elong | uwide | purch) & all;
+        let common = all & !rare;
         let sh = 40 - self.b1;
-        let mut units = [[0u64; 2]; 8];
-        let mut part = [0u64; 8];
+        // Lane arrays, written by the vector stores below before any lane reads them (left
+        // uninitialised: zeroing them would cost more instructions than a lane's whole store).
+        // Plain units and their fronts' byte offsets (partition * 16); rare records' units 0, 1,
+        // 2, their fronts' byte offsets, and the lanes with 3 units.
+        use std::mem::MaybeUninit;
+        let mut units = MaybeUninit::<[[u64; 2]; 8]>::uninit();
+        let mut part = MaybeUninit::<[u64; 8]>::uninit();
+        let mut r0 = MaybeUninit::<[[u64; 2]; 8]>::uninit();
+        let mut r1 = MaybeUninit::<[[u64; 2]; 8]>::uninit();
+        let mut r2 = MaybeUninit::<[[u64; 2]; 8]>::uninit();
+        let mut rpart = MaybeUninit::<[u64; 8]>::uninit();
+        let mut big: __mmask8 = 0;
         unsafe {
             let c = _mm512_set1_epi64(super::keys::MIX_C as i64);
             let m40 = _mm512_set1_epi64(super::keys::M40 as i64);
             let x = _mm512_and_si512(_mm512_mullo_epi64(_mm512_loadu_si512(b.ev_a.as_ptr() as *const _), c), m40);
             let me = _mm512_xor_si512(x, _mm512_srli_epi64::<20>(x));
-            let y = _mm512_and_si512(_mm512_mullo_epi64(_mm512_loadu_si512(b.user_a.as_ptr() as *const _), c), m40);
+            let ua = _mm512_loadu_si512(b.user_a.as_ptr() as *const _);
+            let y = _mm512_and_si512(_mm512_mullo_epi64(ua, c), m40);
             let mu = _mm512_xor_si512(y, _mm512_srli_epi64::<20>(y));
             let ing = _mm512_cvtepu32_epi64(_mm256_loadu_si256(b.ingest.as_ptr() as *const __m256i));
-            let ts = _mm512_cvtepu32_epi64(_mm256_loadu_si256(b.ts.as_ptr() as *const __m256i));
+            let ts = _mm512_maskz_mov_epi64(live, _mm512_cvtepu32_epi64(_mm256_loadu_si256(b.ts.as_ptr() as *const __m256i)));
             let cnt = _mm_cvtsi32_si128(sh as i32);
-            _mm512_storeu_si512(part.as_mut_ptr() as *mut _, _mm512_srl_epi64(me, cnt));
+            let ps = _mm512_srl_epi64(me, cnt);
+            _mm512_storeu_si512(part.as_mut_ptr() as *mut _, _mm512_slli_epi64::<4>(ps));
             let re = _mm512_and_si512(me, _mm512_set1_epi64(((1u64 << sh) - 1) as i64));
-            // survivor bits: high user bits, surv, purch
+            // survivor bits: high user bits, surv
             let hi = _mm512_or_si512(_mm512_slli_epi64::<55>(_mm512_srli_epi64::<33>(mu)), _mm512_set1_epi64(1 << 62));
-            let hi = _mm512_mask_or_epi64(hi, purch, hi, _mm512_set1_epi64(i64::MIN));
             let w0 = _mm512_or_si512(re, _mm512_slli_epi64::<32>(ing));
             let w0 = _mm512_mask_or_epi64(w0, live, w0, hi);
-            let w1 = _mm512_maskz_or_epi64(live, ts, _mm512_slli_epi64::<31>(_mm512_and_si512(mu, _mm512_set1_epi64(M33 as i64))));
+            let w1 = _mm512_or_si512(ts, _mm512_maskz_slli_epi64::<31>(live, _mm512_and_si512(mu, _mm512_set1_epi64(M33 as i64))));
             // [w0, w1] pairs in lane order
             let i0 = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
             let i1 = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
             _mm512_storeu_si512(units.as_mut_ptr() as *mut _, _mm512_permutex2var_epi64(w0, i0, w1));
-            _mm512_storeu_si512(units.as_mut_ptr().add(4) as *mut _, _mm512_permutex2var_epi64(w0, i1, w1));
-        }
-        // lanes in order; a purchase or wide lane (rare) out of line
-        let rare = (wide | purch) & all;
-        for k in 0..n {
-            if rare >> k & 1 == 0 {
-                self.push(part[k] as usize, units[k]);
-            } else {
-                self.rare_lane(b, k);
+            _mm512_storeu_si512((units.as_mut_ptr() as *mut [u64; 2]).add(4) as *mut _, _mm512_permutex2var_epi64(w0, i1, w1));
+            if rare != 0 {
+                // RARE_BIG's three forms: SHORT event (A); LONG event with a SHORT or dead user and
+                // no purchase (B); LONG event with a wide user or a purchase (C, 3 units).
+                big = elong & (uwide | purch);
+                let fa = !elong;
+                let price = _mm512_cvtepu32_epi64(_mm256_loadu_si256(b.price.as_ptr() as *const __m256i));
+                // The parser accepts 1 to 10,000,000; anything at 2^24 or above would not fit.
+                self.bad |= _mm512_mask_cmpge_epu64_mask(purch & rare, price, _mm512_set1_epi64(1 << 24)) != 0;
+                let cat = _mm512_cvtepu8_epi64(_mm_loadl_epi64(b.cat.as_ptr() as *const __m128i));
+                let buy = _mm512_maskz_or_epi64(purch, cat, _mm512_slli_epi64::<8>(price));
+                let one = |m: __mmask8, bit: u32| _mm512_maskz_mov_epi64(m, _mm512_set1_epi64(1i64 << bit));
+                let h = _mm512_or_si512(ing, _mm512_slli_epi64::<29>(ts));
+                let h = _mm512_or_si512(h, _mm512_or_si512(one(elong, 23), one(uwide, 25)));
+                let h = _mm512_or_si512(h, _mm512_or_si512(one(live, 27), one(purch, 28)));
+                let h = _mm512_or_si512(h, one(big, 60));
+                // The user key: (mu, 0) SHORT, (a, b) wide, (0, 0) dead.
+                let uxa = _mm512_maskz_mov_epi64(live, _mm512_mask_mov_epi64(mu, uwide, ua));
+                let uxb = _mm512_maskz_loadu_epi64(uwide, b.user_b.as_ptr() as *const _);
+                // Word 1: A re | payload << 32; B mu (0 dead); C payload.
+                let rw1 = _mm512_mask_mov_epi64(_mm512_mask_mov_epi64(uxa, big, buy), fa, _mm512_or_si512(re, _mm512_slli_epi64::<32>(buy)));
+                // Unit 1: A the user key; B and C the event key.
+                let ea = _mm512_loadu_si512(b.ev_a.as_ptr() as *const _);
+                let eb = _mm512_loadu_si512(b.ev_b.as_ptr() as *const _);
+                let s1a = _mm512_mask_mov_epi64(ea, fa, uxa);
+                let s1b = _mm512_mask_mov_epi64(eb, fa, uxb);
+                // Partition: SHORT event the top bits of mix40, LONG the top bits of long_hash.
+                let lh = _mm512_mullo_epi64(_mm512_xor_si512(ea, _mm512_rol_epi64::<29>(eb)), _mm512_set1_epi64(super::keys::LONG_C as i64));
+                let pl = _mm512_srl_epi64(lh, _mm_cvtsi32_si128(64 - self.b1 as i32));
+                _mm512_storeu_si512(rpart.as_mut_ptr() as *mut _, _mm512_slli_epi64::<4>(_mm512_mask_mov_epi64(ps, elong, pl)));
+                _mm512_storeu_si512(r0.as_mut_ptr() as *mut _, _mm512_permutex2var_epi64(h, i0, rw1));
+                _mm512_storeu_si512((r0.as_mut_ptr() as *mut [u64; 2]).add(4) as *mut _, _mm512_permutex2var_epi64(h, i1, rw1));
+                _mm512_storeu_si512(r1.as_mut_ptr() as *mut _, _mm512_permutex2var_epi64(s1a, i0, s1b));
+                _mm512_storeu_si512((r1.as_mut_ptr() as *mut [u64; 2]).add(4) as *mut _, _mm512_permutex2var_epi64(s1a, i1, s1b));
+                _mm512_storeu_si512(r2.as_mut_ptr() as *mut _, _mm512_permutex2var_epi64(uxa, i0, uxb));
+                _mm512_storeu_si512((r2.as_mut_ptr() as *mut [u64; 2]).add(4) as *mut _, _mm512_permutex2var_epi64(uxa, i1, uxb));
             }
+        }
+        // SAFETY: every lane of the arrays read below was written above (units and part always;
+        // the rare arrays when a lane is rare, and only rare lanes read them).
+        let (units, part) = unsafe { (units.assume_init_ref(), part.assume_init_ref()) };
+        // The plain lanes: front, store, advance (the chunk-end test is the only branch).
+        let fs = self.s.fronts();
+        let mut m = u32::from(common);
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            // SAFETY: part[k] / 16 < 2^b1, the number of bins; a front's pointer is below its
+            // end after next_chunk.
+            unsafe {
+                let f = (fs as *mut u8).add(part[k] as usize) as *mut [*mut [u64; 2]; 2];
+                let mut p = (*f)[0];
+                if p == (*f)[1] {
+                    self.s.next_chunk(part[k] as usize >> 4);
+                    p = (*f)[0];
+                }
+                p.write(units[k]);
+                (*f)[0] = p.add(1);
+                _mm_prefetch((p as *const i8).wrapping_add(64), _MM_HINT_ET0);
+            }
+            m &= m - 1;
+        }
+        if rare == 0 {
+            return;
+        }
+        // SAFETY: as above.
+        let (r0, r1, r2, rpart) = unsafe { (r0.assume_init_ref(), r1.assume_init_ref(), r2.assume_init_ref(), rpart.assume_init_ref()) };
+        // The rare lanes: 2 units (forms A and B), then 3 (form C), inside one chunk each.
+        let fo = self.o.fronts();
+        let mut m = u32::from(rare & !big);
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            // SAFETY: as above, for the rare bins (a B2K chunk holds 128 units).
+            unsafe {
+                let f = (fo as *mut u8).add(rpart[k] as usize) as *mut [*mut [u64; 2]; 2];
+                let mut p = (*f)[0];
+                if ((*f)[1] as usize).wrapping_sub(p as usize) < 32 {
+                    self.o.next_chunk_short(rpart[k] as usize >> 4);
+                    p = (*f)[0];
+                }
+                p.write(r0[k]);
+                p.add(1).write(r1[k]);
+                (*f)[0] = p.add(2);
+            }
+            m &= m - 1;
+        }
+        let mut m = u32::from(big);
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            // SAFETY: as above.
+            unsafe {
+                let f = (fo as *mut u8).add(rpart[k] as usize) as *mut [*mut [u64; 2]; 2];
+                let mut p = (*f)[0];
+                if ((*f)[1] as usize).wrapping_sub(p as usize) < 48 {
+                    self.o.next_chunk_short(rpart[k] as usize >> 4);
+                    p = (*f)[0];
+                }
+                p.write(r0[k]);
+                p.add(1).write(r1[k]);
+                p.add(2).write(r2[k]);
+                (*f)[0] = p.add(3);
+            }
+            m &= m - 1;
         }
     }
 

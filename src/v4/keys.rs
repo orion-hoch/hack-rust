@@ -6,7 +6,7 @@ pub const M40: u64 = (1 << 40) - 1;
 pub const MIX_C: u64 = 0xC2_B2AE_3D27;
 /// MIX_C * MIX_CINV = 1 mod 2^40.
 pub const MIX_CINV: u64 = 0x14_BE47_6297;
-const LONG_C: u64 = 0xD6E8_FEB8_6659_FD93;
+pub const LONG_C: u64 = 0xD6E8_FEB8_6659_FD93;
 
 /// A bijection on [0, 2^40): odd multiply mod 2^40, then a reversible xor-shift (shift 20 of 40 bits).
 #[inline(always)]

@@ -91,6 +91,9 @@ pub struct State {
     bval: Vec<u64>,
     /// Per click (reading order, SHORT then wide): slot or EMPTY.
     cidx: Vec<u32>,
+    /// Where pass 2 writes the clicks of no user here (they reach no session): the cursor of
+    /// the spare slot `dummy` points into it, so neither click loop tests for a miss.
+    trash: Vec<[u64; 2]>,
     ecur: Vec<*mut u32>,
     bcur: Vec<*mut u64>,
     ccur: Vec<*mut [u64; 2]>,
@@ -109,7 +112,6 @@ impl Default for State {
     }
 }
 
-#[inline(always)]
 #[inline(always)]
 fn wide_hash(a: u64, b: u64, kind: u64, bits: u32) -> usize {
     // its own constant: not a partition hash (RECORDS-V4 trap (a))
@@ -136,6 +138,7 @@ impl State {
             bidx: Vec::new(),
             bval: Vec::new(),
             cidx: Vec::new(),
+            trash: Vec::new(),
             ecur: Vec::new(),
             bcur: Vec::new(),
             ccur: Vec::new(),
@@ -178,7 +181,8 @@ impl State {
             self.key.clear();
             self.key.resize(ds, EMPTY);
         }
-        let total = ds + wide;
+        // one spare slot past the wide ones: the clicks' miss slot (`dummy`)
+        let total = ds + wide + 1;
         if self.cnt.len() < total {
             for v in [&mut self.cnt, &mut self.nbuy, &mut self.nck] {
                 v.resize(total, 0);
@@ -706,33 +710,46 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         Stop::BadRu => return Err(Error::RuBits),
         _ => {}
     }
-    // clicks: lookup only
+    // clicks: lookup only. A miss takes the spare slot `dummy` (counted there, never laid out),
+    // so the loops have no miss branch: pass 2 writes such a click to the trash.
     let n_ck: usize = inp.clicks.iter().map(|c| c.len()).sum::<usize>() + inp.wclicks.iter().map(|c| c.len()).sum::<usize>();
+    let dummy = (1usize << k) + wide_max;
     st.cidx.reserve(n_ck);
     {
         let (key, nck, cidx) = (st.key.as_ptr(), st.nck.as_mut_ptr(), st.cidx.as_mut_ptr());
         let (shift, mask) = (st.shift, (1usize << st.k) - 1);
         let mut j = 0usize;
         for c in inp.clicks {
-            for r in c.iter() {
-                let ru = (r[0] >> 32) as u32;
-                // SAFETY: slots are masked below 2^k = key.len(); j < n_ck = cidx's capacity.
+            let cp = c.as_ptr();
+            for i in 0..c.len() {
+                // SAFETY: i < c.len(); slots are masked below 2^k = key.len(); j < n_ck =
+                // cidx's capacity; dummy < nck.len() (reset sizes one spare slot).
                 unsafe {
+                    let ru = ((*cp.add(i))[0] >> 32) as u32;
                     let mut h = (ru >> shift) as usize;
-                    let s = loop {
-                        let k = *key.add(h);
-                        if k == ru {
-                            break h as u32;
-                        }
-                        if k == EMPTY {
-                            break EMPTY;
+                    let mut kk = *key.add(h);
+                    while kk != ru {
+                        if kk == EMPTY {
+                            h = dummy;
+                            break;
                         }
                         h = (h + 1) & mask;
-                    };
-                    if s != EMPTY {
-                        *nck.add(s as usize) += 1;
+                        kk = *key.add(h);
                     }
-                    *cidx.add(j) = s;
+                    *nck.add(h) += 1;
+                    *cidx.add(j + i) = h as u32;
+                }
+            }
+            j += c.len();
+        }
+        for c in inp.wclicks {
+            for r in c.iter() {
+                let s = st.wide_slot(r[0], r[1], r[2] >> 62, false);
+                let s = if s == EMPTY { dummy } else { s as usize };
+                // SAFETY: as above.
+                unsafe {
+                    *nck.add(s) += 1;
+                    *cidx.add(j) = s as u32;
                 }
                 j += 1;
             }
@@ -740,18 +757,9 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         // SAFETY: entries 0..j written above.
         unsafe { st.cidx.set_len(j) };
     }
-    for c in inp.wclicks {
-        for r in c.iter() {
-            let s = st.wide_slot(r[0], r[1], r[2] >> 62, false);
-            if s != EMPTY {
-                st.nck[s as usize] += 1;
-            }
-            st.cidx.push(s);
-        }
-    }
     // layout: blocks in the homes, headers, cursors
     // every slot with blocks gets its cursors below; the arrays only grow
-    let total = (1usize << k) + st.nwide as usize;
+    let total = dummy + 1;
     if st.ecur.len() < total {
         st.ecur.resize(total, null_mut());
         st.bcur.resize(total, null_mut());
@@ -760,69 +768,55 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     let lim24 = 1u32 << 24;
     let nused = st.used.len();
     let nb_homes = 40 - inp.rbits;
+    let rbits = inp.rbits;
     // raw pointers held in registers across the block writes (which could alias nothing here,
     // but the compiler cannot know: with the vectors it reloaded each one after every store)
     let (cnt, nbuy, nck, pkp) = (st.cnt.as_ptr(), st.nbuy.as_ptr(), st.nck.as_ptr(), st.pk.as_mut_ptr());
     let (ecur, bcur, ccur) = (st.ecur.as_mut_ptr(), st.bcur.as_mut_ptr(), st.ccur.as_mut_ptr());
-    for t in 0..nused + st.nwide as usize {
-        let s = if t < nused { st.used[t] } else { (1u32 << k) + (t - nused) as u32 };
-        let su = s as usize;
-        // SAFETY: su < total, the length of every per-slot array (reset and the growth above).
-        let (ne, nb, nc) = unsafe { (*cnt.add(su), *nbuy.add(su), *nck.add(su)) };
-        if ne == 0 && nc == 0 {
-            continue;
-        }
-        if ne >= lim24 || nb >= lim24 || nc >= lim24 {
-            return Err(Error::Count);
-        }
-        if s >= 1 << k && st.wkey[(s - (1 << k)) as usize][3] == 0 {
-            // an unlinked wide user: a P1-local person key, its [a, b] for P2's names
-            let i = st.wide.len() as u64;
-            let w = st.wkey[(s - (1 << k)) as usize];
-            st.wide.push([w[0], w[1]]);
-            // SAFETY: as above.
-            unsafe { *pkp.add(su) = 1 << 63 | w[2] << 61 | 1 << 60 | u64::from(inp.q) << 32 | i };
-        }
-        // SAFETY: as above.
-        let pk = unsafe { *pkp.add(su) };
-        // SHORT: the top b2 bits of mu; wide (links' or P1-local): bits 32-44 (RECORDS-V4 7)
-        let home = if pk >> 63 == 0 { (pk >> inp.rbits) as u32 } else { (pk >> 32) as u32 & 0x1FFF };
-        if home >> nb_homes != 0 {
-            return Err(Error::Size);
-        }
-        let wide = pk >> 63;
-        let ew = (ne as usize).div_ceil(2);
-        if 2 + ew + nb as usize > CW - 2 {
-            // too big for one chunk: its events and payloads into the worker's scratch, cut into
-            // several blocks after pass 2 (`split`); no region memory per block
-            st.bigs.push(Big { su: s, home, pk, at: st.big_ev.len() as u32, n: ne, pat: st.big_pay.len() as u32, nb, clicks: false });
-            st.big_ev.resize(st.big_ev.len() + ne as usize, 0);
-            st.big_pay.resize(st.big_pay.len() + nb as usize, 0);
-        } else if ne > 0 {
-            let p = out.block(home, 2 + ew + nb as usize);
-            // SAFETY: the block has 2 + ew + nb words (Out contract); su < total.
-            unsafe {
-                *p = u64::from(ne) | u64::from(nb) << 24 | wide << 63;
+    // Direct (SHORT) slots, the common case: one allocation holds the person block and the
+    // click block back to back. Anything unusual (a count past 2^24, a home out of range, blocks
+    // over one chunk) and every wide slot go to `layout_one`, the general path.
+    let usedp = st.used.as_ptr();
+    for t in 0..nused {
+        // SAFETY: t < nused = used.len(); every slot s < total, the length of each per-slot array.
+        unsafe {
+            let su = *usedp.add(t) as usize;
+            let (ne, nc) = (*cnt.add(su) as usize, *nck.add(su) as usize);
+            if ne | nc == 0 {
+                continue;
+            }
+            let nb = *nbuy.add(su) as usize;
+            let pk = *pkp.add(su);
+            // SHORT: the top b2 bits of mu; wide (links'): bits 32-44 (RECORDS-V4 7)
+            let home = if pk >> 63 == 0 { pk >> rbits } else { (pk >> 32) & 0x1FFF } as u32;
+            let ew = ne.div_ceil(2);
+            let pw = if ne != 0 { 2 + ew + nb } else { 0 };
+            let cw = if nc != 0 { 2 + 2 * nc } else { 0 };
+            if pw + cw > CW - 2 || home >> nb_homes != 0 {
+                layout_one(st, out, su as u32, k, inp.q, inp.rbits)?;
+                continue;
+            }
+            let p = out.block(home, pw + cw);
+            let wide = pk >> 63;
+            if ne != 0 {
+                *p = ne as u64 | (nb as u64) << 24 | wide << 63;
                 *p.add(1) = pk;
-                if ne & 1 != 0 {
-                    *p.add(1 + ew) = 0xFFFF_FFFF_0000_0000;
-                }
+                // the odd event's pad (for an even count pass 2 overwrites both halves)
+                *p.add(1 + ew) = 0xFFFF_FFFF_0000_0000;
                 *ecur.add(su) = p.add(2) as *mut u32;
                 *bcur.add(su) = p.add(2 + ew);
             }
-        }
-        if 2 + 2 * nc as usize > CW - 2 {
-            st.bigs.push(Big { su: s, home, pk, at: st.big_ck.len() as u32, n: nc, pat: 0, nb: 0, clicks: true });
-            st.big_ck.resize(st.big_ck.len() + nc as usize, [0, 0]);
-        } else if nc > 0 {
-            let p = out.block(home, 2 + 2 * nc as usize);
-            // SAFETY: as above, 2 + 2 nc words.
-            unsafe {
-                *p = u64::from(nc) | 1 << 62 | wide << 63;
-                *p.add(1) = pk;
-                *ccur.add(su) = p.add(2) as *mut [u64; 2];
+            if nc != 0 {
+                let c = p.add(pw);
+                *c = nc as u64 | 1 << 62 | wide << 63;
+                *c.add(1) = pk;
+                *ccur.add(su) = c.add(2) as *mut [u64; 2];
             }
         }
+    }
+    let _ = lim24;
+    for i in 0..st.nwide {
+        layout_one(st, out, (1u32 << k) + i, k, inp.q, inp.rbits)?;
     }
     // the big users' cursors, now that their scratch has its size
     for b in &st.bigs {
@@ -858,42 +852,110 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
                 *c = (*c).add(1);
             }
         }
+        // the misses' clicks: the trash, through the spare slot's cursor
+        let nmiss = st.nck[dummy] as usize;
+        st.nck[dummy] = 0;
+        if st.trash.len() < nmiss {
+            st.trash.resize(nmiss, [0, 0]);
+        }
+        st.ccur[dummy] = st.trash.as_mut_ptr();
         let ccur = st.ccur.as_mut_ptr();
         let cidx = st.cidx.as_ptr();
         let mut j = 0usize;
         for c in inp.clicks {
-            for r in c.iter() {
-                // SAFETY: j < cidx.len() (one entry per click, both forms); a found slot's
-                // cursor has room for its clicks.
+            let cp = c.as_ptr();
+            for i in 0..c.len() {
+                // SAFETY: j + i < cidx.len() (one entry per click, both forms); every slot's
+                // cursor has room for its clicks (the spare slot's: the trash, nmiss pairs).
                 unsafe {
-                    let s = *cidx.add(j);
-                    if s != EMPTY {
-                        let p = &mut *(ccur.add(s as usize) as *mut *mut u64);
-                        **p = r[1];
-                        *(*p).add(1) = r[0] & 0xffff_ffff;
-                        *p = (*p).add(2);
-                    }
+                    let r = *cp.add(i);
+                    let cs = ccur.add(*cidx.add(j + i) as usize);
+                    let p = *cs;
+                    *p = [r[1], r[0] & 0xffff_ffff];
+                    *cs = p.add(1);
                 }
-                j += 1;
             }
+            j += c.len();
         }
         for c in inp.wclicks {
             for r in c.iter() {
-                let s = st.cidx[j];
-                j += 1;
-                if s != EMPTY {
-                    // SAFETY: as above.
-                    unsafe {
-                        let p = ccur.add(s as usize);
-                        **p = [r[3], r[2] & 0xffff_ffff];
-                        *p = (*p).add(1);
-                    }
+                // SAFETY: as above.
+                unsafe {
+                    let cs = ccur.add(*cidx.add(j) as usize);
+                    let p = *cs;
+                    *p = [r[3], r[2] & 0xffff_ffff];
+                    *cs = p.add(1);
                 }
+                j += 1;
             }
         }
     }
     split(st, out);
     Ok(Pass::Done)
+}
+
+/// The general layout of slot s (any slot; the cold path): a P1-local key for an unlinked wide
+/// user, the count bounds, separate blocks, big users to the scratch for `split`.
+#[cold]
+#[inline(never)]
+fn layout_one<O: Out>(st: &mut State, out: &mut O, s: u32, k: u32, q: u32, rbits: u32) -> Result<(), Error> {
+    let lim24 = 1u32 << 24;
+    let su = s as usize;
+    let (ne, nb, nc) = (st.cnt[su], st.nbuy[su], st.nck[su]);
+    if ne == 0 && nc == 0 {
+        return Ok(());
+    }
+    if ne >= lim24 || nb >= lim24 || nc >= lim24 {
+        return Err(Error::Count);
+    }
+    if s >= 1 << k && st.wkey[(s - (1 << k)) as usize][3] == 0 {
+        // an unlinked wide user: a P1-local person key, its [a, b] for P2's names
+        let i = st.wide.len() as u64;
+        let w = st.wkey[(s - (1 << k)) as usize];
+        st.wide.push([w[0], w[1]]);
+        st.pk[su] = 1 << 63 | w[2] << 61 | 1 << 60 | u64::from(q) << 32 | i;
+    }
+    let pk = st.pk[su];
+    // SHORT: the top b2 bits of mu; wide (links' or P1-local): bits 32-44 (RECORDS-V4 7)
+    let home = if pk >> 63 == 0 { (pk >> rbits) as u32 } else { (pk >> 32) as u32 & 0x1FFF };
+    if home >> (40 - rbits) != 0 {
+        return Err(Error::Size);
+    }
+    let wide = pk >> 63;
+    let ew = (ne as usize).div_ceil(2);
+    if 2 + ew + nb as usize > CW - 2 {
+        // too big for one chunk: its events and payloads into the worker's scratch, cut into
+        // several blocks after pass 2 (`split`); no region memory per block
+        st.bigs.push(Big { su: s, home, pk, at: st.big_ev.len() as u32, n: ne, pat: st.big_pay.len() as u32, nb, clicks: false });
+        st.big_ev.resize(st.big_ev.len() + ne as usize, 0);
+        st.big_pay.resize(st.big_pay.len() + nb as usize, 0);
+    } else if ne > 0 {
+        let p = out.block(home, 2 + ew + nb as usize);
+        // SAFETY: the block has 2 + ew + nb words (Out contract); su < total.
+        unsafe {
+            *p = u64::from(ne) | u64::from(nb) << 24 | wide << 63;
+            *p.add(1) = pk;
+            if ne & 1 != 0 {
+                *p.add(1 + ew) = 0xFFFF_FFFF_0000_0000;
+            }
+        }
+        // SAFETY: as above.
+        st.ecur[su] = unsafe { p.add(2) } as *mut u32;
+        st.bcur[su] = unsafe { p.add(2 + ew) };
+    }
+    if 2 + 2 * nc as usize > CW - 2 {
+        st.bigs.push(Big { su: s, home, pk, at: st.big_ck.len() as u32, n: nc, pat: 0, nb: 0, clicks: true });
+        st.big_ck.resize(st.big_ck.len() + nc as usize, [0, 0]);
+    } else if nc > 0 {
+        let p = out.block(home, 2 + 2 * nc as usize);
+        // SAFETY: as above, 2 + 2 nc words.
+        unsafe {
+            *p = u64::from(nc) | 1 << 62 | wide << 63;
+            *p.add(1) = pk;
+        }
+        st.ccur[su] = unsafe { p.add(2) } as *mut [u64; 2];
+    }
+    Ok(())
 }
 
 /// A user whose person block or click block would not fit a chunk: its events (and payloads) or
@@ -1289,8 +1351,22 @@ mod tests {
     }
 
     /// Blocks as comparable values: (home, words).
+    /// Every block, by home, sorted. An allocation may hold several blocks back to back (the
+    /// layout puts a user's person and click blocks in one): split by their headers.
     fn canon(homes: &HashMap<u32, Vec<Box<[u64]>>>) -> Vec<(u32, Vec<u64>)> {
-        let mut v: Vec<(u32, Vec<u64>)> = homes.iter().flat_map(|(&h, bs)| bs.iter().map(move |b| (h, b.to_vec()))).collect();
+        let mut v: Vec<(u32, Vec<u64>)> = Vec::new();
+        for (&h, bs) in homes {
+            for b in bs {
+                let mut at = 0;
+                while at < b.len() {
+                    let h0 = b[at];
+                    let len = if h0 >> 62 & 1 != 0 { 2 + 2 * (h0 & 0xFF_FFFF) as usize } else { 2 + ((h0 & 0xFF_FFFF) as usize).div_ceil(2) + (h0 >> 24 & 0xFF_FFFF) as usize };
+                    assert!(at + len <= b.len(), "a block past its allocation");
+                    v.push((h, b[at..at + len].to_vec()));
+                    at += len;
+                }
+            }
+        }
         v.sort();
         v
     }

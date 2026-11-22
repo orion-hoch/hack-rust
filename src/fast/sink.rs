@@ -140,6 +140,29 @@ impl<T: Copy> Bins<T> {
         }
     }
 
+    /// Every bin's [write pointer, chunk end], for a caller that writes `push_fast` or `push_all`
+    /// out in its own loop: it writes at the pointer and advances it, and calls `next_chunk(b)`
+    /// first when the pointer is at the end (`next_chunk_short(b)` when a group does not fit).
+    /// The array never moves (the bins never grow).
+    #[inline(always)]
+    pub fn fronts(&mut self) -> *mut [*mut T; 2] {
+        self.ce.as_mut_ptr()
+    }
+
+    /// `push_fast`'s slow path: bin `b`'s chunk is full; the next is opened.
+    #[cold]
+    #[inline(never)]
+    pub fn next_chunk(&mut self, b: usize) {
+        self.refill(b);
+    }
+
+    /// `push_all`'s slow path: bin `b`'s chunk is closed at its written length, the next opened.
+    #[cold]
+    #[inline(never)]
+    pub fn next_chunk_short(&mut self, b: usize) {
+        self.close_short(b);
+    }
+
     /// Closes bin `b`'s current chunk at its written length (if any) and opens the next.
     #[cold]
     #[inline(never)]
