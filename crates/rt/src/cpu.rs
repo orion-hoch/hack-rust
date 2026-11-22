@@ -188,3 +188,120 @@ fn itoa(mut v: usize, out: &mut [u8; 8]) -> usize {
     out[..n].copy_from_slice(&t[i..]);
     n
 }
+
+/// Cache sizes as the machine reports them (bytes; 0 when unknown) and how many logical CPUs
+/// share each. From sysfs (`/sys/devices/system/cpu/cpu0/cache/indexN`), else cpuid (Intel leaf
+/// 4, AMD leaf 0x8000001D).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Caches {
+    pub l2: usize,
+    pub l2_shared: usize,
+    pub l3: usize,
+    pub l3_shared: usize,
+    /// Where the numbers came from: b's' sysfs, b'c' cpuid, 0 neither.
+    pub source: u8,
+}
+
+impl Caches {
+    /// L2 bytes per logical CPU sharing it (the share of one hyperthread).
+    pub fn l2_per_thread(&self) -> usize {
+        self.l2 / self.l2_shared.max(1)
+    }
+}
+
+pub fn caches() -> Caches {
+    let mut c = Caches::default();
+    for i in 0..10u8 {
+        let base = [b"/sys/devices/system/cpu/cpu0/cache/index".as_slice(), &[b'0' + i]];
+        let read = |leaf: &[u8], buf: &mut [u8; 64]| -> Option<usize> {
+            let p = sys::CPath::new(&[base[0], base[1], b"/", leaf])?;
+            let fd = unsafe { sys::openat(sys::AT_FDCWD, p.ptr(), sys::O_RDONLY | sys::O_CLOEXEC, 0) }.ok()?;
+            let n = unsafe { sys::read(fd, buf.as_mut_ptr(), buf.len()) }.ok();
+            let _ = sys::close(fd);
+            n
+        };
+        let mut b = [0u8; 64];
+        let Some(n) = read(b"level", &mut b) else { break };
+        let level = b[..n].first().map(|&d| d.wrapping_sub(b'0')).unwrap_or(0);
+        let Some(n) = read(b"type", &mut b) else { continue };
+        if b[..n].starts_with(b"Instruction") {
+            continue;
+        }
+        let Some(n) = read(b"size", &mut b) else { continue };
+        let mut v = 0usize;
+        let mut k = 0;
+        while k < n && b[k].is_ascii_digit() {
+            v = v * 10 + (b[k] - b'0') as usize;
+            k += 1;
+        }
+        let size = match b.get(k) {
+            Some(b'K') => v << 10,
+            Some(b'M') => v << 20,
+            Some(b'G') => v << 30,
+            _ => v,
+        };
+        let mut shared = CpuSet::EMPTY;
+        let nshared = match read(b"shared_cpu_list", &mut b) {
+            Some(n) if parse_list(&b[..n], &mut shared) => shared.count(),
+            _ => 1,
+        };
+        match level {
+            2 => {
+                c.l2 = size;
+                c.l2_shared = nshared;
+            }
+            3 => {
+                c.l3 = size;
+                c.l3_shared = nshared;
+            }
+            _ => {}
+        }
+        c.source = b's';
+    }
+    if c.l2 == 0 {
+        cpuid_caches(&mut c);
+    }
+    c
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cpuid_caches(c: &mut Caches) {
+    use core::arch::x86_64::__cpuid_count;
+    let v = unsafe { __cpuid_count(0, 0) };
+    let amd = v.ebx == 0x6874_7541; // "Auth"
+    let leaf = if amd { 0x8000_001d } else { 4 };
+    if amd && unsafe { __cpuid_count(0x8000_0000, 0) }.eax < 0x8000_001d {
+        return;
+    }
+    if !amd && v.eax < 4 {
+        return;
+    }
+    for sub in 0..16 {
+        let r = unsafe { __cpuid_count(leaf, sub) };
+        let typ = r.eax & 0x1f;
+        if typ == 0 {
+            break;
+        }
+        if typ == 2 {
+            continue; // instruction cache
+        }
+        let level = (r.eax >> 5) & 7;
+        let ways = ((r.ebx >> 22) & 0x3ff) as usize + 1;
+        let parts = ((r.ebx >> 12) & 0x3ff) as usize + 1;
+        let line = (r.ebx & 0xfff) as usize + 1;
+        let sets = r.ecx as usize + 1;
+        let shared = ((r.eax >> 14) & 0xfff) as usize + 1;
+        let size = ways * parts * line * sets;
+        if level == 2 {
+            c.l2 = size;
+            c.l2_shared = shared;
+        } else if level == 3 {
+            c.l3 = size;
+            c.l3_shared = shared;
+        }
+        c.source = b'c';
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpuid_caches(_c: &mut Caches) {}
