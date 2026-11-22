@@ -318,23 +318,64 @@ unsafe fn pext_bmi2(x: u64, mask: u64) -> u64 {
     std::arch::x86_64::_pext_u64(x, mask)
 }
 
+/// Whether BMI2 pext is a single fast instruction here: not on AMD before Zen 3 (family 0x19),
+/// where it is microcoded. Cached after the first call.
+#[inline(always)]
+fn pext_fast() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static F: AtomicU8 = AtomicU8::new(0);
+    let v = F.load(Relaxed);
+    if v != 0 {
+        return v == 1;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let fast = {
+        #[allow(unused_unsafe)]
+        let (l0, l1) = unsafe { (std::arch::x86_64::__cpuid(0), std::arch::x86_64::__cpuid(1)) };
+        let amd = l0.ebx == 0x6874_7541 && l0.edx == 0x6974_6E65 && l0.ecx == 0x444D_4163;
+        let (base, ext) = ((l1.eax >> 8) & 0xF, (l1.eax >> 20) & 0xFF);
+        let family = if base == 0xF { base + ext } else { base };
+        std::is_x86_feature_detected!("bmi2") && !(amd && family < 0x19)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let fast = false;
+    F.store(if fast { 1 } else { 2 }, Relaxed);
+    fast
+}
+
+/// The flags of the separators `d` as a bit string (bit i = the i-th separator), from the flag
+/// bytes `x` (a subset of `d`), without pext: each flagged separator sets the bit of its rank
+/// among `d`. For cnt = popcount(d) <= 8. STEPS fixed steps (a step on x == 0 sets bit cnt, masked
+/// off at the end), then a loop for the rare flags beyond.
+#[inline(always)]
+fn rank_bits<const STEPS: usize>(mut x: u64, d: u64, cnt: usize) -> u64 {
+    let mut out = 0u64;
+    for _ in 0..STEPS {
+        let low = x & x.wrapping_neg();
+        out |= 1u64 << ((d & low.wrapping_sub(1)).count_ones() & 63);
+        x ^= low;
+    }
+    while x != 0 {
+        let low = x & x.wrapping_neg();
+        out |= 1u64 << ((d & (low - 1)).count_ones() & 63);
+        x ^= low;
+    }
+    out & ((1u64 << cnt) - 1)
+}
+
 /// Writes the positions of the set bits of `m` (base + bit) at out[n..]; returns the new n and
 /// the flags of those separators as bit strings (bit i = the i-th separator; `nl` and `fq` are
-/// indexed by byte), without pext (microcoded on Zen 2).
+/// indexed by byte and are subsets of `m`). Up to 8 separators (nearly every block): eight fixed
+/// position steps, then the two flag strings by pext where it is one fast instruction (`fastp`)
+/// and by rank otherwise. More than 8: one step per separator, flags bit by bit.
 #[inline(always)]
-unsafe fn flatten(mut m: u64, nl: u64, fq: u64, base: u32, out: *mut u32, n: usize) -> (usize, u64, u64) {
+unsafe fn flatten<const ISA: u8>(mut m: u64, nl: u64, fq: u64, base: u32, out: *mut u32, n: usize, fastp: bool) -> (usize, u64, u64) {
+    let d = m;
     let cnt = m.count_ones() as usize;
     let p = unsafe { out.add(n) };
-    let (mut nb, mut qb) = (0u64, 0u64);
-    for i in 0..8 {
-        let t = m.trailing_zeros() & 63;
-        unsafe { *p.add(i) = base + t };
-        nb |= ((nl >> t) & 1) << i;
-        qb |= ((fq >> t) & 1) << i;
-        m &= m.wrapping_sub(1);
-    }
     if cnt > 8 {
-        let mut i = 8;
+        let (mut nb, mut qb) = (0u64, 0u64);
+        let mut i = 0;
         while m != 0 {
             let t = m.trailing_zeros();
             unsafe { *p.add(i) = base + t };
@@ -343,10 +384,18 @@ unsafe fn flatten(mut m: u64, nl: u64, fq: u64, base: u32, out: *mut u32, n: usi
             m &= m.wrapping_sub(1);
             i += 1;
         }
+        return (n + cnt, nb, qb);
     }
-    // The fixed steps past the last separator read bit 0: drop those.
-    let keep = if cnt >= 64 { u64::MAX } else { (1u64 << cnt) - 1 };
-    (n + cnt, nb & keep, qb & keep)
+    for i in 0..8 {
+        let t = m.trailing_zeros() & 63;
+        unsafe { *p.add(i) = base + t };
+        m &= m.wrapping_sub(1);
+    }
+    if fastp && ISA != fast::ISA_SCALAR {
+        return (n + cnt, pext::<ISA>(nl, d), pext::<ISA>(fq, d));
+    }
+    // a block holds 0..2 newlines and about one quoted field (unpredictably more): 2 and 3 fixed steps
+    (n + cnt, rank_bits::<2>(nl, d, cnt), rank_bits::<3>(fq, d, cnt))
 }
 
 /// Appends `cnt` bits to each flag stream at bit n (bits n & !63 .. n of the current words are in
@@ -863,6 +912,7 @@ unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: us
     let mut eprev = 0u64;
     let mut carry = 0u64;
     let pf = PREFETCH.load(std::sync::atomic::Ordering::Relaxed);
+    let fastp = pext_fast();
     while b < wend {
         #[cfg(target_arch = "x86_64")]
         if pf != 0 {
@@ -890,10 +940,10 @@ unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: us
         let (n2_, nb, qb) = if ISA == fast::ISA_AVX512 {
             (unsafe { flatten_compress(d, rel, sep, nsep) }, pext::<ISA>(n, d), pext::<ISA>(fq, d))
         } else {
-            unsafe { flatten(d, n, fq, rel, sep, nsep) }
+            unsafe { flatten::<ISA>(d, n, fq, rel, sep, nsep, fastp) }
         };
         #[cfg(not(target_arch = "x86_64"))]
-        let (n2_, nb, qb) = unsafe { flatten(d, n, fq, rel, sep, nsep) };
+        let (n2_, nb, qb) = unsafe { flatten::<ISA>(d, n, fq, rel, sep, nsep, fastp) };
         unsafe { put_bits(fl, nsep, cnt, nb, qb, &mut acc) };
         nsep = n2_;
         dprev = d >> 63;
@@ -976,8 +1026,26 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
     let mut ln = Lanes { ls: [0; LANES], end: [0; LANES], vs: [[0; LANES]; 7], ve: [[0; LANES]; 7] };
     let mut pre = [0u8; LANES];
     let mut pre_u = [0u8; LANES];
-    // Field bounds.
+    // Field bounds. AVX2: all 8 lanes at once from one transpose of the 57 positions (k0 == 0
+    // has no separator before its first line: the lane loop).
+    #[cfg(target_arch = "x86_64")]
+    let vecb = ISA == fast::ISA_AVX2 && k0 > 0;
+    #[cfg(not(target_arch = "x86_64"))]
+    let vecb = false;
+    #[cfg(target_arch = "x86_64")]
+    if vecb {
+        unsafe {
+            crate::avx2::bounds7(sc.sep_ptr().add(k0 - 1), wpos as u32, sc.q_window(k0), &mut ln.ls, &mut ln.end, &mut ln.vs, &mut ln.ve);
+            for l in 0..LANES {
+                // The prefix byte is the first value byte: line start, or one past its quote.
+                pre[l] = *base.add(ln.vs[0][l] as usize);
+            }
+        }
+    }
     for l in 0..LANES {
+        if vecb {
+            break;
+        }
         let kl = k0 + 7 * l;
         let _ = i0;
         let w = wpos as u32;

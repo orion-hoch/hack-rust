@@ -96,7 +96,7 @@ impl<'a, 'b> EvSink<'a, 'b> {
     /// `w`: the pool participant index (the streams' chunks are B8K blocks under it).
     pub fn new(ds: &'a Dataset, ctx: &'b Ctx, b1: u32, w: usize) -> Self {
         #[cfg(target_arch = "x86_64")]
-        let v512 = std::arch::is_x86_feature_detected!("avx512f")
+        let v512 = (std::env::var_os("ENGINE_NO512").is_none() && std::arch::is_x86_feature_detected!("avx512f"))
             && std::arch::is_x86_feature_detected!("avx512dq")
             && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512vl");
@@ -199,6 +199,25 @@ unsafe fn mullo64_halves(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__
     }
 }
 
+/// Bit 2k set for each bit k of the index: `store_lanes`' mask for the AVX2 sink (the AVX-512
+/// sinks take it from one pdep, which is microcode on AMD before Zen 3).
+#[cfg(target_arch = "x86_64")]
+const SPREAD: [u16; 256] = {
+    let mut t = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut k = 0;
+        while k < 8 {
+            if i >> k & 1 != 0 {
+                t[i] |= 1 << (2 * k);
+            }
+            k += 1;
+        }
+        i += 1;
+    }
+    t
+};
+
 /// Appends lane k's 16-byte unit to the bin whose front is at byte offset `part[k]` of the
 /// fronts, for every lane k in `lanes`: the front loaded, one 16-byte store, the front advanced
 /// and its next line asked for. In assembly: 12 instructions a lane (the compiler's loop
@@ -211,9 +230,8 @@ unsafe fn mullo64_halves(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,bmi1,bmi2")]
 #[inline]
-unsafe fn store_lanes(bins: &mut Bins<[u64; 2]>, lanes: u8, part: &[u64; 8], units: &[[u64; 2]; 8]) {
+unsafe fn store_lanes(bins: &mut Bins<[u64; 2]>, mut m: u32, part: &[u64; 8], units: &[[u64; 2]; 8]) {
     let fs = bins.fronts();
-    let mut m = core::arch::x86_64::_pdep_u32(u32::from(lanes), 0x5555);
     while m != 0 {
         // SAFETY: the caller's bound for each front; a front's pointer below its chunk's end has
         // room for one unit.
@@ -405,7 +423,7 @@ impl<'a> EvSink<'a, '_> {
         let (units, part) = unsafe { (units.assume_init_ref(), part.assume_init_ref()) };
         // The plain lanes: front, store, advance (the chunk-end test is the only branch).
         // SAFETY: part[k] / 16 < 2^b1, the number of bins, for every lane.
-        unsafe { store_lanes(&mut self.s, common, part, units) };
+        unsafe { store_lanes(&mut self.s, _pdep_u32(u32::from(common), 0x5555), part, units) };
         if rare == 0 {
             return;
         }
@@ -472,7 +490,8 @@ impl<'a> EvSink<'a, '_> {
                 let mu = mix(_mm256_loadu_si256(b.user_a.as_ptr().add(4 * h) as *const __m256i));
                 let ing = _mm256_cvtepu32_epi64(_mm_loadu_si128(b.ingest.as_ptr().add(4 * h) as *const __m128i));
                 let ts = _mm256_cvtepu32_epi64(_mm_loadu_si128(b.ts.as_ptr().add(4 * h) as *const __m128i));
-                _mm256_storeu_si256(part.as_mut_ptr().add(4 * h) as *mut __m256i, _mm256_srl_epi64(me, cnt));
+                // The bin's byte offset in the fronts (partition * 16), as `store_lanes` takes it.
+                _mm256_storeu_si256(part.as_mut_ptr().add(4 * h) as *mut __m256i, _mm256_slli_epi64::<4>(_mm256_srl_epi64(me, cnt)));
                 let live = lanes(b.surv >> (4 * h));
                 let pu = lanes(purch >> (4 * h));
                 let hi = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi64::<55>(_mm256_srli_epi64::<33>(mu)), s62), _mm256_and_si256(pu, s63));
@@ -486,13 +505,15 @@ impl<'a> EvSink<'a, '_> {
                 _mm256_storeu_si256(u.add(1), _mm256_permute2x128_si256::<0x31>(a, c));
             }
         }
+        // The plain lanes by mask (no branch per lane on which lanes are rare), then the rare
+        // lanes one by one (the order of records inside a stream is free).
         let rare = (wide | purch) & all;
-        for k in 0..n {
-            if rare >> k & 1 == 0 {
-                self.push(part[k] as usize, units[k]);
-            } else {
-                self.rare_lane(b, k);
-            }
+        // SAFETY: part[k] / 16 < 2^b1, the number of bins, for every lane.
+        unsafe { store_lanes(&mut self.s, u32::from(SPREAD[usize::from(all & !rare)]), &part, &units) };
+        let mut m = u32::from(rare);
+        while m != 0 {
+            self.rare_lane(b, m.trailing_zeros() as usize);
+            m &= m - 1;
         }
     }
 
@@ -627,6 +648,8 @@ pub struct ClickSink<'a, 'b> {
     pub bad: bool,
     /// AVX-512 (F, DQ, BW, VL) detected: the batch is packed 8 lanes at a time.
     v512: bool,
+    /// AVX2 (and BMI1, BMI2) detected: the batch is packed 4 lanes at a time.
+    v256: bool,
 }
 
 impl<'a, 'b> ClickSink<'a, 'b> {
@@ -636,13 +659,79 @@ impl<'a, 'b> ClickSink<'a, 'b> {
         // ones at 60M); P1's person blocks are fed by I2's B8K frees, not by these.
         use crate::v3::mem::B2K;
         #[cfg(target_arch = "x86_64")]
-        let v512 = std::arch::is_x86_feature_detected!("avx512f")
+        let v512 = (std::env::var_os("ENGINE_NO512").is_none() && std::arch::is_x86_feature_detected!("avx512f"))
             && std::arch::is_x86_feature_detected!("avx512dq")
             && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512vl");
         #[cfg(not(target_arch = "x86_64"))]
         let v512 = false;
-        ClickSink { ds, ctx, b2, s: Bins::from_blocks(1 << b2, &B2K, w), wide: Bins::from_blocks(1 << b2, &B2K, w), bad: false, v512 }
+        #[cfg(target_arch = "x86_64")]
+        let v256 = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi1") && std::arch::is_x86_feature_detected!("bmi2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let v256 = false;
+        ClickSink { ds, ctx, b2, s: Bins::from_blocks(1 << b2, &B2K, w), wide: Bins::from_blocks(1 << b2, &B2K, w), bad: false, v512, v256 }
+    }
+
+    /// One batch with AVX2, as `clicks512`, 4 lanes a vector (the 40-bit multiply from three
+    /// 32-bit ones, as `EvSink::scatter256`): the path of a host without AVX-512.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2")]
+    #[inline(never)]
+    unsafe fn clicks256(&mut self, b: &ClickBatch) {
+        use core::arch::x86_64::*;
+        let n = (b.n as usize).min(8);
+        let all = ((1u32 << n) - 1) as u8;
+        let wide = b.user_long & all;
+        let short = all & !wide;
+        let sh = 40 - self.b2;
+        let mut units = [[0u64; 2]; 8];
+        let mut part = [0u64; 8];
+        // Bit k: lane k's campaign or locator is past its field.
+        let mut over = 0u32;
+        unsafe {
+            let clo = _mm256_set1_epi64x((super::keys::MIX_C & 0xFFFF_FFFF) as i64);
+            let chi = _mm256_set1_epi64x((super::keys::MIX_C >> 32) as i64);
+            let m40 = _mm256_set1_epi64x(super::keys::M40 as i64);
+            let mix = |x: __m256i| {
+                // x * MIX_C mod 2^64, then mod 2^40 and the xor-shift
+                let lo = _mm256_mul_epu32(x, clo);
+                let mid = _mm256_add_epi64(_mm256_mul_epu32(_mm256_srli_epi64::<32>(x), clo), _mm256_mul_epu32(x, chi));
+                let y = _mm256_and_si256(_mm256_add_epi64(lo, _mm256_slli_epi64::<32>(mid)), m40);
+                _mm256_xor_si256(y, _mm256_srli_epi64::<20>(y))
+            };
+            let rmask = _mm256_set1_epi64x(((1u64 << sh) - 1) as i64);
+            let cnt = _mm_cvtsi32_si128(sh as i32);
+            let zero = _mm256_setzero_si256();
+            for h in 0..2 {
+                let mu = mix(_mm256_loadu_si256(b.user_a.as_ptr().add(4 * h) as *const __m256i));
+                // The bin's byte offset in the fronts (partition * 16).
+                _mm256_storeu_si256(part.as_mut_ptr().add(4 * h) as *mut __m256i, _mm256_slli_epi64::<4>(_mm256_srl_epi64(mu, cnt)));
+                let ts = _mm256_cvtepu32_epi64(_mm_loadu_si128(b.ts.as_ptr().add(4 * h) as *const __m128i));
+                let camp = _mm256_cvtepu16_epi64(_mm_loadl_epi64(b.campaign.as_ptr().add(4 * h) as *const __m128i));
+                let loc = _mm256_loadu_si256(b.loc.as_ptr().add(4 * h) as *const __m256i);
+                let ov = _mm256_or_si256(_mm256_srli_epi64::<12>(camp), _mm256_srli_epi64::<52>(loc));
+                let is0 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(ov, zero))) as u32;
+                over |= (!is0 & 0xF) << (4 * h);
+                let w0 = _mm256_or_si256(_mm256_slli_epi64::<32>(_mm256_and_si256(mu, rmask)), ts);
+                let w1 = _mm256_or_si256(_mm256_slli_epi64::<52>(camp), loc);
+                // [w0, w1] pairs in lane order
+                let a = _mm256_unpacklo_epi64(w0, w1); // lanes 0, 2
+                let c = _mm256_unpackhi_epi64(w0, w1); // lanes 1, 3
+                let u = units.as_mut_ptr().add(4 * h) as *mut __m256i;
+                _mm256_storeu_si256(u, _mm256_permute2x128_si256::<0x20>(a, c));
+                _mm256_storeu_si256(u.add(1), _mm256_permute2x128_si256::<0x31>(a, c));
+            }
+        }
+        // 4,096 campaigns or more, or a locator past 52 bits (lanes 0..n): v4 cannot hold it.
+        self.bad |= over & u32::from(all) != 0;
+        // SAFETY: part[k] / 16 < 2^b2, the number of bins, for every lane.
+        unsafe { store_lanes(&mut self.s, u32::from(SPREAD[usize::from(short)]), &part, &units) };
+        let mut m = u32::from(wide);
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            self.wide(LONG, b.user_a[k], b.user_b[k], u64::from(b.ts[k]), units[k][1]);
+            m &= m - 1;
+        }
     }
 
     /// One batch with AVX-512, as `EvSink::scatter512`: every lane's 16-byte record (the user
@@ -689,7 +778,7 @@ impl<'a, 'b> ClickSink<'a, 'b> {
         // SAFETY: every lane of both arrays was written above.
         let (units, part) = unsafe { (units.assume_init_ref(), part.assume_init_ref()) };
         // SAFETY: part[k] / 16 < 2^b2, the number of bins, for every lane.
-        unsafe { store_lanes(&mut self.s, short, part, units) };
+        unsafe { store_lanes(&mut self.s, _pdep_u32(u32::from(short), 0x5555), part, units) };
         let mut m = u32::from(wide);
         while m != 0 {
             let k = m.trailing_zeros() as usize;
@@ -698,8 +787,7 @@ impl<'a, 'b> ClickSink<'a, 'b> {
         }
     }
 
-    #[cold]
-    #[inline(never)]
+    #[inline]
     fn wide(&mut self, kind: u64, a: u64, b: u64, tc: u64, cl: u64) {
         let p = (long_hash(a, b) >> (64 - self.b2)) as usize;
         // SAFETY: p < 2^b2.
@@ -722,6 +810,11 @@ impl<'a> Sink for ClickSink<'a, '_> {
         if self.v512 {
             // SAFETY: the features were detected at construction.
             return unsafe { self.clicks512(b) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.v256 {
+            // SAFETY: as above.
+            return unsafe { self.clicks256(b) };
         }
         let n = (b.n as usize).min(8);
         let mut over = 0u64;

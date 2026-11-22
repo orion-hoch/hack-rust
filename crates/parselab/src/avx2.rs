@@ -321,3 +321,59 @@ pub(crate) unsafe fn keys(
         }
     }
 }
+
+/// Field value bounds of the 8 event lines of a batch, as the scalar loop in `fast2::batch`:
+/// `sep[0]` is the newline before the first line and `sep[1..57]` the 56 separators; bit
+/// 7 * lane + field of `q` says that field is quoted; `w` is the window's file offset. One 8x8
+/// transpose of the separator positions gives every field's column for the 8 lanes.
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(crate) unsafe fn bounds7(sep: *const u32, w: u32, q: u64, ls: &mut [u32; 8], end: &mut [u32; 8], vs: &mut [[u32; 8]; 7], ve: &mut [[u32; 8]; 7]) {
+    unsafe {
+        let r = |l: usize| _mm256_loadu_si256(sep.add(7 * l) as *const __m256i);
+        let (r0, r1, r2, r3, r4, r5, r6, r7) = (r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7));
+        let t0 = _mm256_unpacklo_epi32(r0, r1);
+        let t1 = _mm256_unpackhi_epi32(r0, r1);
+        let t2 = _mm256_unpacklo_epi32(r2, r3);
+        let t3 = _mm256_unpackhi_epi32(r2, r3);
+        let t4 = _mm256_unpacklo_epi32(r4, r5);
+        let t5 = _mm256_unpackhi_epi32(r4, r5);
+        let t6 = _mm256_unpacklo_epi32(r6, r7);
+        let t7 = _mm256_unpackhi_epi32(r6, r7);
+        let u0 = _mm256_unpacklo_epi64(t0, t2);
+        let u1 = _mm256_unpackhi_epi64(t0, t2);
+        let u2 = _mm256_unpacklo_epi64(t1, t3);
+        let u3 = _mm256_unpackhi_epi64(t1, t3);
+        let u4 = _mm256_unpacklo_epi64(t4, t6);
+        let u5 = _mm256_unpackhi_epi64(t4, t6);
+        let u6 = _mm256_unpacklo_epi64(t5, t7);
+        let u7 = _mm256_unpackhi_epi64(t5, t7);
+        // col[j] lane l = sep[7 * l + j]: the separator before field j of line l.
+        let col = [
+            _mm256_permute2x128_si256::<0x20>(u0, u4),
+            _mm256_permute2x128_si256::<0x20>(u1, u5),
+            _mm256_permute2x128_si256::<0x20>(u2, u6),
+            _mm256_permute2x128_si256::<0x20>(u3, u7),
+            _mm256_permute2x128_si256::<0x31>(u0, u4),
+            _mm256_permute2x128_si256::<0x31>(u1, u5),
+            _mm256_permute2x128_si256::<0x31>(u2, u6),
+            _mm256_permute2x128_si256::<0x31>(u3, u7),
+        ];
+        // Lanes 0..4 test bit 7 * l + j of q, lanes 4..8 bit 7 * (l - 4) + j of q >> 28.
+        let (lo, hi) = (q as u32 as i32, (q >> 28) as u32 as i32);
+        let x = _mm256_setr_epi32(lo, lo, lo, lo, hi, hi, hi, hi);
+        let bits0 = _mm256_setr_epi32(1, 1 << 7, 1 << 14, 1 << 21, 1, 1 << 7, 1 << 14, 1 << 21);
+        let w1 = _mm256_set1_epi32(w.wrapping_add(1) as i32);
+        let wv = _mm256_set1_epi32(w as i32);
+        _mm256_storeu_si256(ls.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(col[0], w1));
+        _mm256_storeu_si256(end.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(col[7], wv));
+        for j in 0..7 {
+            let bits = _mm256_sll_epi32(bits0, _mm_cvtsi32_si128(j as i32));
+            let m = _mm256_cmpeq_epi32(_mm256_and_si256(x, bits), bits); // -1 where quoted
+            let s = _mm256_sub_epi32(_mm256_add_epi32(col[j], w1), m);
+            let e = _mm256_add_epi32(_mm256_add_epi32(col[j + 1], wv), m);
+            _mm256_storeu_si256(vs[j].as_mut_ptr() as *mut __m256i, s);
+            _mm256_storeu_si256(ve[j].as_mut_ptr() as *mut __m256i, e);
+        }
+    }
+}

@@ -117,7 +117,8 @@ impl Ends {
         self.bad |= self.lines > E_MASK;
         let mut soff = vec![0u32; parts + 1];
         for &r in &self.short {
-            soff[(r >> (64 - b2)) as usize + 1] += 1;
+            // SAFETY: r >> (64 - b2) < 2^b2 = parts, and soff has parts + 1 entries.
+            unsafe { *soff.get_unchecked_mut((r >> (64 - b2)) as usize + 1) += 1 };
         }
         let mut woff = vec![0u32; parts + 1];
         for w in &self.wide {
@@ -131,8 +132,13 @@ impl Ends {
         let mut at = soff.clone();
         for &r in &self.short {
             let q = (r >> (64 - b2)) as usize;
-            s[at[q] as usize] = r;
-            at[q] += 1;
+            // SAFETY: q < parts; at[q] runs over partition q's stretch soff[q]..soff[q + 1] of s
+            // (the counts above are of these same records), below short.len() = s.len().
+            unsafe {
+                let a = at.get_unchecked_mut(q);
+                *s.get_unchecked_mut(*a as usize) = r;
+                *a += 1;
+            }
         }
         let mut w = vec![[0u64; 3]; self.wide.len()];
         let mut at = woff.clone();
@@ -167,9 +173,33 @@ impl Sink for LinkSink<'_> {
 
     #[inline]
     fn links(&mut self, b: &LinkBatch) {
-        for k in 0..b.n as usize {
-            self.ends.line((b.a_long >> k & 1 != 0, b.a_a[k], b.a_b[k]), (b.b_long >> k & 1 != 0, b.b_a[k], b.b_b[k]));
+        let n = (b.n as usize).min(8);
+        let e = &mut self.ends;
+        // Room for the batch's SHORT ends asked once; they are then written without a check.
+        e.short.reserve(16);
+        let sp = e.short.as_mut_ptr();
+        let mut len = e.short.len();
+        let mut t = e.lines << 1;
+        for k in 0..n {
+            if b.a_long >> k & 1 != 0 {
+                e.wide.push([b.a_a[k], b.a_b[k], (KIND_LONG << 62) | t]);
+            } else {
+                // SAFETY: at most 2 * n <= 16 SHORT ends a batch, reserved above.
+                unsafe { *sp.add(len) = (mix40(b.a_a[k]) << 24) | t };
+                len += 1;
+            }
+            if b.b_long >> k & 1 != 0 {
+                e.wide.push([b.b_a[k], b.b_b[k], (KIND_LONG << 62) | t | 1]);
+            } else {
+                // SAFETY: as above.
+                unsafe { *sp.add(len) = (mix40(b.b_a[k]) << 24) | t | 1 };
+                len += 1;
+            }
+            t += 2;
         }
+        // SAFETY: the first `len` entries are written, within the reserved capacity.
+        unsafe { e.short.set_len(len) };
+        e.lines += n as u64;
     }
 
     fn foreign_link(&mut self, at: Locator) {
@@ -232,7 +262,9 @@ impl Nodes {
     /// Byte order of the ids of nodes x and y (x != y).
     #[inline(always)]
     fn less(&self, x: u32, y: u32) -> bool {
-        let (kx, ky) = (self.uf[x as usize].okey, self.uf[y as usize].okey);
+        debug_assert!((x as usize) < self.uf.len() && (y as usize) < self.uf.len());
+        // SAFETY: x and y are nodes (roots returned by `find`), below uf.len().
+        let (kx, ky) = unsafe { (self.uf.get_unchecked(x as usize).okey, self.uf.get_unchecked(y as usize).okey) };
         if kx != ky && kx != OKEY_FOREIGN && ky != OKEY_FOREIGN {
             return kx < ky;
         }
@@ -319,6 +351,10 @@ fn find(uf: &mut [Uf], mut x: u32) -> u32 {
                 return x;
             }
             let g = (*p.add(px as usize)).parent;
+            // the parent is the root (the usual case below a root): no store, no third read
+            if g == px {
+                return px;
+            }
             (*p.add(x as usize)).parent = g;
             x = g;
         }
@@ -406,13 +442,14 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
     let tag = 2 * E_MASK + 1;
     for q in 0..parts {
         let tq = tsc();
-        sbase[q] = nd.uf.len() as u32;
+        let base = nd.uf.len() as u32;
+        sbase[q] = base;
         for (t, te) in tasks.iter().enumerate() {
             let eb = 2 * ebase[t];
             for &r in &te.short[te.soff[q] as usize..te.soff[q + 1] as usize] {
                 let mu = r >> 24;
                 // ru + 1: nonzero, and the partition's users are told apart by ru alone.
-                let id = tab.get((mu & rmask) + 1, mu, sbase[q], || nd.push(okey40(unmix40(mu)), mu));
+                let id = tab.get((mu & rmask) + 1, mu, base, || nd.push(okey40(unmix40(mu)), mu));
                 // SAFETY: r's tag < 2 * the task's lines, within its stretch of en.
                 unsafe { *en.get_unchecked_mut((eb + (r & tag)) as usize) = id };
             }
@@ -479,13 +516,14 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
             prefetch(unsafe { ufp.add(*en.get_unchecked(2 * (j + AHEAD)) as usize) });
             prefetch(unsafe { ufp.add(*en.get_unchecked(2 * (j + AHEAD) + 1) as usize) });
         }
-        let (ea, eb) = (en[2 * j], en[2 * j + 1]);
+        // SAFETY: en holds 2 * nl entries; roots are nodes < n = uf.len().
+        let (ea, eb) = unsafe { (*en.get_unchecked(2 * j), *en.get_unchecked(2 * j + 1)) };
         let (ra, rb) = (find(&mut nd.uf, ea), find(&mut nd.uf, eb));
         if ra != rb {
             if nd.less(ra, rb) {
-                nd.uf[rb as usize].parent = ra;
+                unsafe { nd.uf.get_unchecked_mut(rb as usize).parent = ra };
             } else {
-                nd.uf[ra as usize].parent = rb;
+                unsafe { nd.uf.get_unchecked_mut(ra as usize).parent = rb };
             }
         }
     }
@@ -521,30 +559,43 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
         WIDE | (Nodes::kind(p) << 61) | ((p & qmask) << 32) | u64::from(nd.uf[r].wix - 1)
     };
     let mut persons = 0;
+    debug_assert!(nd.place.len() == n);
+    // SHORT entries written so far (ns in all, the capacity of ru and pk: their lengths are set
+    // once, after the loop).
+    let (ru_p, pk_p) = (l.ru.as_mut_ptr(), l.pk.as_mut_ptr());
+    let mut si = 0usize;
     for x in 0..n {
         if x + AHEAD < n {
-            let p = nd.uf[x + AHEAD].parent as usize;
-            prefetch(&nd.uf[p]);
-            prefetch(&nd.place[p]);
+            // SAFETY: a parent is a node < n = uf.len() = place.len(); prefetch never faults.
+            unsafe {
+                let p = nd.uf.get_unchecked(x + AHEAD).parent as usize;
+                prefetch(nd.uf.as_ptr().add(p));
+                prefetch(nd.place.as_ptr().add(p));
+            }
         }
         let r = find(&mut nd.uf, x as u32) as usize;
         persons += usize::from(r == x);
-        let pr = nd.place[r];
+        // SAFETY: r (a root) and x are nodes < n = place.len().
+        let pr = unsafe { *nd.place.get_unchecked(r) };
         let pk = if pr & WIDE == 0 { pr } else { wix_of(&mut nd, &mut l.wkeys, r) };
-        let p = nd.place[x];
+        let p = unsafe { *nd.place.get_unchecked(x) };
         if p & WIDE == 0 {
+            debug_assert!(si < ns as usize);
             // SAFETY: ns SHORT nodes in all, the capacity of both.
             unsafe {
-                let i = l.ru.len();
-                l.ru.as_mut_ptr().add(i).write((p & rmask) as u32);
-                l.pk.as_mut_ptr().add(i).write(pk);
-                l.ru.set_len(i + 1);
-                l.pk.set_len(i + 1);
+                ru_p.add(si).write((p & rmask) as u32);
+                pk_p.add(si).write(pk);
             }
+            si += 1;
         } else {
             let k = nd.wkey[((p & !(7 << 61)) >> WIDX_SHIFT) as usize];
             l.wide.push([k[0], k[1], pk, Nodes::kind(p)]);
         }
+    }
+    // SAFETY: the first si entries of both were written above, si <= ns = their capacity.
+    unsafe {
+        l.ru.set_len(si);
+        l.pk.set_len(si);
     }
     sp.nodes_ms = (t1 - t0).as_secs_f64() * 1e3;
     sp.union_ms = (t2 - t1).as_secs_f64() * 1e3;

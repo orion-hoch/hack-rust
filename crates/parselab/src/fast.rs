@@ -26,7 +26,7 @@ impl Isa {
     pub fn detect() -> Isa {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::is_x86_feature_detected!("avx512f")
+            if (std::env::var_os("ENGINE_NO512").is_none() && std::is_x86_feature_detected!("avx512f"))
                 && std::is_x86_feature_detected!("avx512bw")
                 && std::is_x86_feature_detected!("avx512dq")
                 && std::is_x86_feature_detected!("avx512vl")

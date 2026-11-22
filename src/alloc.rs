@@ -651,6 +651,28 @@ impl Spans {
         }
     }
 
+    /// Where `alloc(n)` would write the header of the remainder if it ran now (0: no split, or
+    /// no span to take). A hint for prefaulting that page outside the lock.
+    unsafe fn peek_remainder(&self, n: usize) -> usize {
+        let mut found: *mut FreeSpan = null_mut();
+        let mask = if n <= SPAN_LISTS { self.nonempty >> (n - 1) } else { 0 };
+        if mask != 0 {
+            found = self.lists[n + mask.trailing_zeros() as usize];
+        } else {
+            let mut s = self.lists[0];
+            while !s.is_null() {
+                // SAFETY: listed spans are valid.
+                if unsafe { (*s).pages } >= n {
+                    found = s;
+                    break;
+                }
+                s = unsafe { (*s).next };
+            }
+        }
+        // SAFETY: found is a listed free span.
+        if !found.is_null() && unsafe { (*found).pages } > n { found as usize + n * PAGE } else { 0 }
+    }
+
     unsafe fn alloc(&mut self, n: usize) -> *mut u8 {
         loop {
             // smallest non-empty exact list of at least n pages, else first fit among longer spans
@@ -743,6 +765,21 @@ fn span_alloc(size: usize) -> *mut u8 {
     if STATS {
         stats::SPAN_LIVE.fetch_add((size.div_ceil(PAGE) * PAGE) as isize, Ordering::Relaxed);
         stats::note();
+    }
+    // Splitting a span writes the remainder's header, and on fresh memory that write is a page
+    // fault that zeroes a whole huge page (100 to 250 us) UNDER the lock: measured 189 waits a
+    // run at 20M and 292 at 60M, each burning that long in sched_yield on another worker. So:
+    // look up where the header would go, drop the lock, ask the kernel to populate that page
+    // (contents untouched if it is already there), then allocate. The hint may be stale; that
+    // only costs the old behaviour.
+    SPAN_LOCK.lock();
+    // SAFETY: under SPAN_LOCK.
+    let hint = unsafe { (*SPANS.0.get()).peek_remainder(size.div_ceil(PAGE)) };
+    SPAN_LOCK.unlock();
+    if hint != 0 {
+        // SAFETY: a hint on memory this allocator mapped; MADV_POPULATE_WRITE changes no contents
+        // (an older kernel returns EINVAL and nothing happens).
+        unsafe { madvise((hint & !(PAGE - 1)) as *mut c_void, PAGE, 23) };
     }
     SPAN_LOCK.lock();
     // SAFETY: under SPAN_LOCK.

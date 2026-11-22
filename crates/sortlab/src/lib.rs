@@ -84,7 +84,7 @@ pub const BEST: Kernel = Kernel::Net;
 pub fn net_bits(width: NetWidth) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        let f = std::arch::is_x86_feature_detected!("avx512f");
+        let f = (std::env::var_os("ENGINE_NO512").is_none() && std::arch::is_x86_feature_detected!("avx512f"));
         let vl = std::arch::is_x86_feature_detected!("avx512vl");
         match width {
             NetWidth::W512 if f => 512,

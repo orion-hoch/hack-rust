@@ -470,7 +470,7 @@ unsafe fn stage_plain(stage: *mut u64, fill: *mut u32, short: &mut Out, rsh: u32
         let n = n + keep as usize;
         if n == 8 {
             *f = FILL0;
-            short.flush_line(q);
+            short.flush_line_here(q);
         } else {
             *f = FILL0 + n as u32;
         }

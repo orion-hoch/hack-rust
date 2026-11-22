@@ -225,10 +225,10 @@ unsafe fn mullo64<const S: bool>(a: __m512i, b: __m512i) -> __m512i {
     split2::<S>(a, b, |x, y| _mm512_mullo_epi64(x, y), |x, y| mullo64_256(x, y))
 }
 
-/// 8 base-36 IDs: (value or NONE40), from the 8 bytes ending at each ID's end, the field's
+/// 8 base-36 IDs: (value or NONE40, which lanes have a value), from the 8 bytes ending at each ID's end, the field's
 /// length (prefix + k digits, as i64, any value) and whether its prefix byte matched.
 #[inline(always)]
-unsafe fn ids<const S: bool>(w: __m512i, len: __m512i, prefix_ok: __mmask8) -> __m512i {
+unsafe fn ids<const S: bool>(w: __m512i, len: __m512i, prefix_ok: __mmask8) -> (__m512i, __mmask8) {
     unsafe {
         // Keep the last k = len - 1 bytes: shift 8 * (8 - k). No clamp: for k outside 1..=8 the
         // shift count is out of range (the lane becomes all '0') and the count check rejects it.
@@ -266,7 +266,7 @@ unsafe fn ids<const S: bool>(w: __m512i, len: __m512i, prefix_ok: __mmask8) -> _
         let r = _mm512_ternarylogic_epi64::<0xF8>(r, _mm512_sub_epi64(value, low), _mm512_set1_epi64(i64::MIN));
         let r = _mm512_ternarylogic_epi64::<0xF8>(r, sh, _mm512_set1_epi64(!0x38));
         let good = _mm512_testn_epi64_mask(r, r) & prefix_ok;
-        _mm512_mask_blend_epi64(good, _mm512_set1_epi64(-1), value)
+        (_mm512_mask_blend_epi64(good, _mm512_set1_epi64(-1), value), good)
     }
 }
 
@@ -284,12 +284,13 @@ unsafe fn byte_at(v: __m512i, i: u32) -> __m512i {
 }
 
 /// `YYYY-MM-DD` over hi (bytes 0..8) and mid (bytes 0..2): (day * 86400 relative to
-/// window_start's day, valid and in the table, byte 2 of mid is `T`). No digit decode: the low bits of the characters
+/// window_start's day, valid and in the table, mid ^ `3x3xT`: its byte 2 is 0 when the `T` is
+/// there, for `hms` to fold into its one test). No digit decode: the low bits of the characters
 /// pick a slot of `Dates::ent` (byte sums, no multiply) and the text is compared with the one date
 /// that lives there, so it is valid exactly when it is the text of a table date. Other lanes get
 /// BAD_DAY * 86400, as the multiply of the old day table's BAD_DAY gave.
 #[inline(always)]
-unsafe fn date(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m512i, __mmask8, __mmask8) {
+unsafe fn date(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m512i, __mmask8, __m512i) {
     unsafe {
         // Y4 bit -> 0x40 of byte 3, M1 bit -> 0x80 of byte 5, M2 nibble -> 0x3C of byte 6; the
         // byte sum is slot bits 2..8, and D1 (bits 0..2) and D2 (bits 8..12) come from mid as is.
@@ -299,16 +300,15 @@ unsafe fn date(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m512i, __mmask8, 
         let e = _mm512_i64gather_epi64::<8>(idx, dates.ent_ptr() as *const i64);
         // Expected bytes 0..8: the slot's year, then `-0x-3x-` up to the slot bits.
         let want = _mm512_ternarylogic_epi64::<0xEA>(e, c64(0xFFFF_FFFF), c64(0x2D30_302D_0000_0000));
-        // mid against `3x3xT`: the day digits' high bits (part of the date), and the `T` after them
-        // as a separate result (it is not part of what selects the day).
+        // mid against `3x3xT`: the day digits' high bits are part of the date; the `T` after them
+        // is not part of what selects the day, and is left in xm for the caller.
         let xm = _mm512_xor_si512(mid, c64(0x0054_3030));
         // One test for the date: the differences of hi (under its mask) and of mid's day digits.
         let r = _mm512_ternarylogic_epi64::<0x28>(hi, want, c64(0xFFF0_FEFF_FFFF_FFFF));
         let r = _mm512_ternarylogic_epi64::<0xF8>(r, xm, c64(0xF0FC));
         let ok = _mm512_testn_epi64_mask(r, r);
-        let t_ok = _mm512_testn_epi64_mask(xm, c64(0x00FF_0000));
         let day_s = _mm512_mask_srai_epi64::<32>(_mm512_set1_epi64(BAD_DAY as i64 * 86_400), ok, e);
-        (day_s, ok, t_ok)
+        (day_s, ok, xm)
     }
 }
 
@@ -321,9 +321,10 @@ unsafe fn times1000(x: __m512i) -> __m512i {
     }
 }
 
-/// `HH:MM:SS` in t (8 bytes): (seconds of day, ok). Lane-wise copy of `fast::hms`.
+/// `HH:MM:SS` in t (8 bytes), and a word tx whose bytes `txm` must be zero (from `date`: the `T`
+/// before the time): (seconds of day, all ok).
 #[inline(always)]
-unsafe fn hms<const S: bool>(t: __m512i) -> (__m512i, __mmask8) {
+unsafe fn hms<const S: bool>(t: __m512i, tx: __m512i, txm: u64) -> (__m512i, __mmask8) {
     unsafe {
         // y: 0 at the colons and the digit values elsewhere, when the text is well formed; z adds
         // 15 - limit to each digit (H 2 9, M 5 9, S 5 9), so a digit over its limit reaches bit 4.
@@ -339,6 +340,9 @@ unsafe fn hms<const S: bool>(t: __m512i) -> (__m512i, __mmask8) {
         // hour + 232 carries out of byte 0 exactly when the hour is over 23: bit 8 (clear before).
         let over = _mm512_add_epi64(v, _mm512_set1_epi64(232));
         let r = _mm512_ternarylogic_epi64::<0xF8>(r, over, _mm512_set1_epi64(0x100));
+        // and what the caller wants tested with it: the bytes `txm` of tx must be zero (the `T`
+        // before the time: byte 2 of the date's mid word, see `date`; for ingest also the `Z`).
+        let r = _mm512_ternarylogic_epi64::<0xF8>(r, tx, c64(txm));
         let ok = _mm512_testn_epi64_mask(r, r);
         // (h * 60 + m) * 60 + s on the three fields in place (24 bits apart; each * 60 as
         // (x << 6) - (x << 2) stays inside its field), no byte extraction.
@@ -369,6 +373,29 @@ unsafe fn dec8<const S: bool>(w: __m512i) -> (__m512i, __mmask8) {
         )
     };
     (v, ok)
+}
+
+/// As `dec8`, with the digit check left as a word that is zero when all 8 are digits (a digit's
+/// high nibble is zero, and so is the high nibble of digit + 6): the caller ORs several and tests
+/// once.
+#[inline(always)]
+unsafe fn dec8r<const S: bool>(w: __m512i) -> (__m512i, __m512i) {
+    unsafe {
+        let x = _mm512_xor_si512(w, c64(0x3030_3030_3030_3030));
+        let r = _mm512_ternarylogic_epi64::<0xA8>(x, _mm512_add_epi8(x, _mm512_set1_epi8(6)), c64(0xF0F0_F0F0_F0F0_F0F0));
+        let v = chain::<S>(
+            x,
+            |x| {
+                let t = _mm512_madd_epi16(_mm512_maddubs_epi16(x, _mm512_set1_epi16(0x010A)), _mm512_set1_epi32(0x0001_0064));
+                _mm512_add_epi64(mul_epu32_512(t, _mm512_set1_epi64(10_000)), _mm512_srli_epi64::<32>(t))
+            },
+            |x| {
+                let t = madd_100(maddubs_10(x));
+                _mm256_add_epi64(mulu_10p4(t), _mm256_srli_epi64::<32>(t))
+            },
+        );
+        (v, r)
+    }
 }
 
 /// Offset `SS±HH:MM` (bytes 0..8 of t17): (signed offset ms, ok).
@@ -665,11 +692,9 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         // Order matters for the instruction count: the LONG branch between the two decodes ends
         // the block, so each decode's constants are single-use memory operands instead of one
         // register load each shared by both.
-        let x_e = ids::<S>(w_e, len[0], pe);
-        let e_short = _mm512_cmpneq_epi64_mask(x_e, _mm512_set1_epi64(-1));
+        let (x_e, e_short) = ids::<S>(w_e, len[0], pe);
         let (e_a, e_b, e_long) = with_long(wbase, ve[0], len[0], pe, x_e);
-        let x_u = ids::<S>(w_u, len[1], pu);
-        let u_short = _mm512_cmpneq_epi64_mask(x_u, _mm512_set1_epi64(-1));
+        let (x_u, u_short) = ids::<S>(w_u, len[1], pu);
         let (u_a, u_b, u_long) = with_long(wbase, ve[1], len[1], pu, x_u);
         let ev_ok = e_short | e_long;
         let user_ok = u_short | u_long;
@@ -679,11 +704,11 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         // HH:MM:SS (bytes 11..19) as its own gather: no shifts to join it from two others.
         let t_11 = gather64o(wbase, vs[2], 11);
         let t_17 = gather64o(wbase, vs[2], 17);
-        let (day_s, date_ok, t_ok) = date(dates, t_hi, t_mid);
-        let (secs, hms_ok) = hms::<S>(t_11);
+        let (day_s, date_ok, t_x) = date(dates, t_hi, t_mid);
+        let (secs, hms_ok) = hms::<S>(t_11, t_x, 0x00FF_0000);
         let z = _mm512_cmpeq_epi64_mask(byte_at(t_17, 2), _mm512_set1_epi64(b'Z' as i64));
         let (off, off_ok) = offset::<S>(t_17);
-        let dt_ok = date_ok & t_ok & hms_ok;
+        let dt_ok = date_ok & hms_ok;
         let f1 = _mm512_cmpeq_epi64_mask(len[2], _mm512_set1_epi64(20)) & z & dt_ok;
         let f2 = _mm512_cmpeq_epi64_mask(len[2], _mm512_set1_epi64(25)) & off_ok & dt_ok;
         // day * DAY_MS + secs * 1000 as (day * 86400 + secs) * 1000, by shifts.
@@ -696,9 +721,10 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let m13 = _mm512_cmpeq_epi64_mask(len[2], _mm512_set1_epi64(13));
         let (mut f3, mut v3) = (0u8, zero);
         if m13 != 0 {
-            let (hi, hi_ok) = dec8::<S>(t_hi);
-            let (lo, lo_ok) = dec8::<S>(_mm512_or_si512(_mm512_slli_epi64::<24>(t_mid), _mm512_set1_epi64(0x0030_3030)));
-            f3 = m13 & hi_ok & lo_ok;
+            let (hi, hi_r) = dec8r::<S>(t_hi);
+            let (lo, lo_r) = dec8r::<S>(_mm512_or_si512(_mm512_slli_epi64::<24>(t_mid), _mm512_set1_epi64(0x0030_3030)));
+            let r = _mm512_or_si512(hi_r, lo_r);
+            f3 = m13 & _mm512_testn_epi64_mask(r, r);
             v3 = _mm512_sub_epi64(_mm512_add_epi64(chain::<S>(hi, |x| _mm512_mul_epu32(x, _mm512_set1_epi64(100_000)), |x| mulu_100000(x)), lo), _mm512_set1_epi64(f.ws_ms));
         }
         let ts_rel = _mm512_mask_blend_epi64(f3, f12, v3);
@@ -707,10 +733,11 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let i_hi = gather64(wbase, vs[3]);
         let i_mid = gather64o(wbase, vs[3], 8);
         let i_16 = gather64o(wbase, vs[3], 16);
-        let (iday_s, idate_ok, it_ok) = date(dates, i_hi, i_mid);
-        let (isecs, ihms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(i_mid), _mm512_slli_epi64::<40>(i_16)));
-        let iz = _mm512_cmpeq_epi64_mask(byte_at(i_16, 3), _mm512_set1_epi64(b'Z' as i64));
-        let ing_fast = _mm512_cmpeq_epi64_mask(len[3], _mm512_set1_epi64(20)) & idate_ok & it_ok & ihms_ok & iz;
+        let (iday_s, idate_ok, i_x) = date(dates, i_hi, i_mid);
+        // The `Z` (byte 3 of i_16) joins the `T` (byte 2 of i_x) in the word hms tests: bytes 2 and 3.
+        let i_zx = _mm512_ternarylogic_epi64::<0xD8>(i_x, _mm512_xor_si512(i_16, _mm512_set1_epi64((b'Z' as i64) << 24)), _mm512_set1_epi64(0xFF00_0000));
+        let (isecs, ihms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(i_mid), _mm512_slli_epi64::<40>(i_16)), i_zx, 0xFFFF_0000);
+        let ing_fast = _mm512_cmpeq_epi64_mask(len[3], _mm512_set1_epi64(20)) & idate_ok & ihms_ok;
         let ing_s = _mm512_add_epi64(iday_s, isecs);
         let ingest = _mm512_add_epi64(ing_s, _mm512_set1_epi64(f.ingest_add));
         // Type, validity, lateness.
@@ -724,11 +751,9 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let ts_ok = _mm512_cmplt_epu64_mask(ts_rel, _mm512_set1_epi64(f.win_ms));
         let ing_ms = _mm512_sub_epi64(chain::<S>(ing_s, |x| _mm512_mul_epi32(x, _mm512_set1_epi64(1000)), |x| muls_1000(x)), _mm512_set1_epi64(f.ws_frac));
         let late = _mm512_cmpgt_epi64_mask(_mm512_sub_epi64(ing_ms, ts_rel), _mm512_set1_epi64(DAY_MS));
-        let base_ok = _mm512_cmpneq_epi64_mask(len[1], zero)
-            & ts_ok
-            & (purchase | view | cart)
-            & _mm512_cmpneq_epi64_mask(len[5], zero)
-            & !late;
+        // user_id and product_id both non-empty: the smaller length is not zero (one compare).
+        let both = _mm256_min_epu32(_mm256_sub_epi32(ve[1], vs[1]), _mm256_sub_epi32(ve[5], vs[5]));
+        let base_ok = _mm256_cmpneq_epi32_mask(both, _mm256_setzero_si256()) & ts_ok & (purchase | view | cart) & !late;
         // Purchases: price (up to 8 digits here; longer goes to the reference) and category.
         let mut price = zero;
         let mut cat = zero;
@@ -833,8 +858,7 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         let ff32 = _mm256_set1_epi32(0xFF);
         let w_u = gather64o(wbase, ve[1], -8);
         let pu = _mm256_cmpeq_epi32_mask(_mm256_and_si256(dword_bytes(wbase, vs[1]), ff32), _mm256_set1_epi32(b'u' as i32));
-        let x_u = ids::<S>(w_u, len[1], pu);
-        let u_short = _mm512_cmpneq_epi64_mask(x_u, _mm512_set1_epi64(-1));
+        let (x_u, u_short) = ids::<S>(w_u, len[1], pu);
         let (u_a, u_b, u_long) = with_long(wbase, ve[1], len[1], pu, x_u);
         let user_ok = u_short | u_long;
         // Campaign `c_` + 1..8 canonical digits.
@@ -849,16 +873,17 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         // HH:MM:SS (bytes 11..19) as its own gather: no shifts to join it from two others.
         let t_11 = gather64o(wbase, vs[3], 11);
         let t_17 = gather64o(wbase, vs[3], 17);
-        let (day_s, date_ok, t_ok) = date(dates, t_hi, t_mid);
-        let (secs, hms_ok) = hms::<S>(t_11);
+        let (day_s, date_ok, t_x) = date(dates, t_hi, t_mid);
+        let (secs, hms_ok) = hms::<S>(t_11, t_x, 0x00FF_0000);
         let z = _mm512_cmpeq_epi64_mask(byte_at(t_17, 2), _mm512_set1_epi64(b'Z' as i64));
         let (off, off_ok) = offset::<S>(t_17);
-        let dt_ok = date_ok & t_ok & hms_ok;
+        let dt_ok = date_ok & hms_ok;
         let f1 = _mm512_cmpeq_epi64_mask(len[3], _mm512_set1_epi64(20)) & z & dt_ok;
         let f2 = _mm512_cmpeq_epi64_mask(len[3], _mm512_set1_epi64(25)) & off_ok & dt_ok;
-        let (hi, hi_ok) = dec8::<S>(t_hi);
-        let (lo, lo_ok) = dec8::<S>(_mm512_or_si512(_mm512_slli_epi64::<24>(t_mid), _mm512_set1_epi64(0x0030_3030)));
-        let f3 = _mm512_cmpeq_epi64_mask(len[3], _mm512_set1_epi64(13)) & hi_ok & lo_ok;
+        let (hi, hi_r) = dec8r::<S>(t_hi);
+        let (lo, lo_r) = dec8r::<S>(_mm512_or_si512(_mm512_slli_epi64::<24>(t_mid), _mm512_set1_epi64(0x0030_3030)));
+        let r = _mm512_or_si512(hi_r, lo_r);
+        let f3 = _mm512_cmpeq_epi64_mask(len[3], _mm512_set1_epi64(13)) & _mm512_testn_epi64_mask(r, r);
         // day * DAY_MS + secs * 1000 as (day * 86400 + secs) * 1000, by shifts.
         let local = _mm512_sub_epi64(times1000(_mm512_add_epi64(day_s, secs)), _mm512_set1_epi64(f.ws_frac));
         let f12 = _mm512_mask_sub_epi64(local, f2, local, off);

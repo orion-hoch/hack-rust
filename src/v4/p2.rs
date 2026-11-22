@@ -302,6 +302,7 @@ fn grow(gs: &mut GroupScratch, pks: &[u64]) -> usize {
 /// and notes the block reference with its person in input order; a prefix sum over the persons
 /// and one placement pass finish the counting sort. (On generator data a third of the blocks
 /// belong to a person opened earlier, in every partition: the blocks never arrive sorted.)
+#[inline(never)]
 pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a>) -> Option<()> {
     // Sized for about one block per 8 words (generator data: one per 13), so the map stays in L1
     // or L2; it doubles if it passes half full.
@@ -342,21 +343,20 @@ pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a
     // A click block usually directly follows its person block: the same key as the last block
     // needs no lookup.
     let (mut last_pk, mut last_k) = (NO_KEY, 0usize);
-    // SAFETY: every read is below the chunk's length (`at + 1 < n` for the two header words, the
+    // SAFETY: every read is below the chunk's length (`rem >= 2` for the two header words, the
     // block's length checked against the rest before it is referenced); every write is below the
     // capacity reserved above (at most words / 2 blocks, so at most that many persons); map slots
     // are masked.
     unsafe {
         'all: for c in chunks {
-            let (p, n) = (c.as_ptr(), c.len());
-            let lim = n.saturating_sub(1);
-            let mut at = 0usize;
-            while at < lim {
-                let h0 = *p.add(at);
+            // The block at `p`, with `rem` words left in the chunk from it.
+            let (mut p, mut rem) = (c.as_ptr(), c.len());
+            while rem >= 2 {
+                let h0 = *p;
                 if h0 == 0 {
                     break;
                 }
-                let pk = *p.add(at + 1);
+                let pk = *p.add(1);
                 let k = if pk == last_pk {
                     last_k
                 } else {
@@ -395,29 +395,30 @@ pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a
                 let len;
                 if h0 & CLICK_MARK != 0 {
                     len = 2 + 2 * lo;
-                    if len > n - at {
+                    if len > rem {
                         ok = false;
                         break 'all;
                     }
-                    *ck_in.add(nck) = std::ptr::slice_from_raw_parts(p.add(at), len);
+                    *ck_in.add(nck) = std::ptr::slice_from_raw_parts(p, len);
                     *kck.add(nck) = k as u32;
                     (*cur.add(k))[1] += 1;
                     nck += 1;
                 } else {
-                    len = 2 + lo.div_ceil(2) + ((h0 >> 24) & N24) as usize;
-                    if len > n - at {
+                    len = 2 + ((lo + 1) >> 1) + ((h0 >> 24) & N24) as usize;
+                    if len > rem {
                         ok = false;
                         break 'all;
                     }
-                    *ev_in.add(nev) = std::ptr::slice_from_raw_parts(p.add(at), len);
+                    *ev_in.add(nev) = std::ptr::slice_from_raw_parts(p, len);
                     *kev.add(nev) = k as u32;
                     (*cur.add(k))[0] += 1;
                     nev += 1;
                 }
-                at += len;
+                p = p.add(len);
+                rem -= len;
             }
             // a header word with no room for its key
-            if at < n && *p.add(at) != 0 {
+            if rem == 1 && *p != 0 {
                 ok = false;
                 break;
             }
