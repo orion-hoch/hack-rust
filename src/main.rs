@@ -333,11 +333,13 @@ fn run(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
-/// Huge pages for the allocator as far as the machine can give them without compaction: rt's
-/// verdict for about 0.7 times the input bytes (the measured peak of anonymous memory is 0.57 to
-/// 0.65 times the input). Enough free 2 MB blocks, or a defrag mode that cannot stall: every
-/// mapping. Fewer: a budget of 80% of the free blocks, first come first served (the token table
-/// and the parse buffers come first). RT_HUGE=on|off|<MB> overrides (measurements).
+/// Huge pages for the allocator unless compaction would be costly: rt's verdict for about 0.7
+/// times the input bytes (the measured peak of anonymous memory is 0.57 to 0.65 times the input)
+/// says yes when the free 2 MB blocks cover it, when MemFree is at least twice it (compaction
+/// cheap), when the defrag mode cannot stall, or when nothing can be read; then every mapping.
+/// Otherwise (blocks short and free memory tight) a budget of 80% of the free blocks, first come
+/// first served (the token table and the parse buffers come first). THP never: none.
+/// RT_HUGE=on|off|<MB> overrides (measurements).
 fn huge_pages(cfg: &Config) {
     use std::os::unix::ffi::OsStrExt;
     let budget = match env::var("RT_HUGE").as_deref() {
@@ -352,7 +354,7 @@ fn huge_pages(cfg: &Config) {
                 }
             }
             let v = rt::arena::huge_verdict((bytes as usize) / 10 * 7);
-            if !matches!(v.enabled, b'a' | b'm') {
+            if v.enabled == b'n' {
                 0
             } else if v.use_huge {
                 usize::MAX

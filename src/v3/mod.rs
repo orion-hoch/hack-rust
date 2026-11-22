@@ -27,7 +27,7 @@ use crate::ts::DAY;
 use self::dedup::{Ctx3, Move2, Tables};
 use self::people::{PeopleCtx, Worker};
 use self::persons::People;
-use self::sink::{Special, V3Sink, part_of};
+use self::sink::{ClickSink, Special, V3Sink, part_of};
 use self::tokens::Tokens;
 
 /// A failed internal check: the run falls back to v1.
@@ -88,13 +88,23 @@ impl Clock {
 /// The inputs through rt: events, clicks and links mapped into one reservation (zero pages
 /// around every file), registered for release-behind and for the parallel release at exit. The
 /// same files as `Dataset::open` (regular `*.csv`, not starting with '.', in name order).
-fn open_rt(dir: &Path) -> io::Result<(Dataset, &'static rt::input::Inputs)> {
+/// Err(why) when a folder holds more files than the parser's locator can number (named refusal,
+/// decided before anything is mapped).
+fn open_rt(dir: &Path) -> io::Result<Result<(Dataset, &'static rt::input::Inputs), String>> {
     use std::os::unix::ffi::OsStrExt;
     let errno = |e: rt::sys::Errno| io::Error::from_raw_os_error(e.0);
     let subs = ["events", "clicks", "links"];
     let mut ls = Vec::with_capacity(3);
     for sub in subs {
-        ls.push(rt::input::scan(dir.join(sub).as_os_str().as_bytes()).map_err(errno)?);
+        let l = match rt::input::scan(dir.join(sub).as_os_str().as_bytes()) {
+            Ok(l) => l,
+            Err(rt::sys::Errno::ERANGE) => return Ok(Err(format!("more than {} *.csv files in {sub}/", rt::input::LISTING_MAX))),
+            Err(e) => return Err(errno(e)),
+        };
+        if l.files().len() > parselab::Locator::MAX_FILES {
+            return Ok(Err(format!("{} files in {sub}/, over the {} a locator numbers", l.files().len(), parselab::Locator::MAX_FILES)));
+        }
+        ls.push(l);
     }
     let ls: &'static [rt::input::Listing] = Box::leak(ls.into_boxed_slice());
     let streams: Vec<rt::input::Stream> = ls.iter().map(|l| rt::input::Stream { listing: l, dots: false }).collect();
@@ -114,14 +124,17 @@ fn open_rt(dir: &Path) -> io::Result<(Dataset, &'static rt::input::Inputs)> {
     });
     let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_default();
     let ds = Dataset { dir: dir.to_path_buf(), files, products: read("products.csv"), campaigns: read("campaigns.csv"), manifest: read("manifest.json") };
-    Ok((ds, inp))
+    Ok(Ok((ds, inp)))
 }
 
 pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Result<Outcome> {
     let t0 = Instant::now();
     let mut clock = Clock { on: timing, last: t0, last_use: if timing { usage() } else { (0.0, 0.0, 0, 0) } };
     crate::par::init_pool(threads);
-    let (ds, inp) = open_rt(data)?;
+    let (ds, inp) = match open_rt(data)? {
+        Ok(x) => x,
+        Err(why) => return Ok(Outcome::Fallback(why)),
+    };
     // The fast path's memory region (address space only until a stage takes from it).
     let input_bytes: u64 = [Stream::Events, Stream::Clicks, Stream::Links].iter().map(|&s| ds.bytes(s)).sum();
     if !mem::init((input_bytes as usize / 100) * 45) {
@@ -155,8 +168,9 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     clock.mark("open");
 
     // Parse A: links, then clicks.
-    let mut chunks = parselab::par::plan(&ds, &[Stream::Links], 4 << 20);
-    chunks.extend(parselab::par::plan(&ds, &[Stream::Clicks], 4 << 20));
+    // Links only: clicks are parsed after the events and persons (ClickSink), straight into
+    // person partitions, with read-only token lookups.
+    let chunks = parselab::par::plan(&ds, &[Stream::Links], 4 << 20);
     let per_thread = est_events / threads.max(1);
     let reference = std::env::var("ENGINE_PARSER").is_ok_and(|v| v == "ref");
     let fp = parselab::fast::Fast::new(&ctx);
@@ -191,7 +205,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let sinks = crate::par::run(
         threads,
         chunks.len(),
-        |_| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread),
+        |t| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread, t),
         |s, i| parse(&chunks[i], s),
     );
     clock.mark("parse.links+clicks");
@@ -225,7 +239,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             slots
                 .get(t)
                 .and_then(|m| m.lock().unwrap().take())
-                .unwrap_or_else(|| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread))
+                .unwrap_or_else(|| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread, t))
         },
         |s, i| {
             if i == 0 {
@@ -295,7 +309,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let dd = crate::par::run(
         threads,
         parts,
-        |_| (Tables::new((typical_short.min(max_short) * 3 / 2).next_power_of_two().max(16), (typical_long.min(max_long) * 3 / 2).next_power_of_two().max(16)), Move2::new(p2_bits, est_surv / threads.max(1)), 0usize, None::<Abort>),
+        |w| (Tables::new((typical_short.min(max_short) * 3 / 2).next_power_of_two().max(16), (typical_long.min(max_long) * 3 / 2).next_power_of_two().max(16)), Move2::new_in(p2_bits, est_surv / threads.max(1), w), 0usize, None::<Abort>),
         |(t, m2, n, err), p| {
             if plant == "panic" && p == 7 {
                 panic!("planted panic in a dedup task");
@@ -329,28 +343,32 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     }
     clock.mark("dedup");
 
-    // Clicks to person partitions.
-    let probe = Move2::new(p2_bits, 1);
-    let ck_parts = crate::par::run(
+    // Clicks: parsed now, straight into person partitions (ClickSink).
+    let ck_chunks = parselab::par::plan(&ds, &[Stream::Clicks], 4 << 20);
+    let mut csinks: Vec<ClickSink> = crate::par::run(
         threads,
-        sinks_ref.len(),
-        |_| Bins::<[u64; 2]>::new(1 << p2_bits, 1 << 15),
-        |bins, i| {
-            for chunk in sinks_ref[i].clicks.all() {
-                for (j, c) in chunk.iter().enumerate() {
-                    // Person lookups are random in a token-sized map: start them 64 clicks ahead.
-                    if let Some(f) = chunk.get(j + 64) {
-                        people.prefetch(f[0] as u32);
-                    }
-                    let person = people.person_of(c[0] as u32);
-                    bins.push(probe.part(person), [(u64::from(person) << 32) | (c[0] >> 32), c[1]]);
-                }
+        ck_chunks.len(),
+        |_| ClickSink::new(&tok, &people, &ds, &ctx, p2_bits),
+        |s, i| {
+            let c = &ck_chunks[i];
+            let bytes = ds.stream(c.stream)[c.file as usize].bytes();
+            if reference {
+                parselab::reference::clicks(&ctx, c.file, bytes, c.from, c.to, s);
+            } else {
+                parselab::fast::parse(&fp, isa, parselab::fast::Kind::Clicks, c.file, parselab::fast::Buf::plain(bytes), c.from, c.to, s);
             }
         },
     );
-    let mut ck_parts = ck_parts;
-    for b in ck_parts.iter_mut() {
-        b.finish();
+    let mut ck_parts: Vec<Bins<[u64; 2]>> = Vec::with_capacity(csinks.len());
+    for s in csinks.iter_mut() {
+        s.drain();
+        if s.bad {
+            return Ok(Outcome::Fallback("a click record did not fit".into()));
+        }
+        s.bins.finish();
+    }
+    for s in csinks {
+        ck_parts.push(s.bins);
     }
     clock.mark("clicks");
 
@@ -367,7 +385,14 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         "radix" => sortlab::Kernel::Radix,
         _ => sortlab::Kernel::Net,
     };
-    let pcx = PeopleCtx { ds: &ds, ctx: &ctx, tok: &tok, organic, kernel };
+    let walk = sortlab::walk::Params {
+        base: ctx.click_base_ms - ctx.window_start_ms,
+        day_shift: ctx.window_start_ms.rem_euclid(DAY) as u32,
+        days: span,
+        campaigns: campaigns_with_organic,
+        organic,
+    };
+    let pcx = PeopleCtx { ds: &ds, ctx: &ctx, tok: &tok, organic, kernel, walk, day0: day0 as i32 };
     let (m2s_ref, ck_ref) = (&m2s, &ck_parts);
     let workers = crate::par::run(
         threads,
@@ -393,7 +418,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             }
         }
         eprintln!(
-            "timing v3.  sessions CPU ms: gather {:.1}, kernel {:.1}, purchases {:.1}, clicks {:.1}, walk {:.1}",
+            "timing v3.  sessions CPU ms: gather {:.1}, kernel {:.1}, clicks gather {:.1}, walk {:.1}, rows {:.1}",
             ph[0] as f64 / 1e6,
             ph[1] as f64 / 1e6,
             ph[2] as f64 / 1e6,
@@ -407,18 +432,8 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             }
         }
         eprintln!(
-            "timing v3.  sessions counts: clicks {}, tie groups re-read {}, persons {}, rows {}, direct assist steps {}, interval-route persons {}",
+            "timing v3.  sessions counts: clicks {}, credited tie groups {}, persons {}, rows {}, tie comparisons {}, assist ranges {}",
             ct[0], ct[1], ct[2], ct[3], ct[4], ct[5]
-        );
-        let mut ic = [0u64; 5];
-        for w in &workers {
-            for i in 0..5 {
-                ic[i] += w.icount[i];
-            }
-        }
-        eprintln!(
-            "timing v3.  interval route: clicks {}, sessions {}, campaigns {}, intervals {}, day steps {}",
-            ic[0], ic[1], ic[2], ic[3], ic[4]
         );
     }
     if workers.iter().any(|w| w.bad) {

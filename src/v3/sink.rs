@@ -17,6 +17,7 @@ use parselab::reference::{click_line, event_line};
 use parselab::{ClickBatch, Ctx, Dataset, EvBatch, LinkBatch, Locator, Sink, Stream};
 
 use super::ids::{Key, classify};
+use super::persons::People;
 use super::tokens::{NO_TOKEN, Pending, Tokens};
 use crate::fast::sink::Bins;
 
@@ -128,20 +129,24 @@ unsafe impl Send for V3Sink<'_, '_> {}
 unsafe impl Sync for V3Sink<'_, '_> {}
 
 impl<'a, 'b> V3Sink<'a, 'b> {
-    pub fn new(tok: &'b Tokens<'a>, ds: &'a Dataset, ctx: &'b Ctx, bits: u32, events_hint: usize) -> Self {
+    /// `w`: the pool participant index this sink is made for (its blocks are taken under it).
+    pub fn new(tok: &'b Tokens<'a>, ds: &'a Dataset, ctx: &'b Ctx, bits: u32, events_hint: usize, w: usize) -> Self {
+        use super::mem::{B256, B2K, B2M, B8K};
         let parts = 1usize << bits;
+        let _ = events_hint;
         V3Sink {
             tok,
             ds,
             ctx,
             bits,
-            // Chunks about what one sink writes to a partition: events / parts / threads.
-            short: Bins::with_chunk(parts, (events_hint / 8).clamp(1 << 14, 1 << 21), (events_hint / parts / 2).clamp(32, 512)),
-            long: Bins::with_chunk(parts, (events_hint / 32).clamp(1 << 12, 1 << 19), (events_hint / parts / 16).clamp(16, 256)),
-            pshort: Bins::with_chunk(parts, 1 << 13, (events_hint / parts / 64).clamp(8, 64)),
-            plong: Bins::with_chunk(parts, 1 << 12, (events_hint / parts / 256).clamp(4, 32)),
-            clicks: Bins::with_chunk(1, (events_hint / 4).clamp(1 << 14, 1 << 20), 1 << 14),
-            edges: Bins::with_chunk(1, (events_hint / 20).clamp(1 << 12, 1 << 19), 1 << 13),
+            // One block per chunk (v3::mem's classes): SHORT 512 x 16 B, LONG 64 x 32 B, purchases
+            // 16 x 16 B and 8 x 32 B, clicks and edges 2 MB.
+            short: Bins::from_blocks(parts, &B8K, w),
+            long: Bins::from_blocks(parts, &B2K, w),
+            pshort: Bins::from_blocks(parts, &B256, w),
+            plong: Bins::from_blocks(parts, &B256, w),
+            clicks: Bins::from_blocks(1, &B2M, w),
+            edges: Bins::from_blocks(1, &B2M, w),
             special: Vec::new(),
             bad: false,
             mode: if cfg!(feature = "measure") { std::env::var("ENGINE_SINK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 },
@@ -409,5 +414,156 @@ impl<'a> Sink for V3Sink<'a, '_> {
         let (x, y) = (self.user_token(fields[0]), self.user_token(fields[1]));
         self.edges.push(0, u64::from(x));
         self.edges.push(0, u64::from(y));
+    }
+}
+
+/// Clicks, parsed after the events and persons: a click needs its user's person, and a user with
+/// no link and no event has no token by then, so its click can reach no session and is dropped
+/// here. The table is read-only (no compare-and-swap, shared prefetch). Two random reads per click
+/// (token slot, then person), pipelined in blocks of CG: a full block resolves the block before it
+/// to tokens and prefetches their persons, and pushes the block before that to person partitions
+/// as [person << 32 | ts, locator | campaign << 48] (the clicks stage's record).
+pub struct ClickSink<'a, 'b> {
+    pub tok: &'b Tokens<'a>,
+    pub people: &'b People,
+    pub ds: &'a Dataset,
+    pub ctx: &'b Ctx,
+    pub bins: Bins<[u64; 2]>,
+    pub bad: bool,
+    pub dropped: u64,
+    pbits: u32,
+    /// Lookups started: [block being filled, block waiting for its token lines].
+    blk: Box<[[ClickPend; CG]; 2]>,
+    cur: usize,
+    n: [usize; 2],
+    /// Tokens found, persons prefetched.
+    ready: Box<[(u32, u64, u64); CG]>,
+    nready: usize,
+}
+
+const CG: usize = 32;
+
+#[derive(Clone, Copy, Default)]
+struct ClickPend {
+    user: Pending,
+    ts: u64,
+    w1: u64,
+}
+
+impl<'a, 'b> ClickSink<'a, 'b> {
+    pub fn new(tok: &'b Tokens<'a>, people: &'b People, ds: &'a Dataset, ctx: &'b Ctx, pbits: u32) -> Self {
+        ClickSink {
+            tok,
+            people,
+            ds,
+            ctx,
+            bins: Bins::new(1 << pbits, 1 << 15),
+            bad: false,
+            dropped: 0,
+            pbits,
+            blk: Box::new([[ClickPend::default(); CG]; 2]),
+            cur: 0,
+            n: [0; 2],
+            ready: Box::new([(0, 0, 0); CG]),
+            nready: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn part(&self, person: u32) -> usize {
+        (mix(u64::from(person) | 0xabcd_0000_0000_0000) >> (64 - self.pbits)) as usize
+    }
+
+    #[inline(always)]
+    fn push_person(&mut self, t: u32, ts: u64, w1: u64) {
+        let person = self.people.person_of(t);
+        let p = self.part(person);
+        self.bins.push(p, [(u64::from(person) << 32) | ts, w1]);
+    }
+
+    /// Pushes the ready block, then resolves block `k` into the ready block.
+    #[inline(always)]
+    fn advance(&mut self, k: usize) {
+        for i in 0..self.nready {
+            let (t, ts, w1) = self.ready[i];
+            self.push_person(t, ts, w1);
+        }
+        let mut r = 0;
+        for i in 0..self.n[k] {
+            let c = self.blk[k][i];
+            let t = self.tok.find(&c.user);
+            if t != NO_TOKEN {
+                self.people.prefetch(t);
+                self.ready[r] = (t, c.ts, c.w1);
+                r += 1;
+            }
+        }
+        self.dropped += (self.n[k] - r) as u64;
+        self.nready = r;
+        self.n[k] = 0;
+    }
+
+    /// Writes every pending click. Call after the last delivery.
+    pub fn drain(&mut self) {
+        let c = self.cur;
+        self.advance(c ^ 1);
+        self.advance(c);
+        self.advance(c ^ 1);
+    }
+}
+
+impl<'a> Sink for ClickSink<'a, '_> {
+    fn events(&mut self, _: &EvBatch) {
+        self.bad = true;
+    }
+    fn foreign_event(&mut self, _: Locator) {
+        self.bad = true;
+    }
+    fn links(&mut self, _: &LinkBatch) {
+        self.bad = true;
+    }
+    fn foreign_link(&mut self, _: Locator) {
+        self.bad = true;
+    }
+
+    #[inline]
+    fn clicks(&mut self, b: &ClickBatch) {
+        let n = b.n as usize;
+        for k in 0..n {
+            if b.loc[k] >> 48 != 0 {
+                self.bad = true;
+            }
+            let user = self.tok.start_hint::<false>(b.user_long >> k & 1 != 0, b.user_a[k], b.user_b[k]);
+            let c = self.cur;
+            self.blk[c][self.n[c]] = ClickPend { user, ts: u64::from(b.ts[k]), w1: b.loc[k] | (u64::from(b.campaign[k]) << 48) };
+            self.n[c] += 1;
+            if self.n[c] == CG {
+                self.advance(c ^ 1);
+                self.cur = c ^ 1;
+            }
+        }
+    }
+
+    fn foreign_click(&mut self, at: Locator) {
+        let line = self.ds.line(Stream::Clicks, at);
+        let mut fields = Vec::with_capacity(8);
+        let Some(c) = click_line(self.ctx, line, &mut fields) else {
+            self.bad = true;
+            return;
+        };
+        if at.0 >> 48 != 0 {
+            self.bad = true;
+        }
+        let t = match classify(c.user_id, b'u') {
+            Key::Foreign => self.tok.find_foreign(c.user_id),
+            Key::Short(v) => self.tok.find(&self.tok.start(false, v, 0)),
+            Key::Long(a, bb) => self.tok.find(&self.tok.start(true, a, bb)),
+        };
+        if t == NO_TOKEN {
+            self.dropped += 1;
+            return;
+        }
+        let ts = (c.ts - self.ctx.click_base_ms) as u64;
+        self.push_person(t, ts, at.0 | (u64::from(c.campaign) << 48));
     }
 }

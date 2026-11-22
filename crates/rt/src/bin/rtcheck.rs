@@ -30,6 +30,9 @@ fn main() {
     if std::env::var("RT_NO_INIT").is_err() {
         rt::init(0);
     }
+    // The pread reader and the content checks use the files' descriptors (map_all turns this off
+    // for sets of 900 files or more: the soft limit of open files is often 1,024).
+    input::set_keep_fds(true);
     let args: Vec<String> = std::env::args().collect();
     if std::env::var("ENGINE_PATH").as_deref() == Ok("v1") {
         return fallback_main(&args);
@@ -52,6 +55,10 @@ fn main() {
         Some("fault-suite") => fault_suite(&a),
         Some("launch") => launch(&a),
         Some("info") => info(),
+        Some("verdict") => verdict_cmd(&a),
+        Some("topo-test") => topo_test(),
+        Some("blocks-bench") => blocks_bench(&a),
+        Some("fragment") => fragment(&a),
         Some("reader-test") => reader_test(&a),
         Some("release-bench") => release_bench(&a),
         _ => {
@@ -107,6 +114,206 @@ fn info() {
     );
     let seg = rt::tls::segment();
     println!("tls segment {:?} area {}", seg, rt::tls::area_size(&seg));
+}
+
+/// What the engine's main.rs huge_pages() decides for DATA, and the numbers it decides from.
+fn verdict_cmd(a: &[&str]) {
+    let dir = a[0];
+    let mut bytes = 0u64;
+    for s in ["events", "clicks", "links"] {
+        if let Ok(l) = input::scan(format!("{dir}/{s}").as_bytes()) {
+            bytes += l.files().iter().chain(l.dots()).map(|e| e.size).sum::<u64>();
+        }
+    }
+    let need = bytes as usize / 10 * 7;
+    let v = arena::huge_verdict(need);
+    let budget = if v.enabled == b'n' {
+        0
+    } else if v.use_huge {
+        usize::MAX
+    } else {
+        (v.free_2m.max(0) as usize) * (2 << 20) / 5 * 4
+    };
+    let mi = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let g = |k: &str| mi.lines().find_map(|l| l.strip_prefix(k).map(|v| v.trim().trim_end_matches(" kB").trim().parse::<u64>().unwrap_or(0) >> 10)).unwrap_or(0);
+    let normal = std::fs::read_to_string("/proc/buddyinfo").unwrap_or_default().lines().find(|l| l.contains("Normal")).unwrap_or("").to_string();
+    println!(
+        "input {} MB need {} MB (x1.25 = {} MB); thp '{}' defrag '{}' may_stall {}; free 2 MB blocks Normal+Movable {} ({} MB), all zones {}; MemFree {} MB MemAvailable {} MB; use_huge {} (reason '{}'); allocator budget {}",
+        bytes >> 20,
+        need >> 20,
+        (need >> 20) * 5 / 4,
+        v.enabled as char,
+        v.defrag as char,
+        v.may_stall,
+        v.free_2m,
+        v.free_2m * 2,
+        v.free_2m_all,
+        g("MemFree:"),
+        g("MemAvailable:"),
+        v.use_huge,
+        v.reason as char,
+        if budget == usize::MAX { "all".to_string() } else { format!("{} MB", budget >> 20) }
+    );
+    for req in [64usize << 20, 512 << 20] {
+        println!("  verdict for a {} MB table: use_huge {}", req >> 20, arena::huge_verdict(req).use_huge);
+    }
+    println!("  buddyinfo {normal}");
+}
+
+/// Fragments free memory on purpose: maps GB with 4 KB pages, touches it all, then frees every
+/// page but KEEP per 2 MB block and holds the rest until killed. Free memory stays large while
+/// free 2 MB blocks vanish (the "16 GB free and the verdict says no" case).
+fn fragment(a: &[&str]) {
+    let gb: usize = a[0].parse().unwrap();
+    let keep: usize = a.get(1).map(|s| s.parse().unwrap()).unwrap_or(1).clamp(1, 512);
+    let n = start(0);
+    pool::wait_running();
+    let len = gb << 30;
+    let p = sys::map_anon(len).unwrap() as usize;
+    unsafe { sys::madvise(p, len, sys::MADV_NOHUGEPAGE).unwrap() };
+    let parts = (len >> 26) as u32;
+    let t0 = mono();
+    let touch = |_w: usize, i: u32| arena::touch_range(p + ((i as usize) << 26), 1 << 26, true);
+    pool::run(3, parts, &touch);
+    let t1 = mono();
+    let step = 512 / keep;
+    let free = |_w: usize, i: u32| {
+        let base = p + ((i as usize) << 26);
+        for b in 0..32 {
+            let blk = base + (b << 21);
+            for k in 0..keep {
+                let lo = blk + (k * step + 1) * 4096;
+                let hi = blk + ((k + 1) * step) * 4096;
+                if hi > lo {
+                    unsafe {
+                        let _ = sys::madvise(lo, hi - lo, sys::MADV_DONTNEED);
+                    }
+                }
+            }
+        }
+    };
+    pool::run(3, parts, &free);
+    let t2 = mono();
+    println!("fragmented {gb} GB on {n} workers: touched in {} ms, freed all but {keep} page(s) per 2 MB block in {} ms; holding {} MB; pid {}", (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (len / 512 * keep) >> 20, sys::getpid());
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// The topology reader on fabricated sysfs trees (bare-metal layouts a VM cannot show).
+fn topo_test() {
+    let root = "/tmp/rt-topo";
+    let make = |name: &str, n: usize, sib: &dyn Fn(usize) -> String| -> String {
+        let d = format!("{root}/{name}");
+        let _ = std::fs::remove_dir_all(&d);
+        for c in 0..n {
+            std::fs::create_dir_all(format!("{d}/cpu{c}/topology")).unwrap();
+            std::fs::write(format!("{d}/cpu{c}/topology/thread_siblings_list"), sib(c) + "\n").unwrap();
+        }
+        d
+    };
+    let set = |cpus: &[usize]| {
+        let mut s = cpu::CpuSet::EMPTY;
+        for &c in cpus {
+            s.add(c);
+        }
+        s
+    };
+    let show = |t: &cpu::Topo| -> String { (0..t.n).map(|i| format!("{}:{}", t.cpu[i], t.core[i])).collect::<Vec<_>>().join(" ") };
+    // Intel numbering, 16 CPUs on 8 cores: siblings i and i+8; a cpuset of 4 cores x 2 threads.
+    let intel = make("intel", 16, &|c| format!("{},{}", c % 8, c % 8 + 8));
+    let t = cpu::topology(&set(&[0, 1, 2, 3, 8, 9, 10, 11]), intel.as_bytes());
+    println!("  intel 0-3,8-11: {} | cores {} known {}", show(&t), t.cores, t.known);
+    check(t.cores == 4 && t.known && t.cpu[..8] == [0, 8, 1, 9, 2, 10, 3, 11] && t.core[..8] == [0, 0, 1, 1, 2, 2, 3, 3], "Intel-style siblings (i, i+8): 8 allowed CPUs are 4 cores, siblings adjacent");
+    // AMD numbering: siblings 2k, 2k+1 (range list).
+    let amd = make("amd", 16, &|c| format!("{}-{}", c & !1, (c & !1) + 1));
+    let t = cpu::topology(&set(&[0, 1, 2, 3, 4, 5, 6, 7]), amd.as_bytes());
+    println!("  amd 0-7: {} | cores {}", show(&t), t.cores);
+    check(t.cores == 4 && t.core[..8] == [0, 0, 1, 1, 2, 2, 3, 3], "AMD-style siblings (2k, 2k+1): 8 allowed CPUs are 4 cores");
+    // A cpuset that takes one thread of each core: 8 cores.
+    let t = cpu::topology(&set(&[0, 1, 2, 3, 4, 5, 6, 7]), intel.as_bytes());
+    println!("  intel 0-7: {} | cores {}", show(&t), t.cores);
+    check(t.cores == 8, "Intel-style, one thread per core allowed: 8 cores (siblings outside the set ignored)");
+    // No sysfs: ascending order, one core per CPU, known = false.
+    let t = cpu::topology(&set(&[2, 3, 5]), b"/nonexistent");
+    check(!t.known && t.cores == 3 && t.cpu[..3] == [2, 3, 5], "unreadable sysfs: ascending order, each CPU its own core, known = false");
+    let _ = std::fs::remove_dir_all(root);
+    println!("topo-test: all passed");
+}
+
+/// The dedup pattern on a block arena: per worker, PARTS partitions of input chunks; for each,
+/// free its chunks, then allocate half as many output chunks and write them. 8 workers.
+fn blocks_bench(a: &[&str]) {
+    let bsize: usize = a.first().map(|s| s.parse().unwrap()).unwrap_or(8192);
+    let per: usize = a.get(1).map(|s| s.parse().unwrap()).unwrap_or(12_500);
+    let parts: usize = a.get(2).map(|s| s.parse().unwrap()).unwrap_or(64);
+    let cap: usize = a.get(3).map(|s| s.parse().unwrap()).unwrap_or(256);
+    let n = start(0);
+    pool::wait_running();
+    REG_A.init(32 << 30, arena::Huge::Auto(n * per * bsize * 2)).unwrap();
+    BLOCKS.attach(&REG_A, bsize).unwrap();
+    BLOCKS.set_local_max(cap);
+    let input: Vec<Vec<AtomicUsize>> = (0..n).map(|_| (0..per).map(|_| AtomicUsize::new(0)).collect()).collect();
+    let output: Vec<Vec<AtomicUsize>> = (0..n).map(|_| (0..per).map(|_| AtomicUsize::new(0)).collect()).collect();
+    // One task per worker, each on its own worker (tasks wait for all to arrive).
+    let each = |f: &(dyn Fn(usize) + Sync)| {
+        let arrived = AtomicUsize::new(0);
+        let g = |w: usize, _i: u32| {
+            arrived.fetch_add(1, AcqRel);
+            while arrived.load(Acquire) < n {
+                std::hint::spin_loop();
+            }
+            f(w);
+        };
+        pool::run(3, n as u32, &g);
+    };
+    // The sink fills the input chunks (fresh memory, faulted once).
+    each(&|w| unsafe {
+        for k in 0..per {
+            let p = BLOCKS.alloc(w);
+            std::ptr::write_bytes(p, 1, bsize);
+            input[w][k].store(p as usize, Relaxed);
+        }
+    });
+    let (s0, r0) = BLOCKS.lock_ops();
+    let f0 = sys::getrusage(sys::RUSAGE_SELF).minflt;
+    let (_, _, carved0) = BLOCKS.stats();
+    let t0 = mono();
+    let kp = per / parts;
+    each(&|w| unsafe {
+        let mut o = 0;
+        for p in 0..parts {
+            for k in p * kp..(p + 1) * kp {
+                BLOCKS.free(w, input[w][k].load(Relaxed) as *mut u8);
+            }
+            for _ in 0..kp / 2 {
+                let q = BLOCKS.alloc(w);
+                std::ptr::write_volatile(q, 2);
+                output[w][o].store(q as usize, Relaxed);
+                o += 1;
+            }
+        }
+    });
+    let t1 = mono();
+    let f1 = sys::getrusage(sys::RUSAGE_SELF).minflt;
+    let (s1, r1) = BLOCKS.lock_ops();
+    let (_, _, carved1) = BLOCKS.stats();
+    let ops = n * (parts * kp + parts * (kp / 2));
+    println!(
+        "block {} B, {} chunks per worker in {} partitions, cap {} blocks ({} KB): {:.2} ms for {} frees+allocs on {n} workers ({:.1} ns per op per worker); shared-list locks: {} spills {} refills; fresh blocks {}; faults {}",
+        bsize,
+        per,
+        parts,
+        cap,
+        cap * bsize >> 10,
+        (t1 - t0) as f64 / 1e6,
+        ops,
+        (t1 - t0) as f64 * n as f64 / ops as f64,
+        s1 - s0,
+        r1 - r0,
+        carved1 - carved0,
+        f1 - f0
+    );
 }
 
 // ------------------------------------------------------------------------------------------
@@ -329,6 +536,10 @@ fn pool_bench(a: &[&str]) {
     // busy elsewhere is hard to arrange; instead time the caller alone with a 1-worker pool via
     // `pool-bench 1`.
 
+    if n < 2 {
+        println!("fewer than 2 workers: wake-latency and queue tests skipped (they need a worker besides the caller)");
+        return;
+    }
     // Wake latency: push -> first task start, workers spinning vs sleeping.
     let lat = |label: &str, idle_ms: u64| {
         let mut v = Vec::new();
@@ -406,6 +617,7 @@ static mut INPUTS: std::mem::MaybeUninit<input::Inputs> = std::mem::MaybeUninit:
 
 fn map_all(dir: &str, register: bool) -> &'static input::Inputs {
     let ls: Vec<input::Listing> = ["events", "clicks", "links"].iter().map(|s| input::scan(format!("{dir}/{s}").as_bytes()).expect("scan")).collect();
+    input::set_keep_fds(ls.iter().map(|l| l.files().len()).sum::<usize>() < 900);
     let ls: &'static [input::Listing] = Box::leak(ls.into_boxed_slice());
     let streams: Vec<input::Stream> = ls.iter().map(|l| input::Stream { listing: l, dots: false }).collect();
     #[allow(static_mut_refs)]
@@ -456,6 +668,9 @@ fn map_cmd(a: &[&str]) {
         let b = f.bytes();
         let mut tmp = vec![0u8; 4096];
         for &off in &[0usize, b.len() / 2, b.len().saturating_sub(4096)] {
+            if f.fd < 0 {
+                break;
+            }
             let k = sys::pread_full(f.fd, &mut tmp, off as u64).unwrap();
             if b[off..off + k] != tmp[..k] {
                 bad += 1;
@@ -1054,6 +1269,11 @@ unsafe fn plant(kind: &str) {
             std::hint::black_box(recurse(0));
         }
         "fail" => fail::fail(b"planted fail() from a worker"),
+        "emfile" => {
+            // Use up every descriptor, then fail: the re-exec must still read /proc.
+            while sys::openat(sys::AT_FDCWD, b"/proc/self/exe\0".as_ptr(), sys::O_RDONLY | sys::O_CLOEXEC, 0).is_ok() {}
+            fail::fail(b"planted descriptor exhaustion")
+        }
         _ => panic!("unknown fault"),
     }
 }
@@ -1062,7 +1282,7 @@ fn fault_suite(a: &[&str]) {
     let outdir = a.first().copied().unwrap_or("/tmp/rtfault");
     let mb = a.get(1).copied().unwrap_or("0");
     let exe = std::env::current_exe().unwrap();
-    let kinds = ["segv", "bus", "ill", "fpe", "abort", "panic", "stack", "fail"];
+    let kinds = ["segv", "bus", "ill", "fpe", "abort", "panic", "stack", "fail", "emfile"];
     let mut all_ok = true;
     for k in kinds {
         let _ = std::fs::remove_dir_all(outdir);

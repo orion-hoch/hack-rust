@@ -22,6 +22,11 @@ impl FastAgg {
         FastAgg { campaigns, span, day0, cred: vec![[0, 0]; cells], asst: vec![0; cells] }
     }
 
+    /// The cells, for sortlab's walk (same layout: day offset * campaigns + campaign).
+    pub fn cells_mut(&mut self) -> (&mut [[u64; 2]], &mut [u32]) {
+        (&mut self.cred, &mut self.asst)
+    }
+
     /// Day offset of an absolute day number.
     #[inline(always)]
     pub fn offset(&self, day: i32) -> usize {

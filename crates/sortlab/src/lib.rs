@@ -32,6 +32,7 @@
 pub mod net;
 mod measure;
 pub use measure::*;
+pub mod walk;
 
 pub const GAP: u32 = 1_800_000;
 pub const SLOT: u32 = 900_000;
@@ -113,6 +114,12 @@ pub enum Error {
     BadPerson(usize),
     /// `sessions_counted`: the given counts do not match the records.
     CountMismatch,
+    /// `walk`: a click (index) whose campaign is out of range or organic.
+    BadCampaign(usize),
+    /// `walk`: a session (index into `Out::start`) whose day is outside the cells.
+    DayOutOfRange(usize),
+    /// `walk`: inputs that do not belong together (sizes, or `out` not from these purchases).
+    WalkInput,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -743,6 +750,7 @@ fn finish(np: usize, buys: &[[u64; 2]], kernel: Kernel, sc: &mut Scratch, out: &
         Kernel::NetWith { width, max } => Some((width, max)),
         _ => None,
     };
+    #[cfg(target_arch = "x86_64")]
     if let Some((width, max)) = net {
         let bits = sc.nets[match width {
             NetWidth::W512 => 0,

@@ -2,6 +2,10 @@
 //! chunk end, a store and an increment. Chunks (512 records) are bumped from large arena blocks
 //! owned by the bins, so nothing is ever copied or reallocated; memory is the records plus at
 //! most one partly filled chunk per bin.
+//!
+//! Bins made by `from_blocks` take each chunk as one block of an rt block class instead (the
+//! fast path's region, `v3::mem`): the bins never free those blocks; whoever consumes a chunk
+//! frees it (dedup, per partition) or the class is reset (the driver).
 
 
 /// Records binned by an index, in chunks bumped from arena blocks.
@@ -14,6 +18,8 @@ pub struct Bins<T: Copy> {
     bump_end: *mut T,
     block: usize,
     chunk: usize,
+    /// Chunks from this block class, one block each, for pool participant `w` (`from_blocks`).
+    src: Option<(&'static rt::arena::Blocks, usize)>,
 }
 
 // SAFETY: the raw pointers point into `blocks`, which the struct owns; moving the struct to
@@ -40,7 +46,18 @@ impl<T: Copy> Bins<T> {
             bump_end: std::ptr::null_mut(),
             block: block.div_ceil(chunk).max(1) * chunk,
             chunk,
+            src: None,
         }
+    }
+
+    /// `n` bins whose chunks are blocks of `src` (one block per chunk, as many records as fit),
+    /// taken for pool participant `w`: an index no other thread uses with `src` at the same time.
+    pub fn from_blocks(n: usize, src: &'static rt::arena::Blocks, w: usize) -> Self {
+        let (bs, sz) = (src.block_size(), std::mem::size_of::<T>());
+        assert!(bs >= sz && bs % sz == 0, "block class of {bs} bytes for records of {sz}");
+        let mut b = Self::with_chunk(n, 1, bs / sz);
+        b.src = Some((src, w));
+        b
     }
 
     #[inline(always)]
@@ -92,6 +109,14 @@ impl<T: Copy> Bins<T> {
             // SAFETY: end is `chunk` records past the start of the same chunk.
             let start = unsafe { end.sub(self.chunk) };
             self.full[b].push((start, self.chunk as u32));
+        }
+        if let Some((src, w)) = self.src {
+            // SAFETY: `w` is this bins' participant index (from_blocks); the block holds `chunk`
+            // records and is aligned to its size.
+            let p = unsafe { src.alloc(w) } as *mut T;
+            assert!(!p.is_null(), "block class exhausted");
+            self.ce[b] = [p, unsafe { p.add(self.chunk) }];
+            return;
         }
         // SAFETY (pointer arithmetic): bump and bump_end delimit the unused tail of the newest block.
         if self.bump.is_null() || (self.bump_end as usize - self.bump as usize) < self.chunk * std::mem::size_of::<T>() {
