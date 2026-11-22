@@ -222,8 +222,14 @@ impl People {
             if i + AHEAD < n {
                 prefetch(&rec[parent[i + AHEAD] as usize]);
             }
-            person[node_token[i] as usize] = rec[parent[i] as usize][1] as u32 + 1;
+            let (t, name) = (node_token[i], rec[parent[i] as usize][1] as u32);
+            person[t as usize] = name + 1;
+            if name != t {
+                // The person also in the token's own slot (a click's find reads that line).
+                tok.stamp(t, name);
+            }
         }
+        tok.set_stamped();
         lap("map");
         Some(People { person, linked: n, persons: roots })
     }

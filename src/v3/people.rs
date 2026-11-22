@@ -139,14 +139,18 @@ impl Worker {
         for k in 0..np.min(AHEAD) {
             cx.tok.prefetch_key(out.persons[k]);
         }
+        // Room for every name of the partition at once (an ID is at most 33 bytes unless
+        // FOREIGN; those grow the vector themselves), so the loop does not check capacity.
+        r.names.reserve(np * 33);
+        r.name_offsets.reserve(np);
+        r.runs.reserve(np);
         let mut r0 = 0u32;
-        for k in 0..np {
-            if k + AHEAD < np {
-                cx.tok.prefetch_key(out.persons[k + AHEAD]);
+        for (k, (&person, &r1)) in out.persons.iter().zip(&wr.row_end).enumerate() {
+            if let Some(&next) = out.persons.get(k + AHEAD) {
+                cx.tok.prefetch_key(next);
             }
-            let r1 = wr.row_end[k];
             if r1 > r0 {
-                cx.tok.bytes(out.persons[k], &mut r.names);
+                cx.tok.bytes(person, &mut r.names);
                 r.name_offsets.push(r.names.len() as u32);
                 r.runs.push(r1 - r0);
             }

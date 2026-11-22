@@ -48,11 +48,58 @@ pub fn part_of(a: u64, b: u64, bits: u32) -> usize {
     (mix(a ^ b.rotate_left(17).wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> (64 - bits)) as usize
 }
 
+/// `part_of` for the 8 lanes of an event batch at once (`long` bit k: lane k's event key is LONG;
+/// a SHORT lane's b is taken as 0, as the callers do), into `out` (lanes past b.n hold garbage).
+/// With AVX-512 the mixes run in zmm registers: about 2 instructions a lane against about 14.
+#[inline(always)]
+pub fn parts8(a: &[u64; 8], b: &[u64; 8], long: u8, bits: u32, out: &mut [u32; 8]) {
+    #[cfg(target_arch = "x86_64")]
+    if bits >= 1 && std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512dq") {
+        // SAFETY: both features were just detected.
+        unsafe { parts512(a, b, long, bits, out) };
+        return;
+    }
+    for k in 0..8 {
+        out[k] = part_of(a[k], if long >> k & 1 != 0 { b[k] } else { 0 }, bits) as u32;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq")]
+unsafe fn parts512(a: &[u64; 8], b: &[u64; 8], long: u8, bits: u32, out: &mut [u32; 8]) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let va = _mm512_loadu_si512(a.as_ptr() as *const _);
+        let vb = _mm512_maskz_loadu_epi64(long, b.as_ptr() as *const i64);
+        let x = _mm512_xor_si512(va, _mm512_mullo_epi64(_mm512_rol_epi64::<17>(vb), _mm512_set1_epi64(0x9e37_79b9_7f4a_7c15u64 as i64)));
+        let mut z = _mm512_xor_si512(x, _mm512_srli_epi64::<33>(x));
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xff51_afd7_ed55_8ccdu64 as i64));
+        z = _mm512_xor_si512(z, _mm512_srli_epi64::<33>(z));
+        z = _mm512_mullo_epi64(z, _mm512_set1_epi64(0xc4ce_b9fe_1a85_ec53u64 as i64));
+        z = _mm512_xor_si512(z, _mm512_srli_epi64::<33>(z));
+        let q = _mm512_srlv_epi64(z, _mm512_set1_epi64(i64::from(64 - bits)));
+        _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, _mm512_cvtepi64_epi32(q));
+    }
+}
+
 /// A purchase's side record goes into its event's own bin (SHORT [key | ingest << 40, buy | this],
 /// LONG [a, b, ingest, buy | this]): the surv bit is clear and the last word is not zero, which no
 /// event record has (a dead copy's last word is 0). Two streams of write fronts fewer; at 8,192
 /// partitions every purchase push missed on its own front.
 pub const PURCHASE_SIDE: u64 = 1 << 62;
+
+/// A LONG record is two 16-byte units in its partition's one stream, pushed back to back: unit 1
+/// [LONG_MARK | w2, w3] (w2 = ingest | surv << 63; w3 = token | ts << 32 | purch << 63, or
+/// buy | PURCHASE_SIDE), unit 2 [a, b]. A SHORT w0 holds ingest < 2^23 - 1 in bits 40-62, so
+/// all ones there marks a LONG unit 1 (dedup reads both layouts since d1cd61a).
+pub const LONG_MARK: u64 = 0x7f_ffff << 40;
+
+/// Appends a LONG record's two units to bin `p`.
+#[inline(always)]
+fn push_long(bins: &mut Bins<[u64; 2]>, p: usize, a: u64, b: u64, w2: u64, w3: u64) {
+    bins.push(p, [LONG_MARK | w2, w3]);
+    bins.push(p, [a, b]);
+}
 
 /// Event lookups prefetch shared: they are mostly hits, and a line taken for writing is taken
 /// away from every other core that reads it. Links and clicks bring most new IDs: for writing.
@@ -166,7 +213,8 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             // One block per chunk (v3::mem's classes): SHORT 512 x 16 B, LONG 64 x 32 B, purchases
             // 16 x 16 B and 8 x 32 B, clicks and edges 2 MB.
             short: Bins::from_blocks(parts, &B8K, w).next_line_prefetch(bits < BIG_BITS),
-            long: Bins::from_blocks(parts, &B2K, w).next_line_prefetch(bits < BIG_BITS),
+            // Empty: LONG records go into the SHORT stream as two units (push_long).
+            long: Bins::from_blocks(parts, &B2K, w),
             // Empty: purchases go into the event bins (PURCHASE_SIDE); dedup still takes these.
             pshort: Bins::from_blocks(parts, &B256, w),
             plong: Bins::from_blocks(parts, &B256, w),
@@ -208,7 +256,7 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             if e.flags & 2 == 0 {
                 self.short.push(e.part as usize, [e.w[0], e.w[1] | t]);
             } else {
-                self.long.push(e.part as usize, [e.w[0], e.w[1], e.w[2], e.w[3] | t]);
+                push_long(&mut self.short, e.part as usize, e.w[0], e.w[1], e.w[2], e.w[3] | t);
             }
         }
         self.bad |= bad;
@@ -218,20 +266,22 @@ impl<'a, 'b> V3Sink<'a, 'b> {
     /// Resolves ring entry `j`: every lane's token (survivors), then its complete records.
     #[inline(always)]
     fn resolve_batch(&mut self, j: usize) {
-        let V3Sink { tok, evr, short, long, bad, bits, mbits, mode, .. } = self;
+        let V3Sink { tok, evr, short, bad, bits, mbits, mode, .. } = self;
         let b = &evr.b[j];
         let sl = &evr.slot[j];
         let n = b.n as usize;
         let pbits = if cfg!(feature = "measure") { *mbits } else { *bits };
         let notab = cfg!(feature = "measure") && *mode == 5;
         let mut nb = false;
+        let mut parts = [0u32; 8];
+        parts8(&b.ev_a, &b.ev_b, b.ev_long, pbits, &mut parts);
         for k in 0..n {
             let surv = b.surv >> k & 1 != 0;
             let purch = surv && b.purch >> k & 1 != 0;
             let ing = u64::from(b.ingest[k]);
             let ev_long = b.ev_long >> k & 1 != 0;
             let (a, bb) = (b.ev_a[k], if ev_long { b.ev_b[k] } else { 0 });
-            let p = part_of(a, bb, pbits);
+            let p = parts[k] as usize;
             let w1 = if surv {
                 let t = if notab {
                     sl[k]
@@ -250,13 +300,13 @@ impl<'a, 'b> V3Sink<'a, 'b> {
                 nb |= b.price[k] >> 24 != 0;
                 let buy = u64::from(b.cat[k]) | (u64::from(b.price[k]) << 8);
                 if ev_long {
-                    long.push(p, [a, bb, ing, buy | PURCHASE_SIDE]);
+                    push_long(short, p, a, bb, ing, buy | PURCHASE_SIDE);
                 } else {
                     short.push(p, [a | (ing << 40), buy | PURCHASE_SIDE]);
                 }
             }
             if ev_long {
-                long.push(p, [a, bb, ing | (u64::from(surv) << 63), w1]);
+                push_long(short, p, a, bb, ing | (u64::from(surv) << 63), w1);
             } else {
                 short.push(p, [a | (ing << 40) | (u64::from(surv) << 63), w1]);
             }
@@ -352,7 +402,7 @@ impl<'a, 'b> V3Sink<'a, 'b> {
                 self.short.push(part_of(a, 0, bits), [a | (ing << 40) | (u64::from(surv) << 63), w1]);
             } else {
                 let (a, bb) = (b.ev_a[k], b.ev_b[k]);
-                self.long.push(part_of(a, bb, bits), [a, bb, ing | (u64::from(surv) << 63), w1]);
+                push_long(&mut self.short, part_of(a, bb, bits), a, bb, ing | (u64::from(surv) << 63), w1);
             }
         }
     }
@@ -408,6 +458,8 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         // all lanes' home slots at once (a dead copy's is unused: one spare prefetch)
         let mut home = [0u32; 8];
         self.tok.homes8::<EVENT_PREFETCH_W>(b.user_long, &b.user_a, &b.user_b, n, &mut home);
+        let mut parts = [0u32; 8];
+        parts8(&b.ev_a, &b.ev_b, b.ev_long, self.bits, &mut parts);
         for k in 0..n {
             let surv = b.surv >> k & 1 != 0;
             let purch = surv && b.purch >> k & 1 != 0;
@@ -423,10 +475,10 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             };
             let ev_long = b.ev_long >> k & 1 != 0;
             let (a, bb) = (b.ev_a[k], if ev_long { b.ev_b[k] } else { 0 });
-            let p = part_of(a, bb, self.bits);
+            let p = parts[k] as usize;
             if purch {
                 if ev_long {
-                    self.long.push(p, [a, bb, ing, buy | PURCHASE_SIDE]);
+                    push_long(&mut self.short, p, a, bb, ing, buy | PURCHASE_SIDE);
                 } else {
                     self.short.push(p, [a | (ing << 40), buy | PURCHASE_SIDE]);
                 }
@@ -438,7 +490,7 @@ impl<'a, 'b> V3Sink<'a, 'b> {
                 self.group(EvPend { ua: b.user_a[k], ub: b.user_b[k], slot, w, part: p as u32, flags: u32::from(ul) | (u32::from(ev_long) << 1) });
             } else if ev_long {
                 // A dead copy only shadows: its key, ingest and dead bit; no token needed.
-                self.long.push(p, w);
+                push_long(&mut self.short, p, w[0], w[1], w[2], w[3]);
             } else {
                 self.short.push(p, [w[0], w[1]]);
             }
@@ -476,9 +528,13 @@ impl<'a> Sink for V3Sink<'a, '_> {
         self.edges.prefetch_ahead(0, 512);
         let l = &mut *self.lnk;
         l.b[i] = *b;
-        for k in 0..b.n as usize {
-            l.slot[i][2 * k] = self.tok.start_hint::<true>(b.a_long >> k & 1 != 0, b.a_a[k], b.a_b[k]).slot as u32;
-            l.slot[i][2 * k + 1] = self.tok.start_hint::<true>(b.b_long >> k & 1 != 0, b.b_a[k], b.b_b[k]).slot as u32;
+        let n = b.n as usize;
+        let (mut ha, mut hb) = ([0u32; 8], [0u32; 8]);
+        self.tok.homes8::<true>(b.a_long, &b.a_a, &b.a_b, n, &mut ha);
+        self.tok.homes8::<true>(b.b_long, &b.b_a, &b.b_b, n, &mut hb);
+        for k in 0..n {
+            l.slot[i][2 * k] = ha[k];
+            l.slot[i][2 * k + 1] = hb[k];
         }
         l.head = (i + 1) % LD;
     }
@@ -669,11 +725,13 @@ impl<'a> Sink for ClickSink<'a, '_> {
     #[inline]
     fn clicks(&mut self, b: &ClickBatch) {
         let n = b.n as usize;
+        let mut h = [0u32; 8];
+        self.tok.homes8::<false>(b.user_long, &b.user_a, &b.user_b, n, &mut h);
         for k in 0..n {
             if b.loc[k] >> 48 != 0 {
                 self.bad = true;
             }
-            let user = self.tok.start_hint::<false>(b.user_long >> k & 1 != 0, b.user_a[k], b.user_b[k]);
+            let user = Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: h[k] as usize };
             let c = self.cur;
             self.blk[c][self.n[c]] = ClickPend { user, ts: u64::from(b.ts[k]), w1: b.loc[k] | (u64::from(b.campaign[k]) << 48) };
             self.n[c] += 1;

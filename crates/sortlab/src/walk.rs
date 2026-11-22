@@ -131,6 +131,8 @@ pub struct WalkScratch {
     row_info: Vec<[u32; 2]>,
     /// The click keys of this call carry the campaign (see `walk`).
     packed: bool,
+    /// Single pass: the campaign of each sorted click.
+    camp_s: Vec<u32>,
     pub stats: Stats,
 }
 
@@ -165,6 +167,7 @@ impl WalkScratch {
             last_at: Vec::new(),
             row_info: Vec::new(),
             packed: false,
+            camp_s: Vec::new(),
             stats: Stats::default(),
         }
     }
@@ -641,7 +644,8 @@ fn ckey(x: u64) -> u64 {
 const TS_MAX: u64 = (1 << 32) - REACH as u64 - 2;
 
 /// Stable LSD radix sort of packed keys by (person, ts) (bits KT..64): insertion up to 24 keys,
-/// else 12-bit digits, passes whose digit is the same for every key skipped.
+/// else 8-bit digits (256 buckets: the counts and the 256 write streams stay in L1), all six
+/// histograms from one read, passes whose digit is the same for every key skipped.
 fn radix_keys(a: &mut Vec<u64>, b: &mut Vec<u64>) {
     let n = a.len();
     if n <= 24 {
@@ -658,26 +662,32 @@ fn radix_keys(a: &mut Vec<u64>, b: &mut Vec<u64>) {
     }
     b.clear();
     b.resize(n, 0);
-    for (shift, bits) in [(KT, 12u32), (KT + 12, 12), (KT + 24, 12), (KT + 36, 11)] {
-        let mask = (1u64 << bits) - 1;
-        let mut count = [0u32; 4096];
-        for &x in a.iter() {
-            count[((x >> shift) & mask) as usize] += 1;
+    let mut count = [[0u32; 256]; 6];
+    for &x in a.iter() {
+        let k = x >> KT;
+        for (d, c) in count.iter_mut().enumerate() {
+            c[((k >> (8 * d)) & 255) as usize] += 1;
         }
-        if count[((a[0] >> shift) & mask) as usize] as usize == n {
+    }
+    for (d, c) in count.iter_mut().enumerate() {
+        let shift = KT + 8 * d as u32;
+        if c[((a[0] >> shift) & 255) as usize] as usize == n {
             continue;
         }
         let mut sum = 0u32;
-        for c in count[..1 << bits].iter_mut() {
-            let x = *c;
-            *c = sum;
+        for v in c.iter_mut() {
+            let x = *v;
+            *v = sum;
             sum += x;
         }
         for &x in a.iter() {
-            let d = ((x >> shift) & mask) as usize;
-            // SAFETY: count[d] < n = b.len() (prefix sums of the n keys)
-            unsafe { *b.get_unchecked_mut(count[d] as usize) = x };
-            count[d] += 1;
+            let dg = ((x >> shift) & 255) as usize;
+            // SAFETY: dg < 256; c[dg] < n = b.len() (prefix sums of the n keys)
+            unsafe {
+                let at = c.get_unchecked_mut(dg);
+                *b.get_unchecked_mut(*at as usize) = x;
+                *at += 1;
+            }
         }
         core::mem::swap(a, b);
     }
@@ -801,10 +811,14 @@ fn single_pass<F: FnMut(u64, u64) -> Ordering>(
     // sessions: credit, and the two click pointers into their histograms
     ws.last_at.clear();
     ws.last_at.resize(2 * (nc + 1), 0); // [credit-pointer histogram | window-start histogram]
-    let camp_of = |x: u64| -> usize {
+    // the campaigns in sorted order, read from the click records once (they are still near
+    // from the key pass); the loops below never touch the records again
+    ws.camp_s.clear();
+    ws.camp_s.extend(ka[..nc].iter().map(|&x| {
         // SAFETY: the low 17 bits of a key are the index of a kept input click
-        unsafe { (clicks.get_unchecked((x & 0x1_ffff) as usize)[1] >> 48) as usize }
-    };
+        unsafe { (clicks.get_unchecked((x & 0x1_ffff) as usize)[1] >> 48) as u32 }
+    }));
+    let camp_s = &ws.camp_s[..];
     {
         let (starts, revs) = (&out.start[..ns], &ws.sess_rev[..ns]);
         let (hl, hh) = ws.last_at.split_at_mut(nc + 1);
@@ -838,7 +852,7 @@ fn single_pass<F: FnMut(u64, u64) -> Ordering>(
                         let x = *kp.add(cp - 1);
                         let xk = ckey(x);
                         if xk >> 32 == p as u64 && sk - xk <= reach {
-                            camp = camp_of(x);
+                            camp = *camp_s.get_unchecked(cp - 1) as usize;
                             if cp >= 2 && *kp.add(cp - 2) >> KT == x >> KT {
                                 // a ts tie: the smallest click_id of the group (equal ids: the later)
                                 let mut g = cp - 1;
@@ -848,7 +862,7 @@ fn single_pass<F: FnMut(u64, u64) -> Ordering>(
                                 if g == memo_g {
                                     camp = memo_c;
                                 } else {
-                                    if ka[g..cp].iter().any(|&y| camp_of(y) != camp) {
+                                    if camp_s[g..cp].iter().any(|&y| y as usize != camp) {
                                         ws.stats.tie_groups += 1;
                                         let mut best = g;
                                         for i in g + 1..cp {
@@ -857,7 +871,7 @@ fn single_pass<F: FnMut(u64, u64) -> Ordering>(
                                                 best = i;
                                             }
                                         }
-                                        camp = camp_of(ka[best]);
+                                        camp = camp_s[best] as usize;
                                     }
                                     memo_g = g;
                                     memo_c = camp;
@@ -902,7 +916,7 @@ fn single_pass<F: FnMut(u64, u64) -> Ordering>(
                 lo += *hl.get_unchecked(j) as usize;
                 hi += *hh.get_unchecked(j) as usize;
                 let x = *ka.get_unchecked(j);
-                let camp = camp_of(x);
+                let camp = *camp_s.get_unchecked(j) as usize;
                 let st = sbase + (x >> KP) as u32;
                 let sc_ = stamp.get_unchecked_mut(camp);
                 let up = upto.get_unchecked_mut(camp);

@@ -135,6 +135,12 @@ pub struct Tables {
     /// Purchase side records met in the main streams (layout with purchases inline: surv 0 and a
     /// nonzero second word, `buy | PURCH_MARK`); joined with the side streams' records.
     pin_s: Vec<[u64; 2]>,
+    /// Pre-filter bitmaps (a key's bit set once in `fa`; again: also in `fb`), the unique
+    /// survivors' words, and the colliding records for the exact table.
+    fm: Vec<[u64; 2]>,
+    uniq: Vec<u64>,
+    ex_s: Vec<[u64; 2]>,
+    ex_l: Vec<[u64; 4]>,
     pin_l: Vec<[u64; 4]>,
     /// LONG records found in the SHORT stream (one-stream layout), for the LONG table.
     long_in: Vec<[u64; 4]>,
@@ -158,6 +164,10 @@ impl Tables {
             spec: Vec::new(),
             poisoned: false,
             pin_s: Vec::new(),
+            fm: Vec::new(),
+            uniq: Vec::new(),
+            ex_s: Vec::new(),
+            ex_l: Vec::new(),
             pin_l: Vec::new(),
             long_in: Vec::new(),
         }
@@ -847,6 +857,204 @@ pub fn partition(
     t: &mut Tables,
     m2: &mut Move2,
 ) -> Result<usize, Abort> {
+    // Pre-filter: a bit per key (another hash than the tables'). Copies of a key are all in this
+    // partition, so a key met twice sets its "again" bit; a record whose "again" bit is clear is
+    // the only copy of its key in the input: the winner, a survivor when alive. The rest (and
+    // every purchase side record and special) go through the exact table below.
+    // Bitmap words come in pairs [seen, again] so one line serves both.
+    let n_s: usize = short.iter().map(|c| c.len()).sum();
+    let n_l: usize = long.iter().map(|c| c.len()).sum();
+    let n_all = n_s + n_l + pshort.iter().map(|c| c.len()).sum::<usize>() + plong.iter().map(|c| c.len()).sum::<usize>() + specials.len();
+    let fbits = (n_all * 16).next_power_of_two().clamp(1 << 12, 1 << 20).trailing_zeros();
+    let fsh = 64 - fbits;
+    let words = 1usize << (fbits - 6);
+    let mut fm = std::mem::take(&mut t.fm);
+    fm.clear();
+    fm.resize(words, [0; 2]);
+    let fp = fm.as_mut_ptr();
+    let hs = |k: u64| ((k & KEY40).wrapping_mul(FH) >> fsh) as usize;
+    let hl = |a: u64, b: u64| (long_hash(a, b).wrapping_mul(FH) >> fsh) as usize;
+    // SAFETY (mark, again): h < 2^fbits, so h >> 6 < words = fm.len().
+    let mark = |h: usize| unsafe {
+        let w = &mut *fp.add(h >> 6);
+        let bit = 1u64 << (h & 63);
+        w[1] |= w[0] & bit;
+        w[0] |= bit;
+    };
+    let again = |h: usize| unsafe { ((*fp.add(h >> 6))[1] >> (h & 63)) & 1 };
+    let pf = |h: usize| prefetch(fp.wrapping_add(h >> 6));
+    // Pass 1 over the SHORT stream (LONG pairs inside it marked by their second unit's key).
+    let mut pend = false;
+    for c in short {
+        let (n, p) = (c.len(), c.as_ptr());
+        let mut j = 0;
+        if pend && n > 0 {
+            // SAFETY: n > 0.
+            let u = unsafe { *p };
+            mark(hl(u[0], u[1]));
+            pend = false;
+            j = 1;
+        }
+        while j < n {
+            if j + DT < n {
+                // SAFETY: j + DT < n.
+                pf(hs(unsafe { (*p.add(j + DT))[0] }));
+            }
+            // SAFETY: j < n.
+            let r = unsafe { *p.add(j) };
+            j += 1;
+            if !r[0] & X0 == 0 {
+                if j < n {
+                    // SAFETY: j < n.
+                    let u = unsafe { *p.add(j) };
+                    mark(hl(u[0], u[1]));
+                    j += 1;
+                } else {
+                    pend = true;
+                }
+                continue;
+            }
+            mark(hs(r[0]));
+        }
+    }
+    for c in long {
+        for r in c.iter() {
+            mark(hl(r[0], r[1]));
+        }
+    }
+    for c in pshort {
+        for r in c.iter() {
+            mark(hs(r[0]));
+        }
+    }
+    for c in plong {
+        for r in c.iter() {
+            mark(hl(r[0], r[1]));
+        }
+    }
+    for sp in specials {
+        match sp.key {
+            super::ids::Key::Short(k) => mark(hs(k)),
+            super::ids::Key::Long(a, b) => mark(hl(a, b)),
+            super::ids::Key::Foreign => {}
+        }
+    }
+    // Pass 2, without branches on the common path: every SHORT record is written to both the
+    // unique list (its survivor word) and the exact list, and each list's end advances only for
+    // the records it keeps.
+    let mut uniq = std::mem::take(&mut t.uniq);
+    let mut ex_s = std::mem::take(&mut t.ex_s);
+    let mut ex_l = std::mem::take(&mut t.ex_l);
+    uniq.clear();
+    uniq.reserve(n_s + n_l + 1);
+    ex_s.clear();
+    ex_s.reserve(n_s + 1);
+    ex_l.clear();
+    ex_l.reserve(n_s / 2 + n_l + 1);
+    let (up, sp_, lp) = (uniq.as_mut_ptr(), ex_s.as_mut_ptr(), ex_l.as_mut_ptr());
+    let (mut nu, mut ns_, mut nl_) = (0usize, 0usize, 0usize);
+    // A LONG record [a, b, w2, w3]: exact if its key met another, or a purchase side record.
+    let mut long_rec = |r: [u64; 4], nu: &mut usize, nl_: &mut usize| {
+        let ex = again(hl(r[0], r[1])) | u64::from(r[2] & TOP == 0 && r[3] != 0);
+        // SAFETY: at most one write per LONG record: nu < n_s + n_l + 1 and nl_ < n_s / 2 + n_l + 1
+        // (a LONG in the SHORT stream takes two of its units).
+        unsafe {
+            *lp.add(*nl_) = r;
+            *up.add(*nu) = r[3];
+        }
+        *nl_ += ex as usize;
+        *nu += ((ex ^ 1) & (r[2] >> 63)) as usize;
+    };
+    let mut pend: Option<[u64; 2]> = None;
+    for c in short {
+        let (n, p) = (c.len(), c.as_ptr());
+        let mut j = 0;
+        if let Some(u1) = pend.take() {
+            if n == 0 {
+                pend = Some(u1);
+                continue;
+            }
+            // SAFETY: n > 0.
+            let u = unsafe { *p };
+            long_rec([u[0], u[1], u1[0] & (ING | TOP), u1[1]], &mut nu, &mut nl_);
+            j = 1;
+        }
+        while j < n {
+            if j + DT < n {
+                // SAFETY: j + DT < n.
+                pf(hs(unsafe { (*p.add(j + DT))[0] }));
+            }
+            // SAFETY: j < n.
+            let r = unsafe { *p.add(j) };
+            j += 1;
+            if !r[0] & X0 == 0 {
+                if j < n {
+                    // SAFETY: j < n.
+                    let u = unsafe { *p.add(j) };
+                    long_rec([u[0], u[1], r[0] & (ING | TOP), r[1]], &mut nu, &mut nl_);
+                    j += 1;
+                } else {
+                    pend = Some(r);
+                }
+                continue;
+            }
+            let ex = again(hs(r[0])) | u64::from(r[0] & TOP == 0 && r[1] != 0);
+            // SAFETY: one write each per SHORT record: nu, ns_ < n_s + 1.
+            unsafe {
+                *sp_.add(ns_) = r;
+                *up.add(nu) = r[1];
+            }
+            ns_ += ex as usize;
+            nu += ((ex ^ 1) & (r[0] >> 63)) as usize;
+        }
+    }
+    for c in long {
+        for &r in c.iter() {
+            long_rec(r, &mut nu, &mut nl_);
+        }
+    }
+    // SAFETY: the first nu / ns_ / nl_ entries were written above.
+    unsafe {
+        uniq.set_len(nu);
+        ex_s.set_len(ns_);
+        ex_l.set_len(nl_);
+    }
+    t.fm = fm;
+    if pend.is_some() {
+        t.uniq = uniq;
+        t.ex_s = ex_s;
+        t.ex_l = ex_l;
+        return Err(Abort("a LONG record's first unit without its second".into()));
+    }
+    let r = exact(&[&ex_s[..]], &[&ex_l[..]], pshort, plong, specials, cx, t, m2, &uniq);
+    t.uniq = uniq;
+    t.ex_s = ex_s;
+    t.ex_l = ex_l;
+    if r.is_ok() && m2.w != NO_ARENA {
+        // SAFETY: new_in's contract: every chunk is a whole block of its class, in this
+        // partition only, and nothing reads it after this partition (the lists are copies).
+        unsafe { release(m2.w, short, long, pshort, plong) };
+    }
+    r
+}
+
+/// Second multiplier for the pre-filter's bit (independent of the tables' FIB index).
+const FH: u64 = 0xc2b2_ae3d_27d4_eb4f;
+
+/// The exact table on the colliding records, then move 2 of the unique survivors `uniq` and the
+/// table's survivors.
+#[allow(clippy::too_many_arguments)]
+fn exact(
+    short: &[&[[u64; 2]]],
+    long: &[&[[u64; 4]]],
+    pshort: &[&[[u64; 2]]],
+    plong: &[&[[u64; 4]]],
+    specials: &[Special],
+    cx: &Ctx3,
+    t: &mut Tables,
+    m2: &mut Move2,
+    uniq: &[u64],
+) -> Result<usize, Abort> {
     if t.poisoned {
         return Err(Abort("dedup tables left in an unknown state by an earlier failure".into()));
     }
@@ -960,11 +1168,6 @@ pub fn partition(
     t.marked.clear();
     // The move-1 chunks are read for the last time above: in block-class mode they go back to
     // this worker's lists now, so the move-2 output below reuses them (no fresh pages).
-    if m2.w != NO_ARENA {
-        // SAFETY: new_in's contract: every chunk is a whole block of its class, in this
-        // partition only, and nothing reads it after this partition.
-        unsafe { release(m2.w, short, long, pshort, plong) };
-    }
 
     // Survivor scan: the winners' survivor words, densely; the slots are zeroed after.
     let mut n = 0usize;
@@ -1039,14 +1242,8 @@ pub fn partition(
 
     // Move 2: person lookups prefetched DP survivors ahead.
     let people = cx.people;
-    let sv = &t.surv[..n];
-    for k in 0..n {
-        if k + DP < n {
-            people.prefetch(sv[k + DP] as u32);
-        }
-        let w = sv[k];
-        m2.push_word(people.person_of(w as u32), w);
-    }
+    emit(people, uniq, m2);
+    emit(people, &t.surv[..n], m2);
     for &(w, buy) in &t.buys {
         let person = people.person_of(w as u32);
         let q = m2.part(person);
@@ -1062,7 +1259,20 @@ pub fn partition(
     unsafe {
         core::arch::x86_64::_mm_sfence()
     };
-    Ok(n + t.spec.len())
+    Ok(uniq.len() + n + t.spec.len())
+}
+
+/// Survivor words to move 2, person lookups prefetched DP ahead.
+#[inline(always)]
+fn emit(people: &People, sv: &[u64], m2: &mut Move2) {
+    let n = sv.len();
+    for k in 0..n {
+        if k + DP < n {
+            people.prefetch(sv[k + DP] as u32);
+        }
+        let w = sv[k];
+        m2.push_word(people.person_of(w as u32), w);
+    }
 }
 
 /// Returns a partition's move-1 chunks to their block classes for pool participant `w`.
