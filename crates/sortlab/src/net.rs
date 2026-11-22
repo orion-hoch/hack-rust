@@ -138,6 +138,27 @@ impl Lanes for Z {
     }
 }
 
+/// Bit l: a[l] > b[l] unsigned, on 256-bit registers, written in asm. With the intrinsic the
+/// compiler joined two registers' compares (and the subtract and permute feeding them) into one
+/// 512-bit compare; any 512-bit instruction makes a Skylake-X / Cascade Lake core lower its clock
+/// for about 2 ms, and this ran for every person, so the whole session stage ran at the reduced
+/// clock. The comparator network itself is untouched.
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline]
+unsafe fn gt_y(a: __m256i, b: __m256i) -> u32 {
+    let r: u32;
+    core::arch::asm!(
+        "vpcmpnleud {k}, {a}, {b}",
+        "kmovw {r:e}, {k}",
+        k = out(kreg) _,
+        a = in(ymm_reg) a,
+        b = in(ymm_reg) b,
+        r = lateout(reg) r,
+        options(pure, nomem, nostack, preserves_flags),
+    );
+    r
+}
+
 /// 8 lanes, AVX-512F + AVX-512VL (256-bit registers).
 #[derive(Clone, Copy)]
 pub struct Y(__m256i);
@@ -191,7 +212,7 @@ impl Lanes for Y {
     }
     #[inline(always)]
     unsafe fn gt(a: Self, b: Self) -> u32 {
-        u32::from(_mm256_cmpgt_epu32_mask(a.0, b.0))
+        gt_y(a.0, b.0)
     }
     #[inline(always)]
     unsafe fn compress(m: u32, v: Self) -> Self {

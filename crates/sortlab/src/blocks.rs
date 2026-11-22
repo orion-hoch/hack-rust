@@ -225,12 +225,41 @@ unsafe fn blocks512(pb: &PersonBlocks, sc: &mut Scratch, out: &mut Out) -> Resul
     unsafe { blocks_partition::<NetCut<net::Z>>(pb, sc, out) }
 }
 
+/// The 256-bit network behind a call, so that it is the ONLY code compiled with AVX-512 enabled.
+/// Why: inside a function that has AVX-512F enabled the compiler vectorises ordinary loops with
+/// 512-bit registers (the reservation sum, the person index fill and constants did: 166 zmm
+/// instructions in blocks256, run once per partition, about every millisecond). Any 512-bit
+/// instruction makes a Skylake-X / Cascade Lake core lower its clock for about 2 ms, so the whole
+/// session stage ran at the reduced clock for the sake of loops that gain nothing from it.
+#[cfg(target_arch = "x86_64")]
+struct NetCut256;
+#[cfg(target_arch = "x86_64")]
+impl Cut for NetCut256 {
+    const MAX: usize = net::MAX_N;
+    const VEC: bool = true;
+    #[inline(always)]
+    unsafe fn net(ts: &[u32], out: &mut Out) {
+        // SAFETY: the caller's contract; blocks256 is only entered when AVX-512F and VL exist.
+        unsafe { net256_call(ts, out) }
+    }
+}
+
 /// # Safety
-/// AVX-512F and AVX-512VL present.
+/// AVX-512F and AVX-512VL present, and the conditions of `net::person_net_inl`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512vl")]
+#[inline(never)]
+unsafe fn net256_call(ts: &[u32], out: &mut Out) {
+    unsafe { net::person_net_inl::<net::Y>(ts, out, core::ptr::null_mut()) }
+}
+
+/// # Safety
+/// AVX-512F and AVX-512VL present (for the network it calls); this function itself is compiled
+/// for AVX2 only, so nothing in it can use a 512-bit register.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 unsafe fn blocks256(pb: &PersonBlocks, sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
-    unsafe { blocks_partition::<NetCut<net::Y>>(pb, sc, out) }
+    unsafe { blocks_partition::<NetCut256>(pb, sc, out) }
 }
 
 /// # Safety

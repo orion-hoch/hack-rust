@@ -179,6 +179,19 @@ fn nl_pattern(sc: &Scratch, k: usize, nf: usize) -> bool {
 pub(crate) struct Dates {
     y0: i64,
     day: Vec<i32>,
+    /// The AVX-512 batches' table (`fast3::date`): slot `date_ent_index(text)` holds the date's four
+    /// year characters (low 32 bits) and its day * 86400 relative to window_start's day (high 32).
+    ent: Vec<u64>,
+}
+
+/// Slots of `Dates::ent`.
+pub(crate) const DATE_ENTS: usize = 4096;
+
+/// Slot of a `YYYY-MM-DD` text in `Dates::ent`, from the low bits of its characters: D1 (2 bits),
+/// M2 (4), Y4 (1), M1 (1), D2 (4). One slot per date for any two consecutive years.
+#[inline(always)]
+pub(crate) fn date_ent_index(b: &[u8]) -> usize {
+    (b[8] & 3) as usize | ((b[6] & 15) as usize) << 2 | ((b[3] & 1) as usize) << 6 | ((b[5] & 1) as usize) << 7 | ((b[9] & 15) as usize) << 8
 }
 
 pub(crate) const BAD_DAY: i32 = i32::MIN;
@@ -200,18 +213,32 @@ impl Dates {
     pub(crate) fn day_ptr(&self) -> *const i32 {
         self.day.as_ptr()
     }
+    #[inline(always)]
+    pub(crate) fn ent_ptr(&self) -> *const u64 {
+        self.ent.as_ptr()
+    }
     pub(crate) fn new(ws_ms: i64, we_ms: i64) -> Dates {
         let ws_day = ws_ms.div_euclid(DAY_MS);
         let we_day = (we_ms - 1).div_euclid(DAY_MS);
         let (y0, _, _) = crate::ts::civil_from_days(ws_day - 9);
         let mut day = vec![BAD_DAY; DATE_SLOTS];
+        // An empty slot holds year characters whose last one has the other low bit than the slot's
+        // Y4 bit: no text that lands in the slot can equal them.
+        let mut ent: Vec<u64> = (0..DATE_ENTS).map(|i| ((((i >> 6) & 1) ^ 1) as u64) << 24).collect();
         for d in (ws_day - 9)..=(we_day + 7) {
             let (y, m, dd) = crate::ts::civil_from_days(d);
             if y - y0 < 2 && (0..=9999).contains(&y) {
                 day[date_index(y - y0, m, dd)] = (d - ws_day) as i32;
+                let (y, m, dd) = (y as u32, m as u32, dd as u32);
+                let dg = |v: u32| b'0' + (v % 10) as u8;
+                let text = [dg(y / 1000), dg(y / 100), dg(y / 10), dg(y), b'-', dg(m / 10), dg(m), b'-', dg(dd / 10), dg(dd)];
+                let i = date_ent_index(&text);
+                debug_assert!(ent[i] >> 32 == 0 && ent[i] & 0xFFFF_FFFF == ((((i >> 6) & 1) ^ 1) as u64) << 24);
+                let year = u32::from_le_bytes([text[0], text[1], text[2], text[3]]) as u64;
+                ent[i] = year | ((((d - ws_day) * 86_400) as i32 as u32 as u64) << 32);
             }
         }
-        Dates { y0, day }
+        Dates { y0, day, ent }
     }
 }
 

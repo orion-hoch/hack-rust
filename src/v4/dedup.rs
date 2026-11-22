@@ -157,9 +157,32 @@ impl Out2 {
     /// A SHORT user's survivor: pu, ru from mu (40 bits: below 2^b2 and 2^(40 - b2)).
     #[inline(always)]
     fn emit_short(&mut self, mu: u64, ts: u64, purch: u64, pay: u64) {
-        let q = (mu >> (40 - self.b2)) as usize;
-        let ru = mu & ((1 << (40 - self.b2)) - 1);
-        put(&mut self.short, q, &[(ru << 32) | (ts << 1) | purch, pay][..1 + purch as usize]);
+        let rsh = 40 - self.b2;
+        let q = (mu >> rsh) as usize;
+        let word = (low_bits(mu, rsh) << 32) | (ts << 1) | purch;
+        let (stage, fill, _) = self.short.raw_parts();
+        // The word, then the payload stored after it and kept (the count + 1) with a purchase:
+        // no branch on purch, two stores and two full-line tests.
+        // SAFETY: q is below the partition count; the count is below 8 at each store (see
+        // `Out::raw_parts`); a full line is flushed before the next store.
+        unsafe {
+            let f = fill.add(q);
+            let line = stage.add(q * 8);
+            let mut n = *f as usize;
+            *line.add(n) = word;
+            n += 1;
+            if n == 8 {
+                self.short.flush_line(q);
+                n = 0;
+            }
+            *line.add(n) = pay;
+            n += purch as usize;
+            if n == 8 {
+                self.short.flush_line(q);
+                n = 0;
+            }
+            *f = n as u32;
+        }
     }
 
     /// A LONG or FOREIGN user's survivor.

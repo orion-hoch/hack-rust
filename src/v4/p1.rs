@@ -2,12 +2,13 @@
 //! entries (I4) and writes one person block per user with events and one click block per user
 //! with clicks (RECORDS-V4 section 8), each to its person's home partition.
 //!
-//! * Users: every user gets a dense 32-byte record in insertion order (counts and pk in pass 1,
-//!   the block cursors in pass 2); its byte offset is its handle. SHORT users are found through a
-//!   direct table of `ru | offset << 32` indexed by the top k bits of ru (ru is the low bits of
-//!   mix40, already uniform: no hash), linear probing, all ones = empty (ru has at most 31 bits).
+//! * Users: every user gets a dense id in insertion order and three 8-byte words under it (key
+//!   and count, pk, click and purchase counts in pass 1; the three block cursors in pass 2), each
+//!   in its own array so a pass touches one. SHORT users are found through a direct table of
+//!   ids (4 bytes a slot) indexed by the top k bits of ru (ru is the low bits of mix40, already
+//!   uniform: no hash), linear probing, id 0 = empty (its key is EMPTY; ru has at most 31 bits).
 //!   LONG/FOREIGN users ("wide") through a small hash of (a, b, kind). Nothing per user is
-//!   indexed by the sparse slot: a partition's working set is the table plus the records.
+//!   indexed by the sparse slot: a partition's working set is the table plus the dense words.
 //! * Link entries are inserted first (they carry the person key pk; a representative's pk is its
 //!   own key). An unlinked SHORT user's pk is its own mu = q << rbits | ru (home q); an unlinked
 //!   wide user's pk is P1-local: 1 << 63 | kind << 61 | 1 << 60 | q << 32 | i, with [a, b] at
@@ -67,37 +68,36 @@ pub enum Error {
     Size,
 }
 
-/// One user's record: 32 bytes, dense, in insertion order (the offset of a record in bytes is the
-/// user's handle everywhere: in the direct table, the wide table, idx, bidx and cidx).
-/// Pass 1: `[cnt | nbuy << 32, pk, nck, -]`. The layout turns it into the pass-2 cursors:
-/// `[event cursor, payload cursor, nck, click cursor]`.
-const REC: usize = 32;
-
 pub struct State {
-    /// The direct table, 2^k entries `ru | record offset << 32` (home slot of ru = its top k
-    /// bits); all ones = empty.
-    tab: Vec<u64>,
-    /// The user records; record 0 is the spare one of the clicks that hit no user.
-    users: Vec<[u64; 4]>,
-    /// Offset of the next free record.
+    /// The direct table, 2^k entries: the user's id (home slot of ru = its top k bits); 0 = empty.
+    tab: Vec<u32>,
+    /// Per user id (dense, in insertion order; id 0 is the spare user of the clicks that hit no
+    /// user, its key EMPTY), three 8-byte arrays, each the only one its pass touches at random:
+    /// `ua`: key | cnt << 32 (a wide user's key is EMPTY), after the layout the event cursor;
+    /// `ub`: the links' pk, after the layout the payload cursor;
+    /// `uc`: nck | nbuy << 32, after the layout the click cursor.
+    ua: Vec<u64>,
+    ub: Vec<u64>,
+    uc: Vec<u64>,
+    /// The next free id.
     next: usize,
     nwide: u32,
-    /// Wide users: hash table of [a, b, kind, record offset] (0 = empty), and per wide index
+    /// Wide users: hash table of [a, b, kind, id] (0 = empty), and per wide index
     /// [a, b, kind, linked].
     wt: Vec<[u64; 4]>,
     /// Entries of wtab in use (cleared by the next reset).
     wpos: Vec<u32>,
     wkey: Vec<[u64; 4]>,
-    /// Per event (reading order): record offset and the 4-byte event.
+    /// Per event (reading order): user id and the 4-byte event.
     idx: Vec<u32>,
     ev: Vec<u32>,
-    /// Per purchase: record offset and payload.
+    /// Per purchase: user id and payload.
     bidx: Vec<u32>,
     bval: Vec<u64>,
-    /// Per click (reading order, SHORT then wide): record offset (0: no user here).
+    /// Per click (reading order, SHORT then wide): user id (0: no user here).
     cidx: Vec<u32>,
     /// Where pass 2 writes the clicks of no user here (they reach no session): the click cursor
-    /// of record 0 points into it, so neither click loop tests for a miss.
+    /// of user 0 points into it, so neither click loop tests for a miss.
     trash: Vec<[u64; 2]>,
     /// P1-local wide person keys of the last partition: [a, b] at index i of pk.
     pub wide: Vec<[u64; 2]>,
@@ -124,8 +124,10 @@ impl State {
     pub fn new() -> Self {
         State {
             tab: Vec::new(),
-            users: Vec::new(),
-            next: REC,
+            ua: Vec::new(),
+            ub: Vec::new(),
+            uc: Vec::new(),
+            next: 1,
             nwide: 0,
             wt: Vec::new(),
             wpos: Vec::new(),
@@ -144,8 +146,7 @@ impl State {
         }
     }
 
-    /// A clean direct table of 2^k slots, room for `cap` user records, a wide table for `wide`
-    /// wide users.
+    /// A clean direct table of 2^k slots, room for `cap` users, a wide table for `wide` wide users.
     fn reset(&mut self, k: u32, wide: usize, cap: usize) {
         for &h in &self.wpos {
             self.wt[h as usize] = [0; 4];
@@ -153,20 +154,24 @@ impl State {
         self.wpos.clear();
         self.nwide = 0;
         let ds = 1usize << k;
-        // The whole direct table in one sequential fill (8 bytes a slot): no per-user clearing
+        // The whole direct table in one sequential fill (4 bytes a slot): no per-user clearing
         // of sparse arrays, and the table is in cache for the inserts that follow.
         self.tab.clear();
         self.tab.reserve(ds);
-        // SAFETY: ds entries reserved; all-ones bytes are a valid u64.
+        // SAFETY: ds entries reserved; zero bytes are a valid u32.
         unsafe {
-            core::ptr::write_bytes(self.tab.as_mut_ptr(), 0xFF, ds);
+            core::ptr::write_bytes(self.tab.as_mut_ptr(), 0, ds);
             self.tab.set_len(ds);
         }
-        if self.users.len() < cap {
-            self.users.resize(cap, [0; 4]);
+        if self.ua.len() < cap {
+            self.ua.resize(cap, 0);
+            self.ub.resize(cap, 0);
+            self.uc.resize(cap, 0);
         }
-        self.users[0] = [0; 4];
-        self.next = REC;
+        self.ua[0] = u64::from(EMPTY);
+        self.ub[0] = 0;
+        self.uc[0] = 0;
+        self.next = 1;
         let wsize = (2 * wide).max(16).next_power_of_two();
         if self.wt.len() != wsize {
             self.wt.clear();
@@ -181,7 +186,7 @@ impl State {
         self.wide.clear();
     }
 
-    /// Record offset of wide user (a, b, kind), inserted (pk 0: decided at layout) if new.
+    /// Id of wide user (a, b, kind), inserted (pk 0: decided at layout) if new.
     #[inline(always)]
     fn wide_slot(&mut self, a: u64, b: u64, kind: u64) -> usize {
         let mask = self.wt.len() - 1;
@@ -204,14 +209,16 @@ impl State {
     #[cold]
     #[inline(never)]
     fn wide_new(&mut self, h: usize, a: u64, b: u64, kind: u64) -> usize {
-        let off = self.next;
-        self.next += REC;
+        let id = self.next;
+        self.next += 1;
         self.nwide += 1;
-        self.wt[h] = [a, b, kind, off as u64];
+        self.wt[h] = [a, b, kind, id as u64];
         self.wpos.push(h as u32);
         self.wkey.push([a, b, kind, 0]);
-        self.users[off / REC] = [0; 4];
-        off
+        self.ua[id] = u64::from(EMPTY);
+        self.ub[id] = 0;
+        self.uc[id] = 0;
+        id
     }
 }
 
@@ -219,18 +226,20 @@ impl State {
 /// reallocates them during it). The first six fields are read by the asm at fixed offsets.
 #[repr(C)]
 struct Hot {
-    /// Offset of the next free user record (advances).
+    /// The next free user id (advances).
     next: u64,      // 0
     /// A `next` past this after an insert: the direct table is over half full.
     lim: u64,       // 8
-    own: u64,       // 16
+    /// uc: nck | nbuy << 32 per id.
+    uc: *mut u64,   // 16
     mask: u64,      // 24
-    /// The next purchase's payload and record offset (advance).
+    /// The next purchase's payload and user id (advance).
     bval: *mut u64, // 32
     bidx: *mut u32, // 40
-    tab: *mut u64,
-    users: *mut u8,
-    /// The next event's record offset and 4-byte event (advance).
+    tab: *mut u32,
+    /// ua: key | cnt << 32 per id.
+    ua: *mut u64,
+    /// The next event's user id and 4-byte event (advance).
     idx: *mut u32,
     ev: *mut u32,
     /// 32 + shift: a record's home slot is its word >> sh (the top k bits of ru).
@@ -251,14 +260,14 @@ enum Stop {
 }
 
 /// SHORT survivors of one piece from word i: per record its user (home slot = the top k bits of ru,
-/// then linear probing; a new user gets the next record, pk = its own key), its count, the record
-/// offset and the 4-byte event stored; a purchase counts in nbuy and its payload (the next word)
-/// goes to bval/bidx. One asm loop: 13 instructions per record that hits its home slot (load, rorx,
-/// shrx, cmp, the offset, the count, two stores, the purchase test, the counter).
+/// then linear probing; a new user gets the next id), its count, the id and the 4-byte event stored;
+/// a purchase counts in nbuy and its payload (the next word) goes to bval/bidx. One asm loop: 13
+/// instructions per record that hits its home slot (load, rorx, shrx, the id, cmp, the count, two
+/// stores, the purchase test, the counter). An empty slot holds id 0, whose key (EMPTY) is no ru.
 ///
 /// # Safety
 /// The Hot pointers have room for every record of the pass (idx, ev, bval, bidx: one per word;
-/// users: up to lim + REC); tab covers every slot (ru < 2^rbits).
+/// ua, uc: ids up to lim); tab covers every slot (ru < 2^rbits).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn hot(c: &[u64], i: usize, h: &mut Hot) -> Stop {
@@ -278,85 +287,85 @@ unsafe fn hot(c: &[u64], i: usize, h: &mut Hot) -> Stop {
             "mov {r}, qword ptr [{inp} + 8*{t}]",
             "rorx {ru}, {r}, 32",
             "shrx {s}, {r}, {sh}",
-            "cmp {ru:e}, dword ptr [{tab} + 8*{s}]",
+            "mov {id:e}, dword ptr [{tab} + 4*{s}]",
+            "cmp {ru:e}, dword ptr [{ua} + 8*{id}]",
             "jne 5f",
             "3:",
-            "mov {s:e}, dword ptr [{tab} + 8*{s} + 4]",
-            "inc dword ptr [{us} + {s}]",
-            "mov dword ptr [{idx} + 4*{t}], {s:e}",
+            "inc dword ptr [{ua} + 8*{id} + 4]",
+            "mov dword ptr [{idx} + 4*{t}], {id:e}",
             "mov dword ptr [{ev} + 4*{t}], {r:e}",
             "test {r:l}, 1",
             "jnz 6f",
             "inc {t}",
             "jnz 2b",
-            "xor {tmp:e}, {tmp:e}",
+            "xor {id:e}, {id:e}",
             "jmp 9f",
             // not at its home slot: probe on (moved by an earlier user), or insert at an empty slot
             "5:",
-            "cmp dword ptr [{tab} + 8*{s}], -1",
-            "je 7f",
+            "test {id:e}, {id:e}",
+            "jz 7f",
             "4:",
             "inc {s}",
             "and {s}, qword ptr [{ctx} + 24]",
-            "mov {tmp:e}, dword ptr [{tab} + 8*{s}]",
-            "cmp {tmp:e}, {ru:e}",
+            "mov {id:e}, dword ptr [{tab} + 4*{s}]",
+            "cmp {ru:e}, dword ptr [{ua} + 8*{id}]",
             "je 3b",
-            "cmp {tmp:e}, -1",
-            "jne 4b",
-            // a new user: the next record (counts 0, pk = own | ru), its offset into the slot
+            "test {id:e}, {id:e}",
+            "jnz 4b",
+            // a new user: the next id into the slot, its key with count 0, no clicks or purchases
             "7:",
             "cmp {ru:e}, -1",
             "je 8f",
-            "mov {tmp}, qword ptr [{ctx}]",
-            "mov dword ptr [{tab} + 8*{s}], {ru:e}",
-            "mov dword ptr [{tab} + 8*{s} + 4], {tmp:e}",
+            "mov {id}, qword ptr [{ctx}]",
+            "mov dword ptr [{tab} + 4*{s}], {id:e}",
             "mov {ru:e}, {ru:e}",
-            "or {ru}, qword ptr [{ctx} + 16]",
-            "mov qword ptr [{us} + {tmp}], 0",
-            "mov qword ptr [{us} + {tmp} + 8], {ru}",
-            "mov qword ptr [{us} + {tmp} + 16], 0",
-            "add {tmp}, 32",
-            "mov qword ptr [{ctx}], {tmp}",
-            "cmp {tmp}, qword ptr [{ctx} + 8]",
+            "mov qword ptr [{ua} + 8*{id}], {ru}",
+            "mov {s}, qword ptr [{ctx} + 16]",
+            "mov qword ptr [{s} + 8*{id}], 0",
+            "lea {s}, [{id} + 1]",
+            "mov qword ptr [{ctx}], {s}",
+            "cmp {s}, qword ptr [{ctx} + 8]",
             "jbe 3b",
-            "mov {tmp:e}, 2",
+            "mov {id:e}, 2",
             "jmp 9f",
             "8:",
-            "mov {tmp:e}, 3",
+            "mov {id:e}, 3",
             "jmp 9f",
-            // a purchase of user s: count it, then its payload word (or it starts the next piece)
+            // a purchase of user id: count it, then its payload word (or it starts the next piece)
             "6:",
-            "inc dword ptr [{us} + {s} + 4]",
+            "mov {s}, qword ptr [{ctx} + 16]",
+            "inc dword ptr [{s} + 8*{id} + 4]",
             "inc {t}",
             "jz 22f",
             "mov {r}, qword ptr [{inp} + 8*{t}]",
-            "mov {tmp}, qword ptr [{ctx} + 32]",
-            "mov qword ptr [{tmp}], {r}",
+            "mov {s}, qword ptr [{ctx} + 32]",
+            "mov qword ptr [{s}], {r}",
             "add qword ptr [{ctx} + 32], 8",
-            "mov {tmp}, qword ptr [{ctx} + 40]",
-            "mov dword ptr [{tmp}], {s:e}",
+            "mov {s}, qword ptr [{ctx} + 40]",
+            "mov dword ptr [{s}], {id:e}",
             "add qword ptr [{ctx} + 40], 4",
             "sub {idx}, 4",
             "sub {ev}, 4",
             "inc {t}",
             "jnz 2b",
-            "xor {tmp:e}, {tmp:e}",
+            "xor {id:e}, {id:e}",
             "jmp 9f",
             "22:",
-            "mov {tmp:e}, 1",
+            "mov {s}, {id}",
+            "mov {id:e}, 1",
             "9:",
             inp = in(reg) inp,
             t = inout(reg) t,
             idx = inout(reg) idx,
             ev = inout(reg) ev,
             tab = in(reg) h.tab,
-            us = in(reg) h.users,
+            ua = in(reg) h.ua,
             sh = in(reg) h.sh,
             ctx = in(reg) h as *mut Hot,
             r = out(reg) _,
             ru = out(reg) _,
             s = out(reg) s,
-            tmp = out(reg) stat,
+            id = out(reg) stat,
             options(nostack),
         );
         h.idx = idx.offset(t);
@@ -379,39 +388,40 @@ unsafe fn hot(c: &[u64], mut i: usize, h: &mut Hot) -> Stop {
             let r = c[i];
             let ru = (r >> 32) as u32;
             let mut s = (r >> h.sh) as usize;
-            let off = loop {
-                let e = *h.tab.add(s);
-                if e as u32 == ru {
-                    break (e >> 32) as usize;
+            let id = loop {
+                let id = *h.tab.add(s) as usize;
+                if *h.ua.add(id) as u32 == ru {
+                    break id;
                 }
-                if e as u32 == EMPTY {
+                if id == 0 {
                     if ru == EMPTY {
                         return Stop::BadRu;
                     }
-                    let off = h.next as usize;
-                    *h.tab.add(s) = u64::from(ru) | (off as u64) << 32;
-                    *(h.users.add(off) as *mut [u64; 4]) = [0, h.own | u64::from(ru), 0, 0];
-                    h.next += REC as u64;
+                    let id = h.next as usize;
+                    *h.tab.add(s) = id as u32;
+                    *h.ua.add(id) = u64::from(ru);
+                    *h.uc.add(id) = 0;
+                    h.next += 1;
                     if h.next > h.lim {
                         return Stop::Full;
                     }
-                    break off;
+                    break id;
                 }
                 s = (s + 1) & h.mask as usize;
             };
-            *(h.users.add(off) as *mut u32) += 1;
-            *h.idx = off as u32;
+            *h.ua.add(id) += 1 << 32;
+            *h.idx = id as u32;
             *h.ev = r as u32;
             h.idx = h.idx.add(1);
             h.ev = h.ev.add(1);
             i += 1;
             if r & 1 != 0 {
-                *(h.users.add(off + 4) as *mut u32) += 1;
+                *h.uc.add(id) += 1 << 32;
                 if i == c.len() {
-                    return Stop::Pend(off as u32);
+                    return Stop::Pend(id as u32);
                 }
                 *h.bval = c[i];
-                *h.bidx = off as u32;
+                *h.bidx = id as u32;
                 h.bval = h.bval.add(1);
                 h.bidx = h.bidx.add(1);
                 i += 1;
@@ -441,7 +451,7 @@ unsafe fn wrec(st: &mut State, h: &mut Hot, t: &WideTab, a: u64, b: u64, kind: u
     let mut x = wide_hash(a, b, kind, t.bits);
     // SAFETY: x is masked below wt.len(); h as the caller's contract.
     unsafe {
-        let off = loop {
+        let id = loop {
             let en = &*t.wt.add(x);
             if en[0] == a && en[1] == b && en[2] == kind {
                 break en[3] as usize;
@@ -454,16 +464,15 @@ unsafe fn wrec(st: &mut State, h: &mut Hot, t: &WideTab, a: u64, b: u64, kind: u
             }
             x = (x + 1) & t.mask;
         };
-        let u = h.users.add(off) as *mut u32;
-        *u += 1;
-        *h.idx = off as u32;
+        *(h.ua.add(id) as *mut u32).add(1) += 1;
+        *h.idx = id as u32;
         *h.ev = e;
         h.idx = h.idx.add(1);
         h.ev = h.ev.add(1);
         if e & 1 != 0 {
-            *u.add(1) += 1;
+            *(h.uc.add(id) as *mut u32).add(1) += 1;
             *h.bval = pay;
-            *h.bidx = off as u32;
+            *h.bidx = id as u32;
             h.bval = h.bval.add(1);
             h.bidx = h.bidx.add(1);
         }
@@ -482,7 +491,7 @@ unsafe fn wfast(c: &[u64], i: &mut usize, h: &mut Hot, t: &WideTab) -> bool {
     let n = c.len();
     let cp = c.as_ptr();
     let (wt, bits, mask) = (t.wt, t.bits, t.mask);
-    let us = h.users;
+    let (ua, uc) = (h.ua, h.uc);
     let (mut idxp, mut evp, mut bvp, mut bip) = (h.idx, h.ev, h.bval, h.bidx);
     let mut j = *i;
     let mut miss = false;
@@ -498,7 +507,7 @@ unsafe fn wfast(c: &[u64], i: &mut usize, h: &mut Hot, t: &WideTab) -> bool {
             let kind = w >> 62;
             let mut x = wide_hash(a, b, kind, bits);
             // a miss leaves the loop (no call inside it: nothing spills); the caller inserts
-            let off = loop {
+            let id = loop {
                 let en = &*wt.add(x);
                 if en[0] == a && en[1] == b && en[2] == kind {
                     break en[3] as usize;
@@ -512,16 +521,15 @@ unsafe fn wfast(c: &[u64], i: &mut usize, h: &mut Hot, t: &WideTab) -> bool {
             if miss {
                 break;
             }
-            let u = us.add(off) as *mut u32;
-            *u += 1;
-            *idxp = off as u32;
+            *(ua.add(id) as *mut u32).add(1) += 1;
+            *idxp = id as u32;
             *evp = w as u32;
             idxp = idxp.add(1);
             evp = evp.add(1);
             if p != 0 {
-                *u.add(1) += 1;
+                *(uc.add(id) as *mut u32).add(1) += 1;
                 *bvp = *cp.add(j + 3);
-                *bip = off as u32;
+                *bip = id as u32;
                 bvp = bvp.add(1);
                 bip = bip.add(1);
             }
@@ -581,8 +589,8 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     if inp.link_ru.len() > mask {
         return Ok(Pass::Direct);
     }
-    // records: the spare one, the SHORT users (the links', or half the table and the one that
-    // passes it), the wide users, one spare; offsets are 32-bit
+    // ids: the spare one, the SHORT users (the links', or half the table and the one that
+    // passes it), the wide users, one spare
     let cap = limit.max(inp.link_ru.len()) + wide_max + 3;
     if cap >= 1 << 27 {
         return Err(Error::Size);
@@ -592,27 +600,29 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     let rbits = inp.rbits;
     let own = u64::from(q) << rbits;
     let tab = st.tab.as_mut_ptr();
-    let us = st.users.as_mut_ptr() as *mut u8;
+    let (ua, ub, uc) = (st.ua.as_mut_ptr(), st.ub.as_mut_ptr(), st.uc.as_mut_ptr());
     // links first: their person keys (a representative's is its own key)
-    let mut next = REC;
+    let mut next = 1usize;
     for (&ru, &pk) in inp.link_ru.iter().zip(inp.link_pk) {
         if ru == EMPTY {
             return Err(Error::RuBits);
         }
         let mut s = (ru >> shift) as usize & mask;
-        // SAFETY: s is masked below 2^k = tab.len(); at most link_ru.len() records are taken
+        // SAFETY: s is masked below 2^k = tab.len(); at most link_ru.len() ids are taken
         // (cap covers them) and the table has an empty slot (link_ru.len() <= mask).
         unsafe {
             loop {
-                let e = *tab.add(s);
-                if e as u32 == ru {
-                    *(us.add((e >> 32) as usize + 8) as *mut u64) = pk;
+                let id = *tab.add(s) as usize;
+                if id == 0 {
+                    *tab.add(s) = next as u32;
+                    *ua.add(next) = u64::from(ru);
+                    *ub.add(next) = pk;
+                    *uc.add(next) = 0;
+                    next += 1;
                     break;
                 }
-                if e as u32 == EMPTY {
-                    *tab.add(s) = u64::from(ru) | (next as u64) << 32;
-                    *(us.add(next) as *mut [u64; 4]) = [0, pk, 0, 0];
-                    next += REC;
+                if *ua.add(id) as u32 == ru {
+                    *ub.add(id) = pk;
                     break;
                 }
                 s = (s + 1) & mask;
@@ -620,18 +630,18 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         }
     }
     st.next = next;
-    // records [REC, a_end): the links' SHORT users; [a_end, b_end): the links' wide users
+    // ids [1, a_end): the links' SHORT users; [a_end, b_end): the links' wide users
     let a_end = next;
-    if a_end / REC - 1 > limit {
+    if a_end - 1 > limit {
         return Ok(Pass::Direct);
     }
     for w in inp.wlink {
-        let off = st.wide_slot(w[0], w[1], w[3]);
-        st.users[off / REC][1] = w[2];
-        st.wkey[(off - a_end) / REC][3] = 1;
+        let id = st.wide_slot(w[0], w[1], w[3]);
+        st.ub[id] = w[2];
+        st.wkey[id - a_end][3] = 1;
     }
     let b_end = st.next;
-    // pass 1, SHORT survivors (the hot loop, `hot`): user, count, the offset and the event stored
+    // pass 1, SHORT survivors (the hot loop, `hot`): user, count, the id and the event stored
     let n_surv: usize = inp.surv.iter().map(|c| c.len()).sum();
     let n_wsurv: usize = inp.wsurv.iter().map(|c| c.len()).sum();
     // one entry per SHORT word, one per wide-stream record (3 words or more)
@@ -642,15 +652,15 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     st.bidx.reserve(n_rec);
     let mut h = Hot {
         next: b_end as u64,
-        // the SHORT users are the a_end / REC - 1 of the links and those taken from b_end on:
-        // more than `limit` of them is a table over half full
-        lim: (b_end + REC * limit + REC - a_end) as u64,
-        own,
+        // the SHORT users are the a_end - 1 of the links and those taken from b_end on: more
+        // than `limit` of them is a table over half full
+        lim: (b_end + limit + 1 - a_end) as u64,
+        uc,
         mask: mask as u64,
         bval: st.bval.as_mut_ptr(),
         bidx: st.bidx.as_mut_ptr(),
         tab,
-        users: us,
+        ua,
         idx: st.idx.as_mut_ptr(),
         ev: st.ev.as_mut_ptr(),
         sh: u64::from(32 + shift),
@@ -680,7 +690,7 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
             _ => break,
         }
     }
-    // records [b_end, c_end): the SHORT users first seen in the survivors; [c_end, d_end): wide
+    // ids [b_end, c_end): the SHORT users first seen in the survivors; [c_end, d_end): wide
     st.next = h.next as usize;
     let c_end = st.next;
     // wide survivors: [a, b, word] (+ the payload word after a purchase),
@@ -741,7 +751,11 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         Stop::BadRu => return Err(Error::RuBits),
         _ => {}
     }
-    // clicks: lookup only. A miss takes record 0 (counted there, never laid out), so the loops
+    // an event counted on the spare user: its ru was EMPTY (the spare key), not a valid remainder
+    if st.ua[0] >> 32 != 0 {
+        return Err(Error::RuBits);
+    }
+    // clicks: lookup only. A miss takes user 0 (counted there, never laid out), so the loops
     // have no miss branch on the store: pass 2 writes such a click to the trash.
     let n_ck: usize = inp.clicks.iter().map(|c| c.len()).sum::<usize>() + inp.wclicks.iter().map(|c| c.len()).sum::<usize>();
     st.cidx.reserve(n_ck);
@@ -752,22 +766,20 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
             let cp = c.as_ptr();
             for i in 0..c.len() {
                 // SAFETY: i < c.len(); slots are masked below 2^k = tab.len(); j + i < n_ck =
-                // cidx's capacity; an offset from the table is a record's.
+                // cidx's capacity; an id from the table is a user's.
                 unsafe {
                     let ru = ((*cp.add(i))[0] >> 32) as u32;
                     let mut s = (ru >> shift) as usize;
-                    let mut e = *tab.add(s);
-                    while e as u32 != ru {
-                        if e as u32 == EMPTY {
-                            e = 0;
+                    let mut id = *tab.add(s) as usize;
+                    while *ua.add(id) as u32 != ru {
+                        if id == 0 {
                             break;
                         }
                         s = (s + 1) & mask;
-                        e = *tab.add(s);
+                        id = *tab.add(s) as usize;
                     }
-                    let off = (e >> 32) as usize;
-                    *(us.add(off + 16) as *mut u32) += 1;
-                    *cidx.add(j + i) = off as u32;
+                    *(uc.add(id) as *mut u32) += 1;
+                    *cidx.add(j + i) = id as u32;
                 }
             }
             j += c.len();
@@ -777,7 +789,7 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
                 let (a, b, kind) = (r[0], r[1], r[2] >> 62);
                 let mut x = wide_hash(a, b, kind, wt.bits);
                 // SAFETY: x is masked below the table's length.
-                let off = loop {
+                let id = loop {
                     let en = unsafe { &*wt.wt.add(x) };
                     if en[0] == a && en[1] == b && en[2] == kind {
                         break en[3] as usize;
@@ -789,8 +801,8 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
                 };
                 // SAFETY: as above.
                 unsafe {
-                    *(us.add(off + 16) as *mut u32) += 1;
-                    *cidx.add(j) = off as u32;
+                    *(uc.add(id) as *mut u32) += 1;
+                    *cidx.add(j) = id as u32;
                 }
                 j += 1;
             }
@@ -798,87 +810,91 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         // SAFETY: entries 0..j written above.
         unsafe { st.cidx.set_len(j) };
     }
-    // layout: blocks in the homes, headers, cursors. The records are walked in order (dense).
+    // the clicks of no user here: counted on user 0
+    let nmiss = st.uc[0] as u32 as usize;
+    // layout: blocks in the homes, headers, cursors. The users are walked in id order (dense).
     // SHORT users, the common case: one allocation holds the person block and the click block
     // back to back. Anything unusual (a count past 2^24, a home out of range, blocks over one
     // chunk) and every wide user go to `layout_one`, the general path.
     let nb_homes = 40 - rbits;
-    for (lo, hi) in [(REC, a_end), (b_end, c_end)] {
-        let mut off = lo;
-        while off < hi {
-            // SAFETY: off < hi <= the records taken; a block has the words asked for.
+    for (lo, hi, linked) in [(1, a_end, true), (b_end, c_end, false)] {
+        for id in lo..hi {
+            // SAFETY: id < hi <= the ids taken; a block has the words asked for.
             unsafe {
-                let rec = us.add(off) as *mut u64;
-                let w0 = *rec;
-                let (ne, nb) = (w0 as u32 as usize, (w0 >> 32) as usize);
-                let nc = *rec.add(2) as u32 as usize;
+                let a = *ua.add(id);
+                let c = *uc.add(id);
+                let (ne, nc, nb) = ((a >> 32) as usize, c as u32 as usize, (c >> 32) as usize);
                 if ne | nc != 0 {
-                    let pk = *rec.add(1);
+                    // a link's pk, or the user's own key
+                    let pk = if linked { *ub.add(id) } else { own | u64::from(a as u32) };
                     // SHORT: the top b2 bits of mu; wide (links'): bits 32-44 (RECORDS-V4 7)
                     let home = if pk >> 63 == 0 { pk >> rbits } else { (pk >> 32) & 0x1FFF } as u32;
                     let ew = ne.div_ceil(2);
                     let pw = if ne != 0 { 2 + ew + nb } else { 0 };
                     let cw = if nc != 0 { 2 + 2 * nc } else { 0 };
                     if pw + cw > CW - 2 || home >> nb_homes != 0 {
-                        layout_one(st, out, off, usize::MAX, q, rbits)?;
+                        layout_one(st, out, id, pk, usize::MAX, q, rbits)?;
                     } else {
                         let p = out.block(home, pw + cw);
+                        // every line of the two blocks is wanted for writing by pass 2: asked
+                        // for here, it arrives while the layout goes on (a store that misses in
+                        // pass 2 waits in the store buffer instead)
+                        want(p, pw + cw);
                         let wide = pk >> 63;
                         if ne != 0 {
                             *p = ne as u64 | (nb as u64) << 24 | wide << 63;
                             *p.add(1) = pk;
                             // the odd event's pad (for an even count pass 2 overwrites both halves)
                             *p.add(1 + ew) = 0xFFFF_FFFF_0000_0000;
-                            *rec = p.add(2) as u64;
-                            *rec.add(1) = p.add(2 + ew) as u64;
+                            *ua.add(id) = p.add(2) as u64;
+                            *ub.add(id) = p.add(2 + ew) as u64;
                         }
                         if nc != 0 {
-                            let c = p.add(pw);
-                            *c = nc as u64 | 1 << 62 | wide << 63;
-                            *c.add(1) = pk;
-                            *rec.add(3) = c.add(2) as u64;
+                            let cb = p.add(pw);
+                            *cb = nc as u64 | 1 << 62 | wide << 63;
+                            *cb.add(1) = pk;
+                            *uc.add(id) = cb.add(2) as u64;
                         }
                     }
                 }
             }
-            off += REC;
         }
     }
     // the wide users, in the order of their index (wkey): the links', then the survivors'
-    let nwl = (b_end - a_end) / REC;
+    let nwl = b_end - a_end;
     for j in 0..nwl {
-        layout_one(st, out, a_end + j * REC, j, q, rbits)?;
+        let pk = st.ub[a_end + j];
+        layout_one(st, out, a_end + j, pk, j, q, rbits)?;
     }
-    for j in 0..(d_end - c_end) / REC {
-        layout_one(st, out, c_end + j * REC, nwl + j, q, rbits)?;
+    for j in 0..d_end - c_end {
+        layout_one(st, out, c_end + j, 0, nwl + j, q, rbits)?;
     }
     // the big users' cursors, now that their scratch has its size
     for b in &st.bigs {
-        let u = b.su as usize / REC;
+        let id = b.su as usize;
         // SAFETY: the offsets lie inside the scratch vectors, sized above; they do not move
         // until `split` has read them.
         unsafe {
             if b.clicks {
-                st.users[u][3] = st.big_ck.as_mut_ptr().add(b.at as usize) as u64;
+                st.uc[id] = st.big_ck.as_mut_ptr().add(b.at as usize) as u64;
             } else {
-                st.users[u][0] = st.big_ev.as_mut_ptr().add(b.at as usize) as u64;
-                st.users[u][1] = st.big_pay.as_mut_ptr().add(b.pat as usize) as u64;
+                st.ua[id] = st.big_ev.as_mut_ptr().add(b.at as usize) as u64;
+                st.ub[id] = st.big_pay.as_mut_ptr().add(b.pat as usize) as u64;
             }
         }
     }
-    // the misses' clicks: the trash, through record 0's click cursor
-    let nmiss = st.users[0][2] as u32 as usize;
+    // the misses' clicks: the trash, through user 0's click cursor
     if st.trash.len() < nmiss {
         st.trash.resize(nmiss, [0, 0]);
     }
-    st.users[0][3] = st.trash.as_mut_ptr() as u64;
+    st.uc[0] = st.trash.as_mut_ptr() as u64;
     // pass 2: scatter
     {
-        let us = st.users.as_mut_ptr() as *mut u8;
+        let (ua, ub, uc) = (st.ua.as_mut_ptr(), st.ub.as_mut_ptr(), st.uc.as_mut_ptr());
         for (&s, &e) in st.idx.iter().zip(&st.ev) {
             // SAFETY: every user with events got a block with room for exactly its events.
             unsafe {
-                let c = us.add(s as usize) as *mut *mut u32;
+                let c = ua.add(s as usize) as *mut *mut u32;
                 **c = e;
                 *c = (*c).add(1);
             }
@@ -886,7 +902,7 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
         for (&s, &v) in st.bidx.iter().zip(&st.bval) {
             // SAFETY: as above, room for its purchases.
             unsafe {
-                let c = us.add(s as usize + 8) as *mut *mut u64;
+                let c = ub.add(s as usize) as *mut *mut u64;
                 **c = v;
                 *c = (*c).add(1);
             }
@@ -897,10 +913,10 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
             let cp = c.as_ptr();
             for i in 0..c.len() {
                 // SAFETY: j + i < cidx.len() (one entry per click, both forms); every user's
-                // cursor has room for its clicks (record 0's: the trash, nmiss pairs).
+                // cursor has room for its clicks (user 0's: the trash, nmiss pairs).
                 unsafe {
                     let r = *cp.add(i);
-                    let cs = us.add(*cidx.add(j + i) as usize + 24) as *mut *mut [u64; 2];
+                    let cs = uc.add(*cidx.add(j + i) as usize) as *mut *mut [u64; 2];
                     let p = *cs;
                     *p = [r[1], r[0] & 0xffff_ffff];
                     *cs = p.add(1);
@@ -912,7 +928,7 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
             for r in c.iter() {
                 // SAFETY: as above.
                 unsafe {
-                    let cs = us.add(*cidx.add(j) as usize + 24) as *mut *mut [u64; 2];
+                    let cs = uc.add(*cidx.add(j) as usize) as *mut *mut [u64; 2];
                     let p = *cs;
                     *p = [r[3], r[2] & 0xffff_ffff];
                     *cs = p.add(1);
@@ -925,23 +941,39 @@ fn pass<O: Out>(inp: &In, st: &mut State, out: &mut O, k: u32, wide_max: usize) 
     Ok(Pass::Done)
 }
 
-/// The general layout of the user at record offset `off` (the cold path; `widx` = its wide index,
+/// Asks for the cache lines of the n words at p, for writing.
+#[inline(always)]
+fn want(p: *mut u64, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch reads and writes nothing (prefetchw is a no-op where unsupported).
+    unsafe {
+        let end = p as usize + 8 * n;
+        let mut l = p as usize & !63;
+        while l < end {
+            core::arch::asm!("prefetchw byte ptr [{0}]", in(reg) l, options(nostack, preserves_flags, readonly));
+            l += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (p, n);
+}
+
+/// The general layout of user `id` with person key `pk` (the cold path; `widx` = its wide index,
 /// usize::MAX for a SHORT user): a P1-local key for an unlinked wide user, the count bounds,
 /// separate blocks, big users to the scratch for `split`.
 #[cold]
 #[inline(never)]
-fn layout_one<O: Out>(st: &mut State, out: &mut O, off: usize, widx: usize, q: u32, rbits: u32) -> Result<(), Error> {
+fn layout_one<O: Out>(st: &mut State, out: &mut O, id: usize, pk: u64, widx: usize, q: u32, rbits: u32) -> Result<(), Error> {
     let lim24 = 1u32 << 24;
-    let u = off / REC;
-    let r = st.users[u];
-    let (ne, nb, nc) = (r[0] as u32, (r[0] >> 32) as u32, r[2] as u32);
+    let (a, c) = (st.ua[id], st.uc[id]);
+    let (ne, nb, nc) = ((a >> 32) as u32, (c >> 32) as u32, c as u32);
     if ne == 0 && nc == 0 {
         return Ok(());
     }
     if ne >= lim24 || nb >= lim24 || nc >= lim24 {
         return Err(Error::Count);
     }
-    let mut pk = r[1];
+    let mut pk = pk;
     if widx != usize::MAX && st.wkey[widx][3] == 0 {
         // an unlinked wide user: a P1-local person key, its [a, b] for P2's names
         let i = st.wide.len() as u64;
@@ -959,7 +991,7 @@ fn layout_one<O: Out>(st: &mut State, out: &mut O, off: usize, widx: usize, q: u
     if 2 + ew + nb as usize > CW - 2 {
         // too big for one chunk: its events and payloads into the worker's scratch, cut into
         // several blocks after pass 2 (`split`); no region memory per block
-        st.bigs.push(Big { su: off as u32, home, pk, at: st.big_ev.len() as u32, n: ne, pat: st.big_pay.len() as u32, nb, clicks: false });
+        st.bigs.push(Big { su: id as u32, home, pk, at: st.big_ev.len() as u32, n: ne, pat: st.big_pay.len() as u32, nb, clicks: false });
         st.big_ev.resize(st.big_ev.len() + ne as usize, 0);
         st.big_pay.resize(st.big_pay.len() + nb as usize, 0);
     } else if ne > 0 {
@@ -971,12 +1003,12 @@ fn layout_one<O: Out>(st: &mut State, out: &mut O, off: usize, widx: usize, q: u
             if ne & 1 != 0 {
                 *p.add(1 + ew) = 0xFFFF_FFFF_0000_0000;
             }
-            st.users[u][0] = p.add(2) as u64;
-            st.users[u][1] = p.add(2 + ew) as u64;
+            st.ua[id] = p.add(2) as u64;
+            st.ub[id] = p.add(2 + ew) as u64;
         }
     }
     if 2 + 2 * nc as usize > CW - 2 {
-        st.bigs.push(Big { su: off as u32, home, pk, at: st.big_ck.len() as u32, n: nc, pat: 0, nb: 0, clicks: true });
+        st.bigs.push(Big { su: id as u32, home, pk, at: st.big_ck.len() as u32, n: nc, pat: 0, nb: 0, clicks: true });
         st.big_ck.resize(st.big_ck.len() + nc as usize, [0, 0]);
     } else if nc > 0 {
         let p = out.block(home, 2 + 2 * nc as usize);
@@ -984,13 +1016,13 @@ fn layout_one<O: Out>(st: &mut State, out: &mut O, off: usize, widx: usize, q: u
         unsafe {
             *p = u64::from(nc) | 1 << 62 | wide << 63;
             *p.add(1) = pk;
-            st.users[u][3] = p.add(2) as u64;
+            st.uc[id] = p.add(2) as u64;
         }
     }
     Ok(())
 }
 
-/// A user (record offset `su`) whose person block or click block would not fit a chunk: its events
+/// A user (id `su`) whose person block or click block would not fit a chunk: its events
 /// (and payloads) or clicks in the worker's scratch from offset `at` (`pat`), `n` of them.
 #[derive(Clone, Copy)]
 struct Big {

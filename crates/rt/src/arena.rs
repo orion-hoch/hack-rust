@@ -355,6 +355,12 @@ impl Region {
         compact_stalls().is_some_and(|now| now > base)
     }
 
+    /// Whether fresh memory of this region comes in 4 KB pages (huge pages off, or stopped).
+    #[inline]
+    pub fn small_pages(&self) -> bool {
+        self.huge.load(Relaxed) != 1 || self.stalled.load(Relaxed) != 0
+    }
+
     /// Whether the stall guard switched this region off huge pages.
     pub fn stalled(&self) -> bool {
         self.stalled.load(Relaxed) != 0
@@ -715,7 +721,13 @@ impl Blocks {
             }
         }
         if s.cur + bs > s.end || s.end == 0 {
-            let c = self.region().take(CHUNK) as usize;
+            let (c, fresh) = self.region().take_tell(CHUNK);
+            let c = c as usize;
+            if fresh && self.region().small_pages() {
+                // 4 KB pages: the chunk's 512 pages in one call instead of 512 page faults taken
+                // by 8 workers at once inside one mapping.
+                touch_range(c, CHUNK, true);
+            }
             let i = self.log_n.fetch_add(1, Relaxed);
             if i >= self.log_cap.load(Relaxed) {
                 crate::fail::fail(b"blocks: chunk log full");

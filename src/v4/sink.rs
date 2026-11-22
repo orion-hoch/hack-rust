@@ -549,6 +549,8 @@ pub struct ClickSink<'a, 'b> {
     /// LONG/FOREIGN users: one stream of 32-byte records per user partition.
     pub wide: Bins<[u64; 4]>,
     pub bad: bool,
+    /// AVX-512 (F, DQ, BW, VL) detected: the batch is packed 8 lanes at a time.
+    v512: bool,
 }
 
 impl<'a, 'b> ClickSink<'a, 'b> {
@@ -557,7 +559,84 @@ impl<'a, 'b> ClickSink<'a, 'b> {
         // filled (8 KB chunks held 267 MB for 202 MB of short clicks and 135 MB for 62 MB of wide
         // ones at 60M); P1's person blocks are fed by I2's B8K frees, not by these.
         use crate::v3::mem::B2K;
-        ClickSink { ds, ctx, b2, s: Bins::from_blocks(1 << b2, &B2K, w), wide: Bins::from_blocks(1 << b2, &B2K, w), bad: false }
+        #[cfg(target_arch = "x86_64")]
+        let v512 = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        #[cfg(not(target_arch = "x86_64"))]
+        let v512 = false;
+        ClickSink { ds, ctx, b2, s: Bins::from_blocks(1 << b2, &B2K, w), wide: Bins::from_blocks(1 << b2, &B2K, w), bad: false, v512 }
+    }
+
+    /// One batch with AVX-512, as `EvSink::scatter512`: every lane's 16-byte record (the user
+    /// key mixed, its partition, ru << 32 | tc, campaign << 52 | locator) is built in zmm
+    /// registers for the 8 lanes at once; then each SHORT lane is its front loaded, one
+    /// 16-byte store and the front advanced. LONG lanes take `wide`, one by one.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512dq,avx512bw,avx512vl,bmi1,bmi2")]
+    #[inline(never)]
+    unsafe fn clicks512(&mut self, b: &ClickBatch) {
+        use core::arch::x86_64::*;
+        use std::mem::MaybeUninit;
+        let n = (b.n as usize).min(8);
+        let all = ((1u32 << n) - 1) as u8;
+        let wide: __mmask8 = b.user_long & all;
+        let short = all & !wide;
+        let sh = 40 - self.b2;
+        // Written by the vector stores below before any lane reads them.
+        let mut units = MaybeUninit::<[[u64; 2]; 8]>::uninit();
+        let mut part = MaybeUninit::<[u64; 8]>::uninit();
+        unsafe {
+            let c = _mm512_set1_epi64(super::keys::MIX_C as i64);
+            let m40 = _mm512_set1_epi64(super::keys::M40 as i64);
+            // Two 256-bit multiplies, never a 512-bit one (see `mullo64_halves`).
+            let x = _mm512_and_si512(mullo64_halves(_mm512_loadu_si512(b.user_a.as_ptr() as *const _), c), m40);
+            let mu = _mm512_xor_si512(x, _mm512_srli_epi64::<20>(x));
+            let ps = _mm512_srl_epi64(mu, _mm_cvtsi32_si128(sh as i32));
+            _mm512_storeu_si512(part.as_mut_ptr() as *mut _, _mm512_slli_epi64::<4>(ps));
+            let ru = _mm512_and_si512(mu, _mm512_set1_epi64(((1u64 << sh) - 1) as i64));
+            let ts = _mm512_cvtepu32_epi64(_mm256_loadu_si256(b.ts.as_ptr() as *const __m256i));
+            let camp = _mm512_cvtepu16_epi64(_mm_loadu_si128(b.campaign.as_ptr() as *const __m128i));
+            let loc = _mm512_loadu_si512(b.loc.as_ptr() as *const _);
+            // 4,096 campaigns or more, or a locator past 52 bits (lanes 0..n): v4 cannot hold it.
+            let over = _mm512_or_si512(_mm512_srli_epi64::<12>(camp), _mm512_srli_epi64::<52>(loc));
+            self.bad |= _mm512_mask_test_epi64_mask(all, over, over) != 0;
+            let w0 = _mm512_or_si512(_mm512_slli_epi64::<32>(ru), ts);
+            let w1 = _mm512_or_si512(_mm512_slli_epi64::<52>(camp), loc);
+            // [w0, w1] pairs in lane order
+            let i0 = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+            let i1 = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+            _mm512_storeu_si512(units.as_mut_ptr() as *mut _, _mm512_permutex2var_epi64(w0, i0, w1));
+            _mm512_storeu_si512((units.as_mut_ptr() as *mut [u64; 2]).add(4) as *mut _, _mm512_permutex2var_epi64(w0, i1, w1));
+        }
+        // SAFETY: every lane of both arrays was written above.
+        let (units, part) = unsafe { (units.assume_init_ref(), part.assume_init_ref()) };
+        let fs = self.s.fronts();
+        let mut m = u32::from(short);
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            // SAFETY: part[k] / 16 < 2^b2, the number of bins; a front's pointer is below its
+            // end after next_chunk.
+            unsafe {
+                let f = (fs as *mut u8).add(part[k] as usize) as *mut [*mut [u64; 2]; 2];
+                let mut p = (*f)[0];
+                if p == (*f)[1] {
+                    self.s.next_chunk(part[k] as usize >> 4);
+                    p = (*f)[0];
+                }
+                p.write(units[k]);
+                (*f)[0] = p.add(1);
+                _mm_prefetch((p as *const i8).wrapping_add(64), _MM_HINT_ET0);
+            }
+            m &= m - 1;
+        }
+        let mut m = u32::from(wide);
+        while m != 0 {
+            let k = m.trailing_zeros() as usize;
+            self.wide(LONG, b.user_a[k], b.user_b[k], u64::from(b.ts[k]), units[k][1]);
+            m &= m - 1;
+        }
     }
 
     #[cold]
@@ -580,6 +659,11 @@ impl<'a, 'b> ClickSink<'a, 'b> {
 impl<'a> Sink for ClickSink<'a, '_> {
     #[inline]
     fn clicks(&mut self, b: &ClickBatch) {
+        #[cfg(target_arch = "x86_64")]
+        if self.v512 {
+            // SAFETY: the features were detected at construction.
+            return unsafe { self.clicks512(b) };
+        }
         let n = (b.n as usize).min(8);
         let mut over = 0u64;
         for k in 0..n {

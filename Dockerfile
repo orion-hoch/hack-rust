@@ -9,9 +9,13 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY src ./src
-# x86-64-v3 = AVX2, BMI2, FMA.
+# x86-64-v3 = AVX2, BMI2, FMA. prefer-256-bit: the compiler vectorises ordinary loops and block
+# fills with at most 256-bit registers, also inside functions that have AVX-512 enabled (the code
+# written for 512-bit registers is unaffected). On Skylake-X and Cascade Lake any 512-bit
+# instruction lowers the core's clock for about 2 ms, so stray ones outside the parser cost a
+# whole stage its speed. rustc prints a warning for this LLVM-level feature name; that is expected.
 ARG X86_TARGET_CPU=x86-64-v3
-RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=${X86_TARGET_CPU}"; fi; \
+RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=${X86_TARGET_CPU} -C target-feature=+prefer-256-bit"; fi; \
     cargo build --release --locked && \
     cp target/release/engine /engine
 
