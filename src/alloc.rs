@@ -129,12 +129,15 @@ static THP_BUDGET: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 pub fn set_thp_budget(bytes: usize) {
     THP_BUDGET.store(bytes, Ordering::Relaxed);
+    rt::arena::set_huge_budget(bytes);
 }
 
 /// Takes `len` bytes of the budget; false when it does not fit (the budget stays as it is).
 #[inline]
 fn take_thp(len: usize) -> bool {
-    THP_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(len)).is_ok()
+    // The process-wide budget, shared with the token tables and rt's regions.
+    let _ = &THP_BUDGET;
+    rt::arena::take_huge(len)
 }
 const HUGE: usize = 2 << 20;
 

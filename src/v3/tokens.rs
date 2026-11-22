@@ -252,7 +252,8 @@ impl<'a> Tokens<'a> {
                 long_cap = long_cap.max(l);
             }
         }
-        let huge = tables_huge((short_cap + long_cap * 4) * 8);
+        let tbytes = (short_cap + long_cap * 4) * 8;
+        let huge = tables_huge(tbytes) && rt::arena::take_huge(tbytes);
         Tokens {
             short: Table::new(short_cap, huge),
             short_mask: short_cap - 1,

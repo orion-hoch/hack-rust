@@ -265,11 +265,12 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     };
     inp.flush();
     clock.mark("parse.events");
-    if tok.full.load(std::sync::atomic::Ordering::Relaxed) || sinks.iter().any(|s| s.bad) {
-        return Ok(Outcome::Fallback("token table full or a record did not fit".into()));
-    }
+    // Finish first: the final drain resolves the last lookups and can raise the flags checked next.
     for s in sinks.iter_mut() {
         s.finish();
+    }
+    if tok.full.load(std::sync::atomic::Ordering::Relaxed) || sinks.iter().any(|s| s.bad) {
+        return Ok(Outcome::Fallback("token table full or a record did not fit".into()));
     }
 
     // Specials by partition; FOREIGN event IDs apart.
@@ -348,7 +349,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let mut csinks: Vec<ClickSink> = crate::par::run(
         threads,
         ck_chunks.len(),
-        |_| ClickSink::new(&tok, &people, &ds, &ctx, p2_bits),
+        |t| ClickSink::new(&tok, &people, &ds, &ctx, p2_bits, t),
         |s, i| {
             let c = &ck_chunks[i];
             let bytes = ds.stream(c.stream)[c.file as usize].bytes();

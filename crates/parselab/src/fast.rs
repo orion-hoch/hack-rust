@@ -650,6 +650,78 @@ unsafe fn link_line<S: Sink>(_f: &Fast, file: u32, start: usize, p: *const u8, l
     true
 }
 
+/// `link_line` for the windowed loop: the lane goes into `lb`, handed to the sink at 8.
+#[inline(always)]
+unsafe fn link_lane<S: Sink>(file: u32, start: usize, p: *const u8, len: usize, m: &Masks, lb: &mut LinkBatch, sink: &mut S) -> bool {
+    let Some([a, b]) = (unsafe { fields::<2>(p, len, m) }) else { return false };
+    if (a.0 == a.1) | (b.0 == b.1) {
+        return true;
+    }
+    match unsafe { (key_at(p, a.0, a.1, b'u'), key_at(p, b.0, b.1, b'u')) } {
+        (Some(ka), Some(kb)) => {
+            lb.push(ka, kb);
+            if lb.n == 8 {
+                sink.links(lb);
+                *lb = LinkBatch::default();
+            }
+        }
+        _ => sink.foreign_link(Locator::new(file, start as u64)),
+    }
+    true
+}
+
+/// Links: every line that ends inside one 128-byte window from that window's masks (a link line
+/// is about 18 bytes; one mask computation per line was half the links phase). Lanes reach the
+/// sink 8 at a time. Bounds as in `one_line`: the window starts inside [fast_lo, fast_hi], and
+/// every read of a line in it stays below window start + WINDOW + 32.
+#[inline(always)]
+unsafe fn links<S: Sink, const ISA: u8>(f: &Fast, file: u32, buf: Buf, from: usize, to: usize, sink: &mut S) {
+    let data = buf.data;
+    let len = data.len();
+    let base = data.as_ptr();
+    let fast_lo = PRE.saturating_sub(buf.pre);
+    let fast_hi = (len + buf.post).saturating_sub(WINDOW + 32);
+    let mut fields: Vec<&[u8]> = Vec::with_capacity(8);
+    let mut lb = LinkBatch::default();
+    let mut start = first_start(data, from);
+    while start < to {
+        if start < fast_lo || start > fast_hi {
+            let l = unsafe { one_line::<S, ISA>(f, Kind::Links, file, buf, start, &mut fields, sink) };
+            start += l + 1;
+            continue;
+        }
+        let p = unsafe { base.add(start) };
+        let mut m = unsafe { masks::<ISA>(p) };
+        if len - start < WINDOW {
+            m.nl |= 1u128 << (len - start);
+        }
+        let mut off = 0usize;
+        while off < WINDOW && start + off < to {
+            let nl = m.nl >> off;
+            if nl == 0 {
+                break;
+            }
+            let l = nl.trailing_zeros() as usize;
+            let at = start + off;
+            let ms = Masks { comma: m.comma >> off, quote: m.quote >> off, nl };
+            if !unsafe { link_lane(file, at, p.add(off), l, &ms, &mut lb, sink) } {
+                count_slow();
+                reference::link_one(f.ctx, file, at, &data[at..at + l], &mut fields, sink);
+            }
+            off += l + 1;
+        }
+        if off == 0 {
+            let l = unsafe { one_line::<S, ISA>(f, Kind::Links, file, buf, start, &mut fields, sink) };
+            start += l + 1;
+        } else {
+            start += off;
+        }
+    }
+    if lb.n > 0 {
+        sink.links(&lb);
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // Chunks.
 
@@ -778,6 +850,9 @@ unsafe fn chunk<S: Sink, const ISA: u8>(f: &Fast, kind: Kind, file: u32, buf: Bu
     }
     if kind == Kind::Clicks && V2.load(std::sync::atomic::Ordering::Relaxed) {
         return unsafe { crate::fast2::clicks::<S, ISA>(f, file, buf, from, to, sink) };
+    }
+    if kind == Kind::Links && V2.load(std::sync::atomic::Ordering::Relaxed) {
+        return unsafe { links::<S, ISA>(f, file, buf, from, to, sink) };
     }
     let mut start = first_start(data, from);
     let mut fields: Vec<&[u8]> = Vec::with_capacity(8);

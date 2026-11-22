@@ -196,6 +196,9 @@ impl Region {
                 if off + bytes > self.cap() {
                     crate::fail::fail(b"arena: region exhausted");
                 }
+                if self.huge.load(Relaxed) == 1 && self.stalled.load(Relaxed) == 0 && !take_huge(bytes) {
+                    self.stop_huge();
+                }
                 base + off
             }
         };
@@ -373,6 +376,26 @@ impl Region {
     pub(crate) fn used_range(&self) -> (usize, usize) {
         (self.base(), self.top.load(Relaxed))
     }
+}
+
+/// One process-wide budget of huge-page bytes, set once from the verdict (`set_huge_budget`) and
+/// drawn by every consumer as it takes fresh memory: the engine's allocator, the token tables,
+/// each `Region` (fresh chunks). Separate verdicts per consumer each saw the same free 2 MB blocks
+/// and together overdrew them (box 2 with MemFree 2 GB: 538 compaction stalls in default mode).
+static HUGE_BUDGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+pub fn set_huge_budget(bytes: usize) {
+    HUGE_BUDGET.store(bytes, Relaxed);
+}
+
+/// Takes `bytes` from the budget; false (and nothing taken) when it does not fit.
+#[inline]
+pub fn take_huge(bytes: usize) -> bool {
+    HUGE_BUDGET.fetch_update(Relaxed, Relaxed, |b| b.checked_sub(bytes)).is_ok()
+}
+
+pub fn huge_budget() -> usize {
+    HUGE_BUDGET.load(Relaxed)
 }
 
 /// The system-wide count of direct-compaction stalls (/proc/vmstat compact_stall).

@@ -451,13 +451,15 @@ struct ClickPend {
 }
 
 impl<'a, 'b> ClickSink<'a, 'b> {
-    pub fn new(tok: &'b Tokens<'a>, people: &'b People, ds: &'a Dataset, ctx: &'b Ctx, pbits: u32) -> Self {
+    /// `w`: the pool participant index (the person partitions' chunks are B8K blocks under it:
+    /// region memory, not 512 KB allocator blocks on 4 KB pages, which cost 20K faults).
+    pub fn new(tok: &'b Tokens<'a>, people: &'b People, ds: &'a Dataset, ctx: &'b Ctx, pbits: u32, w: usize) -> Self {
         ClickSink {
             tok,
             people,
             ds,
             ctx,
-            bins: Bins::new(1 << pbits, 1 << 15),
+            bins: Bins::from_blocks(1 << pbits, &super::mem::B8K, w),
             bad: false,
             dropped: 0,
             pbits,
