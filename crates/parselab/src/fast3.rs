@@ -167,6 +167,43 @@ asm256!(maddubs_256, "vpmaddubsw", "avx2");
 asm256!(madd_256, "vpmaddwd", "avx2");
 asm256!(mullo64_256, "vpmullq", "avx512dq,avx512vl");
 
+// The 256-bit multiplies by a constant, with the constant as a memory operand of the instruction.
+// Given as a value, the constant is loaded into a register once per block and shared by the two
+// halves (and the other chains of the block): one more instruction per constant per chain.
+#[repr(C, align(32))]
+struct K32<T>(T);
+static K_36_1: K32<[u16; 16]> = K32([0x0124; 16]);
+static K_1296_1: K32<[u32; 8]> = K32([0x0001_0510; 8]);
+static K_36P4: K32<[u64; 4]> = K32([1_679_616; 4]);
+static K_10_1: K32<[u16; 16]> = K32([0x010A; 16]);
+static K_100_1: K32<[u32; 8]> = K32([0x0001_0064; 8]);
+static K_10P4: K32<[u64; 4]> = K32([10_000; 4]);
+static K_100000: K32<[u64; 4]> = K32([100_000; 4]);
+static K_60000: K32<[u64; 4]> = K32([60_000; 4]);
+static K_1000: K32<[u64; 4]> = K32([1000; 4]);
+macro_rules! asm256k {
+    ($name:ident, $ins:literal, $feat:literal, $k:ident) => {
+        #[target_feature(enable = $feat)]
+        #[inline]
+        unsafe fn $name(a: __m256i) -> __m256i {
+            let r: __m256i;
+            unsafe {
+                std::arch::asm!(concat!($ins, " {r}, {a}, ymmword ptr [rip + {k}]"), r = lateout(ymm_reg) r, a = in(ymm_reg) a, k = sym $k, options(pure, readonly, nostack, preserves_flags));
+            }
+            r
+        }
+    };
+}
+asm256k!(maddubs_36, "vpmaddubsw", "avx2", K_36_1);
+asm256k!(madd_1296, "vpmaddwd", "avx2", K_1296_1);
+asm256k!(mulu_36p4, "vpmuludq", "avx2", K_36P4);
+asm256k!(maddubs_10, "vpmaddubsw", "avx2", K_10_1);
+asm256k!(madd_100, "vpmaddwd", "avx2", K_100_1);
+asm256k!(mulu_10p4, "vpmuludq", "avx2", K_10P4);
+asm256k!(mulu_100000, "vpmuludq", "avx2", K_100000);
+asm256k!(mulu_60000, "vpmuludq", "avx2", K_60000);
+asm256k!(muls_1000, "vpmuldq", "avx2", K_1000);
+
 #[inline(always)]
 unsafe fn mul_epu32<const S: bool>(a: __m512i, b: __m512i) -> __m512i {
     split2::<S>(a, b, |x, y| _mm512_mul_epu32(x, y), |x, y| mul_epu32_256(x, y))
@@ -212,8 +249,8 @@ unsafe fn ids<const S: bool>(w: __m512i, len: __m512i, prefix_ok: __mmask8) -> _
                 _mm512_add_epi64(mul_epu32_512(t, _mm512_set1_epi64(1_679_616)), _mm512_srli_epi64::<32>(t))
             },
             |v| {
-                let t = madd_256(maddubs_256(v, _mm256_set1_epi16(0x0124)), _mm256_set1_epi32(0x0001_0510));
-                _mm256_add_epi64(mul_epu32_256(t, _mm256_set1_epi64x(1_679_616)), _mm256_srli_epi64::<32>(t))
+                let t = madd_1296(maddubs_36(v));
+                _mm256_add_epi64(mulu_36p4(t), _mm256_srli_epi64::<32>(t))
             },
         )
     };
@@ -315,8 +352,8 @@ unsafe fn dec8<const S: bool>(w: __m512i) -> (__m512i, __mmask8) {
                 _mm512_add_epi64(mul_epu32_512(t, _mm512_set1_epi64(10_000)), _mm512_srli_epi64::<32>(t))
             },
             |x| {
-                let t = madd_256(maddubs_256(x, _mm256_set1_epi16(0x010A)), _mm256_set1_epi32(0x0001_0064));
-                _mm256_add_epi64(mul_epu32_256(t, _mm256_set1_epi64x(10_000)), _mm256_srli_epi64::<32>(t))
+                let t = madd_100(maddubs_10(x));
+                _mm256_add_epi64(mulu_10p4(t), _mm256_srli_epi64::<32>(t))
             },
         )
     };
@@ -337,7 +374,7 @@ unsafe fn offset<const S: bool>(o: __m512i) -> (__m512i, __mmask8) {
     let h = _mm512_and_si512(_mm512_srli_epi64::<24>(v), ff);
     let m = _mm512_and_si512(_mm512_srli_epi64::<48>(v), ff);
     let hm = if S { _mm512_add_epi64(unsafe { times60(h) }, m) } else { _mm512_add_epi64(_mm512_mul_epu32(h, _mm512_set1_epi64(60)), m) };
-    let mag = mul_epu32::<S>(hm, _mm512_set1_epi64(60_000));
+    let mag = unsafe { chain::<S>(hm, |x| _mm512_mul_epu32(x, _mm512_set1_epi64(60_000)), |x| mulu_60000(x)) };
     let plus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'+' as i64));
     let minus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'-' as i64));
     let off = _mm512_mask_sub_epi64(mag, !plus, _mm512_setzero_si512(), mag);
@@ -414,7 +451,7 @@ unsafe fn with_long(wbase: *const u8, ve: __m256i, len: __m512i, pre_ok: __mmask
 unsafe fn numbered<const S: bool>(wbase: *const u8, ve: __m256i, len: __m512i, pre_ok: __mmask8, table: &[u32]) -> (__m512i, __mmask8) {
     unsafe {
         let one = _mm512_set1_epi64(1);
-        let w = gather64(wbase, _mm256_sub_epi32(ve, _mm256_set1_epi32(8)));
+        let w = gather64o(wbase, ve, -8);
         let k = _mm512_sub_epi64(len, one);
         let kcl = _mm512_max_epi64(one, _mm512_min_epi64(k, _mm512_set1_epi64(8)));
         let sh = _mm512_slli_epi64::<3>(_mm512_sub_epi64(_mm512_set1_epi64(8), kcl));
@@ -452,6 +489,13 @@ unsafe fn store32(v: __m512i, out: &mut [u32; 8]) {
 #[inline(always)]
 unsafe fn gather64(base: *const u8, idx: __m256i) -> __m512i {
     unsafe { _mm512_i32gather_epi64::<1>(idx, base as *const i64) }
+}
+
+/// `gather64` at `idx + off`: the constant goes into the gather's address (its displacement), not
+/// into a vector add of the indices.
+#[inline(always)]
+unsafe fn gather64o(base: *const u8, idx: __m256i, off: isize) -> __m512i {
+    unsafe { _mm512_i32gather_epi64::<1>(idx, base.wrapping_offset(off) as *const i64) }
 }
 
 #[inline(always)]
@@ -534,10 +578,9 @@ unsafe fn bounds<const NF: usize>(sc: &Scratch, k0: usize) -> ([__m256i; NF], [_
         let n = NF as i64;
         let qv = _mm512_srlv_epi64(_mm512_set1_epi64(sc.q_window(k0) as i64), _mm512_setr_epi64(0, n, 2 * n, 3 * n, 4 * n, 5 * n, 6 * n, 7 * n));
         let ql = _mm512_cvtepi64_epi32(qv);
-        let rot = _mm256_setr_epi32(7, 0, 1, 2, 3, 4, 5, 6);
-        let shifted = _mm256_permutexvar_epi32(rot, sep[NF - 1]);
         let m1 = _mm256_set1_epi32(-1);
-        let ls = _mm256_sub_epi32(_mm256_mask_set1_epi32(shifted, 1, prev_pos), m1);
+        // [prev_pos, last separators of lanes 0..7] + 1: one element shift across the pair.
+        let ls = _mm256_sub_epi32(_mm256_alignr_epi32::<7>(sep[NF - 1], _mm256_set1_epi32(prev_pos)), m1);
         let mut vs = [_mm256_setzero_si256(); NF];
         let mut ve = [_mm256_setzero_si256(); NF];
         for j in 0..NF {
@@ -590,13 +633,12 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         for j in 0..7 {
             len[j] = _mm512_cvtepi32_epi64(_mm256_sub_epi32(ve[j], vs[j]));
         }
-        let eight = _mm256_set1_epi32(8);
         let zero = _mm512_setzero_si512();
         let one64 = _mm512_set1_epi64(1);
         let ff32 = _mm256_set1_epi32(0xFF);
         // IDs: SHORT from the 8 bytes ending at the end, LONG from the 32 ending there.
-        let w_e = gather64(wbase, _mm256_sub_epi32(ve[0], eight));
-        let w_u = gather64(wbase, _mm256_sub_epi32(ve[1], eight));
+        let w_e = gather64o(wbase, ve[0], -8);
+        let w_u = gather64o(wbase, ve[1], -8);
         // Both prefix bytes in one 16-lane gather.
         let pg = _mm512_i32gather_epi32::<1>(_mm512_inserti64x4::<1>(_mm512_castsi256_si512(vs[0]), vs[1]), wbase as *const i32);
         let pk = _mm512_cmpeq_epi32_mask(
@@ -617,9 +659,9 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let user_ok = u_short | u_long;
         // ts.
         let t_hi = gather64(wbase, vs[2]);
-        let t_mid = gather64(wbase, _mm256_add_epi32(vs[2], eight));
-        let t_16 = gather64(wbase, _mm256_add_epi32(vs[2], _mm256_set1_epi32(16)));
-        let t_17 = gather64(wbase, _mm256_add_epi32(vs[2], _mm256_set1_epi32(17)));
+        let t_mid = gather64o(wbase, vs[2], 8);
+        let t_16 = gather64o(wbase, vs[2], 16);
+        let t_17 = gather64o(wbase, vs[2], 17);
         let (day_s, date_ok, t_ok) = date(dates, t_hi, t_mid);
         let (secs, hms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(t_mid), _mm512_slli_epi64::<40>(t_16)));
         let z = _mm512_cmpeq_epi64_mask(byte_at(t_16, 3), _mm512_set1_epi64(b'Z' as i64));
@@ -640,14 +682,14 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
             let (hi, hi_ok) = dec8::<S>(t_hi);
             let (lo, lo_ok) = dec8::<S>(_mm512_or_si512(_mm512_slli_epi64::<24>(t_mid), _mm512_set1_epi64(0x0030_3030)));
             f3 = m13 & hi_ok & lo_ok;
-            v3 = _mm512_sub_epi64(_mm512_add_epi64(mul_epu32::<S>(hi, _mm512_set1_epi64(100_000)), lo), _mm512_set1_epi64(f.ws_ms));
+            v3 = _mm512_sub_epi64(_mm512_add_epi64(chain::<S>(hi, |x| _mm512_mul_epu32(x, _mm512_set1_epi64(100_000)), |x| mulu_100000(x)), lo), _mm512_set1_epi64(f.ws_ms));
         }
         let ts_rel = _mm512_mask_blend_epi64(f3, f12, v3);
         let ts_fast = f1 | f2 | f3;
         // ingest (always F1).
         let i_hi = gather64(wbase, vs[3]);
-        let i_mid = gather64(wbase, _mm256_add_epi32(vs[3], eight));
-        let i_16 = gather64(wbase, _mm256_add_epi32(vs[3], _mm256_set1_epi32(16)));
+        let i_mid = gather64o(wbase, vs[3], 8);
+        let i_16 = gather64o(wbase, vs[3], 16);
         let (iday_s, idate_ok, it_ok) = date(dates, i_hi, i_mid);
         let (isecs, ihms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(i_mid), _mm512_slli_epi64::<40>(i_16)));
         let iz = _mm512_cmpeq_epi64_mask(byte_at(i_16, 3), _mm512_set1_epi64(b'Z' as i64));
@@ -663,7 +705,7 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let view = four & _mm512_cmpeq_epi64_mask(t32, _mm512_set1_epi64(u32::from_le_bytes(*b"view") as i64));
         let cart = four & _mm512_cmpeq_epi64_mask(t32, _mm512_set1_epi64(u32::from_le_bytes(*b"cart") as i64));
         let ts_ok = _mm512_cmplt_epu64_mask(ts_rel, _mm512_set1_epi64(f.win_ms));
-        let ing_ms = _mm512_sub_epi64(mul_epi32::<S>(ing_s, _mm512_set1_epi64(1000)), _mm512_set1_epi64(f.ws_frac));
+        let ing_ms = _mm512_sub_epi64(chain::<S>(ing_s, |x| _mm512_mul_epi32(x, _mm512_set1_epi64(1000)), |x| muls_1000(x)), _mm512_set1_epi64(f.ws_frac));
         let late = _mm512_cmpgt_epi64_mask(_mm512_sub_epi64(ing_ms, ts_rel), _mm512_set1_epi64(DAY_MS));
         let base_ok = _mm512_cmpneq_epi64_mask(len[1], zero)
             & ts_ok
@@ -677,7 +719,7 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         let mut price_ok: __mmask8 = 0;
         let pb = purchase & base_ok;
         if pb != 0 {
-            let pw = gather64(wbase, _mm256_sub_epi32(ve[6], eight));
+            let pw = gather64o(wbase, ve[6], -8);
             let k = len[6];
             let kc = _mm512_max_epi64(one64, _mm512_min_epi64(k, _mm512_set1_epi64(8)));
             let sh = _mm512_slli_epi64::<3>(_mm512_sub_epi64(_mm512_set1_epi64(8), kc));
@@ -769,11 +811,10 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         for j in 0..4 {
             len[j] = _mm512_cvtepi32_epi64(_mm256_sub_epi32(ve[j], vs[j]));
         }
-        let eight = _mm256_set1_epi32(8);
         let zero = _mm512_setzero_si512();
         let one64 = _mm512_set1_epi64(1);
         let ff32 = _mm256_set1_epi32(0xFF);
-        let w_u = gather64(wbase, _mm256_sub_epi32(ve[1], eight));
+        let w_u = gather64o(wbase, ve[1], -8);
         let pu = _mm256_cmpeq_epi32_mask(_mm256_and_si256(dword_bytes(wbase, vs[1]), ff32), _mm256_set1_epi32(b'u' as i32));
         let x_u = ids::<S>(w_u, len[1], pu);
         let u_short = _mm512_cmpneq_epi64_mask(x_u, _mm512_set1_epi64(-1));
@@ -787,9 +828,9 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         let (camp, camp_ok) = numbered::<S>(wbase, ve[2], _mm512_sub_epi64(len[2], one64), pc, &f.camp32);
         // ts.
         let t_hi = gather64(wbase, vs[3]);
-        let t_mid = gather64(wbase, _mm256_add_epi32(vs[3], eight));
-        let t_16 = gather64(wbase, _mm256_add_epi32(vs[3], _mm256_set1_epi32(16)));
-        let t_17 = gather64(wbase, _mm256_add_epi32(vs[3], _mm256_set1_epi32(17)));
+        let t_mid = gather64o(wbase, vs[3], 8);
+        let t_16 = gather64o(wbase, vs[3], 16);
+        let t_17 = gather64o(wbase, vs[3], 17);
         let (day_s, date_ok, t_ok) = date(dates, t_hi, t_mid);
         let (secs, hms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(t_mid), _mm512_slli_epi64::<40>(t_16)));
         let z = _mm512_cmpeq_epi64_mask(byte_at(t_16, 3), _mm512_set1_epi64(b'Z' as i64));
@@ -803,7 +844,7 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         // day * DAY_MS + secs * 1000 as (day * 86400 + secs) * 1000, by shifts.
         let local = _mm512_sub_epi64(times1000(_mm512_add_epi64(day_s, secs)), _mm512_set1_epi64(f.ws_frac));
         let f12 = _mm512_mask_sub_epi64(local, f2, local, off);
-        let v3 = _mm512_sub_epi64(_mm512_add_epi64(mul_epu32::<S>(hi, _mm512_set1_epi64(100_000)), lo), _mm512_set1_epi64(f.ws_ms));
+        let v3 = _mm512_sub_epi64(_mm512_add_epi64(chain::<S>(hi, |x| _mm512_mul_epu32(x, _mm512_set1_epi64(100_000)), |x| mulu_100000(x)), lo), _mm512_set1_epi64(f.ws_ms));
         // ts relative to window_start - 7 days.
         let ts_rel = _mm512_add_epi64(_mm512_mask_blend_epi64(f3, f12, v3), _mm512_set1_epi64(CLICK_BASE_BEFORE_WINDOW_MS));
         let ts_fast = f1 | f2 | f3;

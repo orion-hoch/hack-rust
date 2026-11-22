@@ -281,6 +281,7 @@ unsafe fn store_lanes2(bins: &mut Bins<[u64; 2]>, lanes: u8, part: &[u64; 8], r0
                 "vmovdqu xmmword ptr [{p}], xmm0",
                 "vmovdqu xmmword ptr [{p} + 16], xmm1",
                 "mov qword ptr [{fs} + {o}], {t}",
+                "prefetcht0 byte ptr [{t} + 64]",
                 "blsr {m:e}, {m:e}",
                 "jne 2b",
                 "3:",

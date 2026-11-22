@@ -174,13 +174,13 @@ impl Out2 {
             *line.add(n) = word;
             n += 1;
             if n == 8 {
-                self.short.flush_line(q);
+                self.short.flush_line_here(q);
                 n = 0;
             }
             *line.add(n) = pay;
             n += purch as usize;
             if n == 8 {
-                self.short.flush_line(q);
+                self.short.flush_line_here(q);
                 n = 0;
             }
             *f = FILL0 + n as u32;
@@ -249,7 +249,7 @@ fn put(o: &mut Out, q: usize, words: &[u64]) {
             *stage.add(q * 8 + n) = w;
             n += 1;
             if n == 8 {
-                o.flush_line(q);
+                o.flush_line_here(q);
                 n = 0;
             }
         }
@@ -270,6 +270,7 @@ type Pair = [u32; 2];
 /// re * FH as a plain unit's; a LONG/FOREIGN key is folded to 32 bits first (without the kind:
 /// a filter needs no exact key).
 #[inline(always)]
+#[allow(dead_code)]
 fn product(a: u64, b: u64) -> u32 {
     let x = a ^ b.rotate_left(29);
     ((x ^ (x >> 32)) as u32).wrapping_mul(FH)
@@ -346,33 +347,95 @@ unsafe fn mark_plain(c: &[Unit], next: *const Unit, fp: *mut Pair, wsh: u32) {
 #[inline(never)]
 unsafe fn mark_rare(c: &[Unit], next: *const Unit, fp: *mut Pair, wsh: u32, mut rh: *mut u32) -> *mut u32 {
     // As in `mark_plain`: the next chunk's lines are asked for while this one is walked (16
-    // records are 512 to 768 bytes; 12 lines a batch cover them).
+    // records are 533 bytes on average at p20v5: 11.04M units in 5.3M records; 9 lines a
+    // batch cover them, and 4 batches a 2 KB chunk ask for 36 lines of the next one's 32).
     let mut nx = next;
     let mut u = c.as_ptr();
     // SAFETY: one past the end of `c`; records never cross a chunk, so the walk ends there.
     let end = unsafe { u.add(c.len()) };
     // Walk 16 records ahead of the bit updates, prefetching each one's bitmap word.
     while u < end {
-        let mut n = 0;
-        for l in 0..12 {
+        for l in 0..9 {
             fetch(nx.wrapping_add(4 * l));
         }
-        nx = nx.wrapping_add(48);
-        // SAFETY: u is a record of this chunk; the caller's bound.
+        nx = nx.wrapping_add(36);
+        // SAFETY: u is a record of this chunk; the caller's bound; rh has room for the
+        // batch's products (one per record).
         unsafe {
-            while u < end && n < 16 {
+            let first = rh;
+            let stop = rh.wrapping_add(16);
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            // The walk in assembly, 21 instructions a record (the compiler's loop keeps three
+            // counters: 25): the key as `rkey` selects it (re, or a ^ rotl(b, 29) for a
+            // LONG/FOREIGN event), folded and multiplied as `product`, stored at rh, its
+            // pair asked for, and the record's 2 units stepped over (one more each for
+            // RARE_BIG and RARE_EXT, out of line).
+            core::arch::asm!(
+                "2:",
+                "mov {h}, qword ptr [{u}]",
+                "mov {x:e}, dword ptr [{u} + 8]",
+                "rorx {t}, qword ptr [{u} + 24], 35",
+                "xor {t}, qword ptr [{u} + 16]",
+                "test {h:e}, 0x1800000",
+                "cmove {t}, {x}",
+                "mov {x}, {t}",
+                "shr {x}, 32",
+                "xor {x:e}, {t:e}",
+                "imul {x:e}, {x:e}, {fh}",
+                "mov dword ptr [{rh}], {x:e}",
+                "add {rh}, 4",
+                "shrx {t:e}, {x:e}, {wsh:e}",
+                "prefetcht0 byte ptr [{fp} + {t}*8]",
+                "add {u}, 32",
+                "test {h}, {be}",
+                "jne 4f",
+                "3:",
+                "cmp {rh}, {stop}",
+                "je 5f",
+                "cmp {u}, {end}",
+                "jb 2b",
+                "jmp 5f",
+                "4:",
+                "shr {h}, 60",
+                "mov {t:e}, {h:e}",
+                "shr {t:e}, 1",
+                "and {h:e}, 1",
+                "and {t:e}, 1",
+                "add {t:e}, {h:e}",
+                "shl {t:e}, 4",
+                "add {u}, {t}",
+                "jmp 3b",
+                "5:",
+                u = inout(reg) u,
+                rh = inout(reg) rh,
+                end = in(reg) end,
+                stop = in(reg) stop,
+                fp = in(reg) fp,
+                wsh = in(reg) u64::from(wsh),
+                be = in(reg) RARE_BIG | RARE_EXT,
+                h = out(reg) _,
+                x = out(reg) _,
+                t = out(reg) _,
+                fh = const FH as i32,
+                options(nostack),
+            );
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            loop {
                 let (a, b, _) = rkey(u);
                 let h = product(a, b);
-                *rh.add(n) = h;
-                #[cfg(target_arch = "x86_64")]
-                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(fp.add((h >> wsh) as usize) as *const i8);
-                n += 1;
+                *rh = h;
+                rh = rh.add(1);
+                fetch(fp.add((h >> wsh) as usize));
                 u = rnext(u);
+                if rh == stop || u >= end {
+                    break;
+                }
             }
-            for i in 0..n {
-                mark(fp, wsh, *rh.add(i));
+            let mut p = first;
+            while p != rh {
+                mark(fp, wsh, *p);
+                p = p.add(1);
             }
-            rh = rh.add(n);
         }
     }
     rh

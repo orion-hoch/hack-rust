@@ -384,6 +384,17 @@ impl Out {
         unsafe { self.flush(q) }
     }
 
+    /// `flush_line` in line: the copy of a full line to a chunk with room is written at the call
+    /// site (no call, nothing saved around it); only the next chunk's opening is a call.
+    ///
+    /// # Safety
+    /// As `flush_line`.
+    #[inline(always)]
+    pub(crate) unsafe fn flush_line_here(&mut self, q: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { self.flush(q) }
+    }
+
     /// Appends `x` to partition `q & mask` (callers pass q below the partition count).
     #[inline(always)]
     pub fn push(&mut self, q: usize, x: u64) {
