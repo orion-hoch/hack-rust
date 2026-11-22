@@ -16,45 +16,6 @@ use crate::ts::DAY;
 
 use super::tokens::Tokens;
 
-/// LSD radix sort of u64 keys over bits [lo, hi), 11 bits a pass, skipping passes whose digit
-/// is the same for every key. `tmp` is scratch of at least keys.len().
-pub fn radix_sort(keys: &mut Vec<u64>, tmp: &mut Vec<u64>, lo: u32, hi: u32) {
-    let n = keys.len();
-    if n < 64 {
-        keys.sort_unstable();
-        return;
-    }
-    tmp.clear();
-    tmp.resize(n, 0);
-    let mut shift = lo;
-    let mut count = [0usize; 2048];
-    while shift < hi {
-        let bits = (hi - shift).min(11);
-        let mask = (1u64 << bits) - 1;
-        count[..(1 << bits)].iter_mut().for_each(|c| *c = 0);
-        for &k in keys.iter() {
-            count[((k >> shift) & mask) as usize] += 1;
-        }
-        if count[((keys[0] >> shift) & mask) as usize] == n {
-            shift += bits;
-            continue;
-        }
-        let mut sum = 0;
-        for c in count[..(1 << bits)].iter_mut() {
-            let x = *c;
-            *c = sum;
-            sum += x;
-        }
-        for &k in keys.iter() {
-            let d = ((k >> shift) & mask) as usize;
-            tmp[count[d]] = k;
-            count[d] += 1;
-        }
-        std::mem::swap(keys, tmp);
-        shift += bits;
-    }
-}
-
 #[derive(Clone, Copy)]
 struct Ck {
     ts: i64,
@@ -106,7 +67,14 @@ pub struct Worker {
     starts: Vec<(i64, i32)>,
     /// Per entry of `starts`, the index of the first later entry on another day.
     day_end: Vec<u32>,
-    pairs: Vec<(u32, i64)>,
+    /// Interval assists: per campaign stamp and local index, the person's campaigns, group
+    /// ends and timestamps grouped by campaign.
+    pno: u32,
+    cstamp: Vec<u32>,
+    cidx_of: Vec<u32>,
+    clist: Vec<u32>,
+    cat: Vec<u32>,
+    cts: Vec<i64>,
     cat_sum: [u64; 256],
     touched: Vec<u8>,
     stamp: Vec<u32>,
@@ -118,7 +86,10 @@ pub struct Worker {
     /// Counts when timing: clicks, tie groups re-read, persons, rows, direct assist steps,
     /// persons on the interval route.
     pub counts: [u64; 6],
+    /// Interval route counts when timing: clicks, sessions, campaigns, intervals, day steps.
+    pub icount: [u64; 5],
 }
+
 
 const DIRECT_ASSISTS: usize = 64;
 const EMPTY: u32 = u32::MAX;
@@ -131,6 +102,27 @@ fn click_id(ds: &Dataset, loc: parselab::Locator) -> &[u8] {
     let end = rest.iter().position(|&c| c == b',' || c == b'\n').unwrap_or(rest.len());
     let f = &rest[..end];
     parselab::csv::unquote(f).unwrap_or(f)
+}
+
+/// The first index at or after `from` whose start fails `before` (which holds on a prefix of
+/// `st[from..]`), by doubling steps from `from` and then a binary search.
+#[inline]
+fn gallop(st: &[(i64, i32)], from: usize, before: impl Fn(i64) -> bool) -> usize {
+    let n = st.len();
+    if from >= n || !before(st[from].0) {
+        return from;
+    }
+    let mut lo = from;
+    let mut step = 1;
+    loop {
+        let hi = lo + step;
+        if hi >= n || !before(st[hi].0) {
+            let hi = hi.min(n);
+            return lo + 1 + st[lo + 1..hi].partition_point(|s| before(s.0));
+        }
+        lo = hi;
+        step *= 2;
+    }
 }
 
 #[inline(always)]
@@ -160,7 +152,12 @@ impl Worker {
             ck: Vec::new(),
             starts: Vec::new(),
             day_end: Vec::new(),
-            pairs: Vec::new(),
+            pno: 0,
+            cstamp: Vec::new(),
+            cidx_of: Vec::new(),
+            clist: Vec::new(),
+            cat: Vec::new(),
+            cts: Vec::new(),
             cat_sum: [0; 256],
             touched: Vec::new(),
             stamp: Vec::new(),
@@ -169,6 +166,7 @@ impl Worker {
             phase_ns: [0; 5],
             timing: false,
             counts: [0; 6],
+            icount: [0; 5],
         }
     }
 
@@ -375,6 +373,9 @@ impl Worker {
         self.starts.clear();
         let mut k = 0usize;
         let mut day_now = i32::MIN;
+        // Start (since the window start) of the day after `day_now`: sessions come in time order,
+        // so the day changes only when a start reaches it.
+        let mut next_day_at = i64::MIN;
         let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0i64);
         let mut first_row = true;
         let direct = clicks.len() <= DIRECT_ASSISTS;
@@ -382,16 +383,18 @@ impl Worker {
         let mut lo = 0usize;
         for s in 0..ss.start.len() {
             let start = i64::from(ss.start[s]);
-            let day = (ws + start).div_euclid(DAY) as i32;
-            if day != day_now {
+            if start >= next_day_at {
+                let day = (ws + start).div_euclid(DAY) as i32;
                 if day_now != i32::MIN {
                     self.emit_day(person, day_now, d_sessions, d_events, d_revenue, &mut first_row, cx);
                 }
                 day_now = day;
+                next_day_at = (i64::from(day) + 1) * DAY - ws;
                 d_sessions = 0;
                 d_events = 0;
                 d_revenue = 0;
             }
+            let day = day_now;
             let mut revenue = 0u64;
             for &j in &ss.sbuy[ss.sb_at[s] as usize..ss.sb_at[s + 1] as usize] {
                 let buy = ss.buys[j as usize][1] as u32;
@@ -456,44 +459,94 @@ impl Worker {
         for i in (0..n.saturating_sub(1)).rev() {
             self.day_end[i] = if self.starts[i + 1].1 != self.starts[i].1 { i as u32 + 1 } else { self.day_end[i + 1] };
         }
-        self.pairs.clear();
-        self.pairs.extend(clicks.iter().map(|c| (c.campaign, c.ts)));
-        self.pairs.sort_unstable();
-        let pairs = std::mem::take(&mut self.pairs);
-        let mut g = 0;
-        while g < pairs.len() {
-            let campaign = pairs[g].0;
-            let mut a = pairs[g].1;
+        // Group the clicks by campaign, keeping time order inside a campaign (counting sort over
+        // the person's distinct campaigns; no comparison sort).
+        self.pno = self.pno.wrapping_add(1);
+        if self.pno == 0 {
+            self.cstamp.iter_mut().for_each(|x| *x = 0);
+            self.pno = 1;
+        }
+        self.clist.clear();
+        self.cat.clear();
+        for c in clicks {
+            let ci = c.campaign as usize;
+            if ci >= self.cstamp.len() {
+                self.cstamp.resize(ci + 1, 0);
+                self.cidx_of.resize(ci + 1, 0);
+            }
+            if self.cstamp[ci] != self.pno {
+                self.cstamp[ci] = self.pno;
+                self.cidx_of[ci] = self.clist.len() as u32;
+                self.clist.push(c.campaign);
+                self.cat.push(0);
+            }
+            self.cat[self.cidx_of[ci] as usize] += 1;
+        }
+        let mut sum = 0u32;
+        for x in self.cat.iter_mut() {
+            let c = *x;
+            *x = sum;
+            sum += c;
+        }
+        self.cts.clear();
+        self.cts.resize(clicks.len(), 0);
+        for c in clicks {
+            let g = self.cidx_of[c.campaign as usize] as usize;
+            let at = self.cat[g] as usize;
+            self.cts[at] = c.ts;
+            self.cat[g] += 1;
+        }
+        // Per campaign: merge [t, t + 7 days] into disjoint intervals in time order, and count the
+        // sessions starting inside each, by day; the search position only moves forward.
+        let (clist, cts, cat) = (std::mem::take(&mut self.clist), std::mem::take(&mut self.cts), std::mem::take(&mut self.cat));
+        if self.timing {
+            self.icount[0] += clicks.len() as u64;
+            self.icount[1] += n as u64;
+            self.icount[2] += clist.len() as u64;
+        }
+        let mut g0 = 0usize;
+        for (g, &campaign) in clist.iter().enumerate() {
+            let ts = &cts[g0..cat[g] as usize];
+            g0 = cat[g] as usize;
+            let mut at = 0usize;
+            let mut a = ts[0];
             let mut b = a + CLICK_REACH;
-            let mut h = g + 1;
-            while h < pairs.len() && pairs[h].0 == campaign {
-                let t = pairs[h].1;
+            for &t in &ts[1..] {
                 if t <= b {
                     b = b.max(t + CLICK_REACH);
                 } else {
-                    self.count_assists(campaign, a, b);
+                    at = self.count_assists(campaign, a, b, at);
                     a = t;
                     b = t + CLICK_REACH;
                 }
-                h += 1;
             }
-            self.count_assists(campaign, a, b);
-            g = h;
+            self.count_assists(campaign, a, b, at);
         }
-        self.pairs = pairs;
+        self.clist = clist;
+        self.cts = cts;
+        self.cat = cat;
     }
 
-    fn count_assists(&mut self, campaign: u32, a: i64, b: i64) {
-        let lo = self.starts.partition_point(|s| s.0 < a);
-        let hi = self.starts.partition_point(|s| s.0 <= b);
+    /// Sessions starting in [a, b], by day, as assists of `campaign`; the search starts at
+    /// `from` (no session before it starts at or after a). Returns the end of the range.
+    fn count_assists(&mut self, campaign: u32, a: i64, b: i64, from: usize) -> usize {
+        let lo = gallop(&self.starts, from, |s| s < a);
+        let hi = gallop(&self.starts, lo, |s| s <= b);
         let mut i = lo;
+        if self.timing {
+            self.icount[3] += 1;
+        }
         while i < hi {
+            if self.timing {
+                self.icount[4] += 1;
+            }
             let day = self.starts[i].1;
             let end = (self.day_end[i] as usize).min(hi);
             let off = self.agg.offset(day);
             self.agg.assist(campaign, off, (end - i) as u32);
             i = end;
         }
+        hi
     }
 
     #[allow(clippy::too_many_arguments)]

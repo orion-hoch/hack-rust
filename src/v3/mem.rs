@@ -58,3 +58,77 @@ pub fn prefault(bytes: usize, threads: usize) {
     let part = bytes.div_ceil(threads).next_multiple_of(rt::arena::CHUNK);
     crate::par::run(threads, threads, |_| (), |_, _| REG.prefault(part, true));
 }
+
+/// Persons: the token-indexed person map (read by move 2 and the clicks stage) and the persons
+/// build's node arrays, on their own mapping so that the huge-page verdict is asked for their own
+/// size (at f60v5 the 75 MB map on 4 KB pages cost about a page walk per lookup). The map is
+/// this region's first take: fresh memory, so zero.
+pub static PERS: Region = Region::new();
+
+static PERS_READY: AtomicBool = AtomicBool::new(false);
+
+/// Reserves the persons region for about `bytes` (huge pages by the verdict for that size). It is
+/// not prefaulted: the worker that builds persons faults it during the event parse, where it is
+/// off the critical path (prefaulting it in parallel at start-up cost 12 ms of wall time at
+/// f60v5). False if the reservation failed (the run falls back).
+pub fn init_persons(bytes: usize) -> bool {
+    if PERS_READY.load(Ordering::Acquire) {
+        return true;
+    }
+    // Reservation with room for an estimate that came out low (address space only).
+    if PERS.init(bytes.saturating_mul(4).max(64 << 20), Huge::Auto(bytes)).is_err() {
+        return false;
+    }
+    PERS_READY.store(true, Ordering::Release);
+    true
+}
+
+/// `len` values of a plain integer type in one contiguous take from a region, given back on
+/// drop. The content is whatever the memory held (zero when fresh); callers write before reading
+/// unless they rely on a fresh take.
+pub struct Buf<T: Copy + 'static> {
+    p: *mut T,
+    len: usize,
+    reg: &'static Region,
+}
+
+// SAFETY: a Buf owns its memory exclusively, like a Vec.
+unsafe impl<T: Copy + Send> Send for Buf<T> {}
+unsafe impl<T: Copy + Sync> Sync for Buf<T> {}
+
+impl<T: Copy + 'static> Buf<T> {
+    pub fn take(reg: &'static Region, len: usize) -> Buf<T> {
+        let bytes = (len * std::mem::size_of::<T>()).max(1);
+        let p = reg.take(bytes) as *mut T;
+        Buf { p, len, reg }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<T: Copy + 'static> std::ops::Deref for Buf<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // SAFETY: `p` holds `len` values (region memory is always readable and initialised).
+        unsafe { std::slice::from_raw_parts(self.p, self.len) }
+    }
+}
+
+impl<T: Copy + 'static> std::ops::DerefMut for Buf<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as above, and the Buf is the only owner.
+        unsafe { std::slice::from_raw_parts_mut(self.p, self.len) }
+    }
+}
+
+impl<T: Copy + 'static> Drop for Buf<T> {
+    fn drop(&mut self) {
+        self.reg.give(self.p as *mut u8, (self.len * std::mem::size_of::<T>()).max(1));
+    }
+}

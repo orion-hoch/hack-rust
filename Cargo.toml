@@ -23,6 +23,10 @@ plant = []
 # Measurement builds only: ENGINE_SINK=1|2|3 (drops or redirects event records),
 # ENGINE_SINK_BITS, ENGINE_TOK_PREFAULT=0 and ENGINE_TOK_STAT in the v3 sink and token table.
 measure = []
+# Whole-suite runs through one network width of the session kernel (sortlab), whatever the CPU:
+# net256 is what family 6 model 0x55 (the likely scorer) selects by itself.
+net256 = ["sortlab/net256"]
+net512 = ["sortlab/net512"]
 
 [profile.release]
 opt-level = 3

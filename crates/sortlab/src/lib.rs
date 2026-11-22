@@ -30,6 +30,8 @@
 
 #[cfg(target_arch = "x86_64")]
 pub mod net;
+mod measure;
+pub use measure::*;
 
 pub const GAP: u32 = 1_800_000;
 pub const SLOT: u32 = 900_000;
@@ -54,9 +56,51 @@ pub enum Kernel {
     Sort,
     Radix,
     Hybrid(u32),
-    /// Persons of at most 32 events by an AVX-512 sorting network, the rest by slots (slots for
-    /// everyone where AVX-512 is missing).
+    /// The recommended kernel: `NetWith { width: Auto, max: 128 }`.
     Net,
+    /// Persons of at most `max` events (capped at 128) by an AVX-512 sorting network, the rest by
+    /// slots; slots for everyone where AVX-512 is missing. Width by `NetWidth`.
+    NetWith { width: NetWidth, max: u32 },
+}
+
+/// Register width of the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetWidth {
+    /// 256-bit on family 6 model 0x55 (Skylake-SP, Cascade Lake, Cooper Lake: 512-bit code lowers
+    /// the clock there), 512-bit on any other CPU with AVX-512; the parser crate's rule. The cargo
+    /// feature `net256` (or `net512`) forces the width.
+    Auto,
+    W512,
+    W256,
+}
+
+/// The recommended kernel: the network for persons of at most 128 events, slots above.
+pub const BEST: Kernel = Kernel::Net;
+
+/// The network path this process would take: 0 none (slots only), 256 or 512.
+pub fn net_bits(width: NetWidth) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f = std::arch::is_x86_feature_detected!("avx512f");
+        let vl = std::arch::is_x86_feature_detected!("avx512vl");
+        match width {
+            NetWidth::W512 if f => 512,
+            NetWidth::W256 if f && vl => 256,
+            // cargo features force the width for whole-suite runs (as the parser's mul256 / mul512)
+            NetWidth::Auto if f && vl && cfg!(feature = "net256") => 256,
+            NetWidth::Auto if f && cfg!(feature = "net512") => 512,
+            NetWidth::Auto if f => {
+                let (family, model) = net::cpu_family_model();
+                if family == 6 && model == 0x55 && vl { 256 } else { 512 }
+            }
+            _ => 0,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = width;
+        0
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +111,8 @@ pub enum Error {
     BuyOutsideSessions(usize),
     /// A person field equal to u32::MAX, or a dense index out of range.
     BadPerson(usize),
+    /// `sessions_counted`: the given counts do not match the records.
+    CountMismatch,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -113,7 +159,10 @@ pub struct Scratch {
     tmp: Vec<u32>,
     rkeys: Vec<u64>,
     rtmp: Vec<u64>,
-    avx512: bool,
+    /// Last ts of each session, kept for persons with purchases (indexed like `out.start`).
+    ends: Vec<u32>,
+    /// Network widths available: (512-bit, 256-bit, Auto's choice), as `net_bits`.
+    nets: [u32; 3],
 }
 
 impl Default for Scratch {
@@ -133,17 +182,6 @@ struct Slot {
 }
 
 const SLOT_EMPTY: Slot = Slot { min: u32::MAX, max: 0, cnt: 0, _pad: 0 };
-
-fn has_avx512() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx512f")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
 
 fn boxed(v: u32) -> Box<[u32; NSLOT]> {
     vec![v; NSLOT].into_boxed_slice().try_into().unwrap()
@@ -173,8 +211,33 @@ impl Scratch {
             tmp: Vec::new(),
             rkeys: Vec::new(),
             rtmp: Vec::new(),
-            avx512: has_avx512(),
+            ends: Vec::new(),
+            nets: [net_bits(NetWidth::W512), net_bits(NetWidth::W256), net_bits(NetWidth::Auto)],
         }
+    }
+
+    /// A fresh owner stamp for the slot fold of one person. `sown` holds 0 or stamps already
+    /// issued; on wrap it is cleared, so a stale entry never equals the live stamp.
+    #[inline(always)]
+    fn next_serial(&mut self) {
+        self.serial = self.serial.wrapping_add(1);
+        if self.serial == 0 {
+            self.sown.fill(0);
+            self.serial = 1;
+        }
+    }
+
+    /// Room in `ends` for the sessions of a person of `n` events (sessions <= events), if it has
+    /// purchases; null otherwise.
+    #[inline(always)]
+    fn ends_for(&mut self, base: usize, n: usize, has_buys: bool) -> *mut u32 {
+        if !has_buys {
+            return core::ptr::null_mut();
+        }
+        if self.ends.len() < base + n {
+            self.ends.resize(base + n, 0);
+        }
+        self.ends.as_mut_ptr()
     }
 
     #[inline(always)]
@@ -202,6 +265,7 @@ impl Scratch {
     #[cold]
     #[inline(never)]
     fn insert(&mut self, tok: u32, h: usize) -> u32 {
+        // h is a probe position < keys.len() found empty by `local`
         let p = self.pos.len() as u32;
         self.keys[h] = tok;
         self.vals[h] = p;
@@ -256,9 +320,70 @@ impl Scratch {
 /// Group: local index per record, counts, then ts grouped by person into `sc.grouped`, with
 /// `sc.first[p]..sc.cur[p]` the range of person p. Purchases likewise into `sc.bgrouped`.
 fn group(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, move_ts: bool, sc: &mut Scratch, out: &mut Out) -> Result<usize, Error> {
+    group_with(ev, buys, dense, None, move_ts, sc, out)
+}
+
+/// `group`, optionally with the per-person counts given (dense mode): then the counting pass is
+/// skipped and every write is checked against its person's range instead.
+fn group_with(
+    ev: &[u64],
+    buys: &[[u64; 2]],
+    dense: Option<usize>,
+    given: Option<&[u32]>,
+    move_ts: bool,
+    sc: &mut Scratch,
+    out: &mut Out,
+) -> Result<usize, Error> {
     let n = ev.len();
+    if let Some(counts) = given {
+        let np = counts.len();
+        if counts.iter().map(|&c| c as u64).sum::<u64>() != n as u64 {
+            return Err(Error::CountMismatch);
+        }
+        sc.first.clear();
+        sc.first.extend_from_slice(counts);
+        out.persons.extend(0..np as u32);
+        let mut sum = 0u32;
+        sc.cur.clear();
+        sc.cur.resize(np, 0);
+        sc.idx.clear();
+        sc.idx.resize(np, 0); // range ends
+        for p in 0..np {
+            let c = sc.first[p];
+            sc.first[p] = sum;
+            sc.cur[p] = sum;
+            sum += c;
+            sc.idx[p] = sum;
+        }
+        sc.grouped.clear();
+        sc.grouped.resize(n, 0);
+        let (cur, lim, grouped) = (&mut sc.cur[..], &sc.idx[..], &mut sc.grouped[..]);
+        for (i, &r) in ev.iter().enumerate() {
+            let p = person_of(r) as usize;
+            if p >= np {
+                return Err(Error::BadPerson(i));
+            }
+            // SAFETY: p < np = cur.len() = lim.len() (checked above).
+            let (c, l) = unsafe { (*cur.get_unchecked(p), *lim.get_unchecked(p)) };
+            if c >= l {
+                return Err(Error::CountMismatch);
+            }
+            // SAFETY: c < lim[p] <= n = grouped.len() (lim are prefix sums totalling n).
+            unsafe {
+                *grouped.get_unchecked_mut(c as usize) = ts_of(r);
+                *cur.get_unchecked_mut(p) = c + 1;
+            }
+        }
+        // every person filled exactly (the counts sum to n and none overflowed, so all are full)
+        group_buys(buys, dense, np, sc)?;
+        return Ok(np);
+    }
     let np = match dense {
         Some(np) => {
+            if np == 0 && n > 0 {
+                // no person can hold these records (and np - 1 below would wrap)
+                return Err(Error::BadPerson(0));
+            }
             sc.first.clear();
             sc.first.resize(np, 0);
             let first = &mut sc.first[..];
@@ -266,8 +391,9 @@ fn group(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, move_ts: bool, sc:
             for &r in ev {
                 let p = person_of(r) as usize;
                 bad |= p >= np;
-                // SAFETY: an out-of-range p is caught below before anything reads `first`;
-                // index min(p, np - 1) keeps the write in bounds meanwhile.
+                // SAFETY: the loop runs only when n > 0, so np >= 1 (guard above) and
+                // min(p, np - 1) < np = first.len(). An out-of-range p only miscounts person
+                // np - 1, and is returned as an error below before any count is read.
                 unsafe { *first.get_unchecked_mut(p.min(np - 1)) += 1 };
             }
             if bad {
@@ -314,7 +440,8 @@ fn group(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, move_ts: bool, sc:
         if dense.is_some() {
             for &r in ev {
                 let p = person_of(r) as usize;
-                // SAFETY: p < np (checked above); cur[p] < n since the counts sum to n.
+                // SAFETY: p < np (checked in the counting pass); cur[p] runs from the person's
+                // start up to its end, and the ends are prefix sums of counts totalling n.
                 unsafe {
                     let c = cur.get_unchecked_mut(p);
                     *grouped.get_unchecked_mut(*c as usize) = ts_of(r);
@@ -333,7 +460,12 @@ fn group(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, move_ts: bool, sc:
             }
         }
     }
-    // purchases
+    group_buys(buys, dense, np, sc)?;
+    Ok(np)
+}
+
+/// Purchases grouped by local person into `sc.bgrouped` (`sc.bfirst[p]..sc.bcur[p]`).
+fn group_buys(buys: &[[u64; 2]], dense: Option<usize>, np: usize, sc: &mut Scratch) -> Result<(), Error> {
     let m = buys.len();
     sc.bidx.clear();
     sc.bidx.resize(m, 0);
@@ -366,14 +498,15 @@ fn group(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, move_ts: bool, sc:
         sc.bgrouped[at] = j as u32;
         sc.bcur[p] = at as u32 + 1;
     }
-    Ok(np)
+    Ok(())
 }
 
 /// Sessions of one person from its timestamps (any order) by 15-minute slots. Leaves the slot
-/// array clean. With `mark`, `sid` / `sown` say which session holds each occupied slot (for the
-/// person's purchases).
+/// array clean. With `ends` non-null (the person has purchases), `sid` / `sown` say which session
+/// holds each occupied slot and `ends[i]` is the last ts of session i (caller: `ends_for`).
 #[inline(always)]
-fn person_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out, mark: bool) {
+fn person_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out, ends: *mut u32) {
+    let mark = !ends.is_null();
     let slots = sc.slots.as_mut_ptr();
     let bits = sc.sbits.as_mut_ptr();
     let mut summary = 0u64;
@@ -381,7 +514,8 @@ fn person_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out, mark: bool) {
         // t < 2^31, so s < NSLOT and s >> 6 < NWORD
         let s = (t / SLOT) as usize;
         debug_assert!(s < NSLOT);
-        // SAFETY: s < NSLOT (above); the slot array and bitmap are NSLOT / NWORD long.
+        // SAFETY: t < 2^31 (31-bit field), so s <= (2^31 - 1) / SLOT = NSLOT - 1 and
+        // s >> 6 < NWORD; the slot array is NSLOT long and the bitmap NWORD.
         unsafe {
             let e = &mut *slots.add(s);
             e.min = e.min.min(t);
@@ -407,12 +541,12 @@ fn person_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out, mark: bool) {
     while summary != 0 {
         let w = summary.trailing_zeros() as usize;
         summary &= summary - 1;
-        // SAFETY: w < NWORD (a bit of `summary` set above from s >> 6).
+        // SAFETY: bits of `summary` are only set from s >> 6 < NWORD.
         let mut b = unsafe { core::mem::replace(&mut *bits.add(w), 0) };
         while b != 0 {
             let s = (w << 6) | b.trailing_zeros() as usize;
             b &= b - 1;
-            // SAFETY: s < NSLOT (set above).
+            // SAFETY: bit b of word w was set from a slot s < NSLOT, so (w << 6) | b < NSLOT.
             let e = unsafe { core::mem::replace(&mut *slots.add(s), SLOT_EMPTY) };
             // boundary: slots three or more apart, or two apart with a gap over GAP; the first
             // slot (prev_s far below) always cuts
@@ -421,16 +555,19 @@ fn person_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out, mark: bool) {
             k = k.wrapping_add(cut as usize);
             cur_start = if cut { e.min } else { cur_start };
             cur_cnt = if cut { e.cnt } else { cur_cnt + e.cnt };
-            // SAFETY: k < number of occupied slots <= ts.len(), reserved above.
+            // SAFETY: after the first slot's cut k = 0; each later slot adds at most 1, so
+            // k < occupied slots <= ts.len(), and base + ts.len() <= capacity (reserved above).
             unsafe {
                 *st.add(base + k) = cur_start;
                 *ev.add(base + k) = cur_cnt;
             }
             if mark {
-                // SAFETY: s < NSLOT.
+                // SAFETY: s < NSLOT (sid, sown are NSLOT long); base + k < base + ts.len(), the
+                // room `ends_for` made. Slots ascend, so the last write per session is its end.
                 unsafe {
                     *sid.add(s) = (base + k) as u32;
                     *sown.add(s) = serial;
+                    *ends.add(base + k) = e.max;
                 }
             }
             prev_s = s;
@@ -450,11 +587,16 @@ fn person_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out, mark: bool) {
 fn buys_by_slot(bj: &[u32], buys: &[[u64; 2]], sc: &Scratch, out: &mut Out) -> Result<(), Error> {
     for &j in bj {
         let t = (buys[j as usize][0] as u32) & 0x7fff_ffff;
-        let s = (t / SLOT) as usize;
+        let s = (t / SLOT) as usize; // < NSLOT, as t < 2^31
         if sc.sown[s] != sc.serial {
             return Err(Error::BuyOutsideSessions(j as usize));
         }
-        out.buy_session[j as usize] = sc.sid[s];
+        let si = sc.sid[s] as usize;
+        // the reference's criterion: inside [start, last ts] of the session
+        if t < out.start[si] || t > sc.ends[si] {
+            return Err(Error::BuyOutsideSessions(j as usize));
+        }
+        out.buy_session[j as usize] = si as u32;
     }
     Ok(())
 }
@@ -515,14 +657,19 @@ fn sort_ts(ts: &mut [u32], tmp: &mut Vec<u32>) {
     }
 }
 
-/// Sessions of one person from its sorted timestamps.
+/// Sessions of one person from its sorted timestamps; with `ends` non-null also the last ts of
+/// each session (caller: `ends_for`).
 #[inline(always)]
-fn walk_sorted(ts: &[u32], out: &mut Out) {
+fn walk_sorted(ts: &[u32], out: &mut Out, ends: *mut u32) {
     let mut start = ts[0];
     let mut cnt = 1u32;
     let mut prev = ts[0];
     for &t in &ts[1..] {
         if t - prev > GAP {
+            if !ends.is_null() {
+                // SAFETY: session index < base + ts.len(), the room `ends_for` made.
+                unsafe { *ends.add(out.start.len()) = prev };
+            }
             out.start.push(start);
             out.events.push(cnt);
             start = t;
@@ -531,6 +678,10 @@ fn walk_sorted(ts: &[u32], out: &mut Out) {
         cnt += 1;
         prev = t;
     }
+    if !ends.is_null() {
+        // SAFETY: as above.
+        unsafe { *ends.add(out.start.len()) = prev };
+    }
     out.start.push(start);
     out.events.push(cnt);
 }
@@ -538,18 +689,32 @@ fn walk_sorted(ts: &[u32], out: &mut Out) {
 /// Purchases of one person to sessions `s0..` by start ts (the last session starting at or
 /// before the purchase).
 #[inline(always)]
-fn buys_by_start(bj: &[u32], buys: &[[u64; 2]], s0: usize, out: &mut Out) -> Result<(), Error> {
+fn buys_by_start(bj: &[u32], buys: &[[u64; 2]], s0: usize, out: &mut Out, ends: &[u32]) -> Result<(), Error> {
     let starts = &out.start[s0..];
     for &j in bj {
         let t = (buys[j as usize][0] as u32) & 0x7fff_ffff;
         // number of sessions with start <= t
         let k = starts.partition_point(|&s| s <= t);
-        if k == 0 {
+        // the reference's criterion: inside [start, last ts] of that session
+        if k == 0 || t > ends[s0 + k - 1] {
             return Err(Error::BuyOutsideSessions(j as usize));
         }
         out.buy_session[j as usize] = (s0 + k - 1) as u32;
     }
     Ok(())
+}
+
+/// `sessions` in dense mode with each person's record count given (`counts[p]` records have
+/// person field p): the counting pass is skipped. Wrong counts are an error, never an
+/// out-of-bounds write. The radix kernel ignores the counts.
+pub fn sessions_counted(ev: &[u64], buys: &[[u64; 2]], kernel: Kernel, counts: &[u32], sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
+    if let Kernel::Radix = kernel {
+        return sessions(ev, buys, kernel, Some(counts.len()), sc, out);
+    }
+    out.clear();
+    out.buy_session.resize(buys.len(), u32::MAX);
+    let np = group_with(ev, buys, Some(counts.len()), Some(counts), true, sc, out)?;
+    finish(np, buys, kernel, sc, out)
 }
 
 /// Sessions of one partition. `out` is cleared first.
@@ -567,10 +732,33 @@ pub fn sessions(
         return radix_partition(ev, buys, dense, sc, out);
     }
     let np = group(ev, buys, dense, true, sc, out)?;
+    finish(np, buys, kernel, sc, out)
+}
+
+/// The per-person part after grouping.
+fn finish(np: usize, buys: &[[u64; 2]], kernel: Kernel, sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
     #[cfg(target_arch = "x86_64")]
-    if kernel == Kernel::Net && sc.avx512 {
-        // SAFETY: AVX-512F was detected.
-        return unsafe { net_partition(np, buys, sc, out) };
+    let net = match kernel {
+        Kernel::Net => Some((NetWidth::Auto, 128)),
+        Kernel::NetWith { width, max } => Some((width, max)),
+        _ => None,
+    };
+    if let Some((width, max)) = net {
+        let bits = sc.nets[match width {
+            NetWidth::W512 => 0,
+            NetWidth::W256 => 1,
+            NetWidth::Auto => 2,
+        }];
+        let max = (max as usize).min(net::MAX_N);
+        if bits == 512 {
+            // SAFETY: bits == 512 only when AVX-512F was detected (`net_bits`).
+            return unsafe { net_partition512(np, max, buys, sc, out) };
+        }
+        if bits == 256 {
+            // SAFETY: bits == 256 only when AVX-512F and AVX-512VL were detected (`net_bits`).
+            return unsafe { net_partition256(np, max, buys, sc, out) };
+        }
+        // no AVX-512: slots for everyone (the generic loop below)
     }
     let mut grouped = std::mem::take(&mut sc.grouped);
     for p in 0..np {
@@ -582,33 +770,24 @@ pub fn sessions(
                 Kernel::Hybrid(t) => ts.len() <= t as usize,
                 _ => false,
             };
-            let net = kernel == Kernel::Net && sc.avx512 && ts.len() <= 32;
+            let net = false;
             let s0 = out.start.len();
             let (ba, bz) = (sc.bfirst[p] as usize, sc.bcur[p] as usize);
+            let ends = sc.ends_for(s0, ts.len(), ba < bz);
             if net {
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: AVX-512F was detected; 1 <= ts.len() <= 32.
-                unsafe {
-                    net::person_net(ts, out)
-                };
-                if ba < bz {
-                    let bj = std::mem::take(&mut sc.bgrouped);
-                    let r = buys_by_start(&bj[ba..bz], buys, s0, out);
-                    sc.bgrouped = bj;
-                    r?;
-                }
+                unreachable!()
             } else if small {
                 sort_ts(ts, &mut sc.tmp);
-                walk_sorted(ts, out);
+                walk_sorted(ts, out, ends);
                 if ba < bz {
                     let bj = std::mem::take(&mut sc.bgrouped);
-                    let r = buys_by_start(&bj[ba..bz], buys, s0, out);
+                    let r = buys_by_start(&bj[ba..bz], buys, s0, out, &sc.ends);
                     sc.bgrouped = bj;
                     r?;
                 }
             } else {
-                sc.serial = sc.serial.wrapping_add(1);
-                person_slots(ts, sc, out, ba < bz);
+                sc.next_serial();
+                person_slots(ts, sc, out, ends);
                 if ba < bz {
                     let bj = std::mem::take(&mut sc.bgrouped);
                     let r = buys_by_slot(&bj[ba..bz], buys, sc, out);
@@ -674,12 +853,18 @@ fn radix_partition(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, sc: &mut
         while j < n && (keys[j] >> 31) as usize == p {
             j += 1;
         }
+        let (ba, bz) = (sc.bfirst[p] as usize, sc.bcur[p] as usize);
         if j > i {
+            let ends = sc.ends_for(s0, j - i, ba < bz);
             let mut start = (keys[i] & 0x7fff_ffff) as u32;
             let (mut prev, mut cnt) = (start, 1u32);
             for &k in &keys[i + 1..j] {
                 let t = (k & 0x7fff_ffff) as u32;
                 if t - prev > GAP {
+                    if !ends.is_null() {
+                        // SAFETY: session index < s0 + (j - i), the room `ends_for` made.
+                        unsafe { *ends.add(out.start.len()) = prev };
+                    }
                     out.start.push(start);
                     out.events.push(cnt);
                     start = t;
@@ -688,17 +873,20 @@ fn radix_partition(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, sc: &mut
                 cnt += 1;
                 prev = t;
             }
+            if !ends.is_null() {
+                // SAFETY: as above.
+                unsafe { *ends.add(out.start.len()) = prev };
+            }
             out.start.push(start);
             out.events.push(cnt);
         }
-        let (ba, bz) = (sc.bfirst[p] as usize, sc.bcur[p] as usize);
         if ba < bz {
             if j == i {
                 sc.rkeys = keys;
                 return Err(Error::BuyWithoutPerson(sc.bgrouped[ba] as usize));
             }
             let bj = std::mem::take(&mut sc.bgrouped);
-            let r = buys_by_start(&bj[ba..bz], buys, s0, out);
+            let r = buys_by_start(&bj[ba..bz], buys, s0, out, &sc.ends);
             sc.bgrouped = bj;
             if r.is_err() {
                 sc.rkeys = keys;
@@ -714,50 +902,11 @@ fn radix_partition(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, sc: &mut
 }
 
 
-/// One person's sessions by slots, for measurement (sessions appended to `out.start/events`).
-pub fn person_by_slots(ts: &[u32], sc: &mut Scratch, out: &mut Out) {
-    sc.serial = sc.serial.wrapping_add(1);
-    person_slots(ts, sc, out, false);
-}
-
-/// One person's sessions by sorting `ts` in place, for measurement.
-pub fn person_by_sort(ts: &mut [u32], sc: &mut Scratch, out: &mut Out) {
-    sort_ts(ts, &mut sc.tmp);
-    walk_sorted(ts, out);
-}
-
-/// Clears only the session arrays of `out` (for measurement loops).
-pub fn clear_sessions(out: &mut Out) {
-    out.start.clear();
-    out.events.clear();
-}
-
-/// Grouping alone (persons, counts, timestamps grouped, purchases grouped), for measurement.
-/// Returns the number of persons.
-pub fn group_only(ev: &[u64], buys: &[[u64; 2]], dense: Option<usize>, sc: &mut Scratch, out: &mut Out) -> Result<usize, Error> {
-    out.clear();
-    group(ev, buys, dense, true, sc, out)
-}
-
-/// One person's sessions by the AVX-512 network (1..=32 events), for measurement. False where
-/// AVX-512 is missing or the person is larger.
-pub fn person_by_net(ts: &[u32], sc: &Scratch, out: &mut Out) -> bool {
-    if !sc.avx512 || ts.is_empty() || ts.len() > 32 {
-        return false;
-    }
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: AVX-512F detected; 1 <= ts.len() <= 32.
-    unsafe {
-        net::person_net(ts, out)
-    };
-    true
-}
-
-/// The per-person loop of `Kernel::Net`, compiled with AVX-512 so the small-person network and
-/// the slot fold inline.
+/// The per-person loop of `Kernel::Net` for register type L: the network for persons of at most
+/// `max` (<= 128) events, slots above. Inlined into the two target-feature entry points below.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn net_partition(np: usize, buys: &[[u64; 2]], sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
+#[inline(always)]
+unsafe fn net_partition<L: net::Lanes>(np: usize, max: usize, buys: &[[u64; 2]], sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
     let grouped = std::mem::take(&mut sc.grouped);
     let bj = std::mem::take(&mut sc.bgrouped);
     let mut res = Ok(());
@@ -767,17 +916,20 @@ unsafe fn net_partition(np: usize, buys: &[[u64; 2]], sc: &mut Scratch, out: &mu
         if a < z {
             let ts = &grouped[a..z];
             let s0 = out.start.len();
-            if ts.len() <= 32 {
-                net::person_net_inl::<true>(ts, out);
+            let ends = sc.ends_for(s0, ts.len(), ba < bz);
+            if ts.len() <= max {
+                // SAFETY: 1 <= ts.len() <= max <= MAX_N; L's features (caller); ts < 2^31 (31-bit
+                // field); `ends` null or with room for s0 + ts.len() entries (ends_for).
+                net::person_net_inl::<L>(ts, out, ends);
                 if ba < bz {
-                    if let Err(e) = buys_by_start(&bj[ba..bz], buys, s0, out) {
+                    if let Err(e) = buys_by_start(&bj[ba..bz], buys, s0, out, &sc.ends) {
                         res = Err(e);
                         break;
                     }
                 }
             } else {
-                sc.serial = sc.serial.wrapping_add(1);
-                person_slots(ts, sc, out, ba < bz);
+                sc.next_serial();
+                person_slots(ts, sc, out, ends);
                 if ba < bz {
                     if let Err(e) = buys_by_slot(&bj[ba..bz], buys, sc, out) {
                         res = Err(e);
@@ -794,4 +946,20 @@ unsafe fn net_partition(np: usize, buys: &[[u64; 2]], sc: &mut Scratch, out: &mu
     sc.grouped = grouped;
     sc.bgrouped = bj;
     res
+}
+
+/// # Safety
+/// AVX-512F present.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn net_partition512(np: usize, max: usize, buys: &[[u64; 2]], sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
+    net_partition::<net::Z>(np, max, buys, sc, out)
+}
+
+/// # Safety
+/// AVX-512F and AVX-512VL present.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+unsafe fn net_partition256(np: usize, max: usize, buys: &[[u64; 2]], sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
+    net_partition::<net::Y>(np, max, buys, sc, out)
 }

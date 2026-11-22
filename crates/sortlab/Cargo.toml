@@ -6,3 +6,8 @@ license = "MIT"
 description = "Sessions from person-partition records: grouping, slot aggregation and sort kernels"
 
 [dependencies]
+
+[features]
+# Force the network width for whole-suite runs (otherwise chosen by CPU model).
+net256 = []
+net512 = []

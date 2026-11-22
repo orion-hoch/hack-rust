@@ -55,9 +55,8 @@ const RING: usize = 64;
 /// away from every other core that reads it. Links and clicks bring most new IDs: for writing.
 const EVENT_PREFETCH_W: bool = false;
 
-/// A started lookup and the word its token goes into (the record is already in its bin: written
-/// at once, its line is still cached when the token is OR-ed in; measured better than holding
-/// whole records here and writing them complete through staged non-temporal lines).
+/// A started lookup and the word its token goes into (clicks and links: the record is already in
+/// its bin, a sequential one, so its line is still cached when the token is OR-ed in).
 #[derive(Clone, Copy)]
 struct Pend {
     user: Pending,
@@ -68,6 +67,33 @@ impl Default for Pend {
     fn default() -> Self {
         Pend { user: Pending::default(), at: std::ptr::null_mut() }
     }
+}
+
+/// Surviving events wait in blocks of G with their lookups started; when a block fills, the other
+/// block (started G records earlier, its lines landed) is resolved and its records are written
+/// complete. Against writing each record at once and OR-ing its token in 64 records later
+/// (interleaved, box 1): equal at p20v5 (2,048 partitions); at f60v5 (8,192 partitions, 2 MB of
+/// write fronts, beyond L2, so the later OR missed) 400 to 700 ms less CPU in the phase.
+const G: usize = 32;
+
+/// A surviving event whose token is pending: user key and slot, partition, the record words
+/// (SHORT [w0, w1]; LONG [a, b, w2, w3]; the token goes into the last word), kind flags.
+#[derive(Clone, Copy, Default)]
+struct EvPend {
+    ua: u64,
+    ub: u64,
+    slot: usize,
+    w: [u64; 4],
+    part: u32,
+    /// Bit 0: the user ID is LONG; bit 1: the event ID is LONG.
+    flags: u32,
+}
+
+struct Groups {
+    blk: [[EvPend; G]; 2],
+    /// Block being filled; the other one waits for its tokens.
+    cur: usize,
+    n: [usize; 2],
 }
 
 pub struct V3Sink<'a, 'b> {
@@ -92,6 +118,7 @@ pub struct V3Sink<'a, 'b> {
     ring: Box<[Pend; RING]>,
     ring_n: usize,
     ring_at: usize,
+    grp: Box<Groups>,
 }
 
 // SAFETY: the ring's pointers point into this sink's own bins (moved with it).
@@ -123,7 +150,41 @@ impl<'a, 'b> V3Sink<'a, 'b> {
             ring: Box::new([Pend::default(); RING]),
             ring_n: 0,
             ring_at: 0,
+            grp: Box::new(Groups { blk: [[EvPend::default(); G]; 2], cur: 0, n: [0; 2] }),
         }
+    }
+
+    /// Queues a surviving event (its lookup started); a full block resolves the other one.
+    #[inline(always)]
+    fn group(&mut self, e: EvPend) {
+        let g = &mut *self.grp;
+        let c = g.cur;
+        g.blk[c][g.n[c]] = e;
+        g.n[c] += 1;
+        if g.n[c] == G {
+            self.resolve_block(c ^ 1);
+            self.grp.cur = c ^ 1;
+        }
+    }
+
+    /// Resolves block `k`: tokens, then the complete records into their bins.
+    #[inline(always)]
+    fn resolve_block(&mut self, k: usize) {
+        let n = self.grp.n[k];
+        let mut bad = false;
+        for i in 0..n {
+            let e = self.grp.blk[k][i];
+            let t = self.tok.finish(&Pending { long: e.flags & 1 != 0, a: e.ua, b: e.ub, slot: e.slot });
+            bad |= t == NO_TOKEN;
+            let t = u64::from(t);
+            if e.flags & 2 == 0 {
+                self.short.push(e.part as usize, [e.w[0], e.w[1] | t]);
+            } else {
+                self.long.push(e.part as usize, [e.w[0], e.w[1], e.w[2], e.w[3] | t]);
+            }
+        }
+        self.bad |= bad;
+        self.grp.n[k] = 0;
     }
 
     /// Starts a lookup whose token is to be OR-ed into `*at` (bits 0-31) later (prefetched for
@@ -160,6 +221,9 @@ impl<'a, 'b> V3Sink<'a, 'b> {
         }
         self.ring_n = 0;
         self.ring_at = 0;
+        let c = self.grp.cur;
+        self.resolve_block(c ^ 1);
+        self.resolve_block(c);
     }
 
     pub fn finish(&mut self) {
@@ -237,29 +301,26 @@ impl<'a> Sink for V3Sink<'a, '_> {
             } else {
                 0
             };
-            let at: *mut u64 = if b.ev_long >> k & 1 == 0 {
-                let a = b.ev_a[k];
-                let p = part_of(a, 0, self.bits);
-                if purch {
+            let ev_long = b.ev_long >> k & 1 != 0;
+            let (a, bb) = (b.ev_a[k], if ev_long { b.ev_b[k] } else { 0 });
+            let p = part_of(a, bb, self.bits);
+            if purch {
+                if ev_long {
+                    self.plong.push(p, [a, bb, ing, buy]);
+                } else {
                     self.pshort.push(p, [a | (ing << 40), buy]);
                 }
-                let r = self.short.push_at(p, [a | (ing << 40) | (u64::from(surv) << 63), w1]);
-                // SAFETY: r points at the record just written; word 1 holds the token.
-                unsafe { (r as *mut u64).add(1) }
-            } else {
-                let (a, bb) = (b.ev_a[k], b.ev_b[k]);
-                let p = part_of(a, bb, self.bits);
-                if purch {
-                    self.plong.push(p, [a, bb, ing, buy]);
-                }
-                let r = self.long.push_at(p, [a, bb, ing | (u64::from(surv) << 63), w1]);
-                // SAFETY: as above; word 3 holds the token.
-                unsafe { (r as *mut u64).add(3) }
-            };
+            }
+            let w: [u64; 4] = if ev_long { [a, bb, ing | (u64::from(surv) << 63), w1] } else { [a | (ing << 40) | (u64::from(surv) << 63), w1, 0, 0] };
             if surv {
+                let ul = b.user_long >> k & 1 != 0;
+                let slot = self.tok.start_hint::<EVENT_PREFETCH_W>(ul, b.user_a[k], b.user_b[k]).slot;
+                self.group(EvPend { ua: b.user_a[k], ub: b.user_b[k], slot, w, part: p as u32, flags: u32::from(ul) | (u32::from(ev_long) << 1) });
+            } else if ev_long {
                 // A dead copy only shadows: its key, ingest and dead bit; no token needed.
-                let user = Pending { long: b.user_long >> k & 1 != 0, a: b.user_a[k], b: b.user_b[k], slot: 0 };
-                self.defer::<EVENT_PREFETCH_W>(user, at);
+                self.long.push(p, w);
+            } else {
+                self.short.push(p, [w[0], w[1]]);
             }
         }
     }
@@ -267,6 +328,10 @@ impl<'a> Sink for V3Sink<'a, '_> {
     #[inline]
     fn clicks(&mut self, b: &ClickBatch) {
         let n = b.n as usize;
+        // The appends' lines, owned before they are written: an insert's lock cmpxchg waits for
+        // every older store, and a store to a line not yet owned held it ~100 cycles.
+        self.clicks.prefetch_ahead(0, 512);
+        self.clicks.prefetch_ahead(0, 576);
         for k in 0..n {
             if b.loc[k] >> 48 != 0 {
                 self.bad = true;
@@ -279,6 +344,9 @@ impl<'a> Sink for V3Sink<'a, '_> {
     #[inline]
     fn links(&mut self, b: &LinkBatch) {
         let n = b.n as usize;
+        // As in `clicks`: 44% of this function's cycles sat on the insert CAS, waiting for stores.
+        self.edges.prefetch_ahead(0, 512);
+        self.edges.prefetch_ahead(0, 576);
         for k in 0..n {
             let r = self.edges.push_at(0, 0);
             self.defer::<true>(Pending { long: b.a_long >> k & 1 != 0, a: b.a_a[k], b: b.a_b[k], slot: 0 }, r);

@@ -48,6 +48,20 @@ impl<T: Copy> Bins<T> {
         self.push_at(b, x);
     }
 
+    /// Asks for the line `bytes` past bin `b`'s write pointer in a writable state (prefetchw), so
+    /// an append there does not wait for ownership. A hint: it never faults, past a chunk's end
+    /// included.
+    #[inline(always)]
+    pub fn prefetch_ahead(&self, b: usize, bytes: usize) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: prefetch never faults, whatever the address.
+        unsafe {
+            core::arch::x86_64::_mm_prefetch((self.ce[b][0] as *const i8).wrapping_add(bytes), core::arch::x86_64::_MM_HINT_ET0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (b, bytes);
+    }
+
     /// Appends and returns where the record was written. The address stays valid for the life
     /// of the bins (chunks never move), so a field can be patched later.
     #[inline(always)]

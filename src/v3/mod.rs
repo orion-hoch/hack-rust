@@ -145,6 +145,11 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     // inputs size both tables from it, so an unusual mix of ID kinds does not fall back (tokens.rs).
     let bound_users = ds.bytes(Stream::Links) as usize / 8 * 2 + ev_bytes / 40 + ds.bytes(Stream::Clicks) as usize / 30;
     let tok = Tokens::with_bound(est_users, bound_users);
+    // The persons region (huge pages by the verdict for its own size), sized from the link
+    // bytes: at most one link line per 16 bytes.
+    if !mem::init_persons(persons::region_bytes(tok.capacity(), 2 * link_lines)) {
+        return Ok(Outcome::Fallback("persons region could not be reserved".into()));
+    }
     // Move-1 partitions of about 16K records: the dedup table (32K slots) stays in L2.
     let p1_bits = ((est_events / 16_000).max(1).next_power_of_two().trailing_zeros()).clamp(4, 14);
     clock.mark("open");
@@ -331,9 +336,15 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         sinks_ref.len(),
         |_| Bins::<[u64; 2]>::new(1 << p2_bits, 1 << 15),
         |bins, i| {
-            for c in sinks_ref[i].clicks.all().flat_map(|c| c.iter()) {
-                let person = people.person_of(c[0] as u32);
-                bins.push(probe.part(person), [(u64::from(person) << 32) | (c[0] >> 32), c[1]]);
+            for chunk in sinks_ref[i].clicks.all() {
+                for (j, c) in chunk.iter().enumerate() {
+                    // Person lookups are random in a token-sized map: start them 64 clicks ahead.
+                    if let Some(f) = chunk.get(j + 64) {
+                        people.prefetch(f[0] as u32);
+                    }
+                    let person = people.person_of(c[0] as u32);
+                    bins.push(probe.part(person), [(u64::from(person) << 32) | (c[0] >> 32), c[1]]);
+                }
             }
         },
     );
@@ -398,6 +409,16 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         eprintln!(
             "timing v3.  sessions counts: clicks {}, tie groups re-read {}, persons {}, rows {}, direct assist steps {}, interval-route persons {}",
             ct[0], ct[1], ct[2], ct[3], ct[4], ct[5]
+        );
+        let mut ic = [0u64; 5];
+        for w in &workers {
+            for i in 0..5 {
+                ic[i] += w.icount[i];
+            }
+        }
+        eprintln!(
+            "timing v3.  interval route: clicks {}, sessions {}, campaigns {}, intervals {}, day steps {}",
+            ic[0], ic[1], ic[2], ic[3], ic[4]
         );
     }
     if workers.iter().any(|w| w.bad) {
