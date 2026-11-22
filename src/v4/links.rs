@@ -49,7 +49,11 @@ fn long_okey(a: u64) -> u64 {
 /// `names::order_key` for x < 2^40, counting the digits down from 8 (nearly every id has 8).
 #[inline(always)]
 fn okey40(x: u64) -> u64 {
-    let mut len = 8usize;
+    // Eight digits (93% of the values below 2^40): the value itself, no table, no multiply.
+    if x >= POW36[7] {
+        return (x << 4) | 8;
+    }
+    let mut len = 7usize;
     while len > 1 && x < POW36[len - 1] {
         len -= 1;
     }
@@ -89,6 +93,8 @@ impl Ends {
         }
     }
 
+    /// One line's two ends (the tests' way in; `LinkSink::links` writes a batch's ends itself).
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     fn line(&mut self, x: (bool, u64, u64), y: (bool, u64, u64)) {
         let e = self.lines << 1;
@@ -317,25 +323,6 @@ impl Small {
         let n = (2 * cap).next_power_of_two().max(64);
         Small { slot: vec![Slot { k: 0, n: 0 }; n], mask: n - 1 }
     }
-
-    /// The node of `k` (`h` its hash) among the entries of nodes >= `base`, or `fresh()` stored for it.
-    #[inline(always)]
-    fn get(&mut self, k: u64, h: u64, base: u32, fresh: impl FnOnce() -> u32) -> u32 {
-        let mut i = h as usize & self.mask;
-        loop {
-            // SAFETY: i <= mask < slot.len().
-            let s = unsafe { self.slot.get_unchecked_mut(i) };
-            if s.n <= base {
-                let n = fresh();
-                *s = Slot { k, n: n + 1 };
-                return n;
-            }
-            if s.k == k {
-                return s.n - 1;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
 }
 
 /// Root of `x` with path halving. Every node index in `uf` is below its length (nodes are only
@@ -406,6 +393,45 @@ fn stop() -> u32 {
     std::env::var("LNK_STOP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
+/// Pass 1 over one task's SHORT ends of one partition (`recs`): each end's node (found in the
+/// partition's table, or opened as node `id`) is written to `en` at the end's tag. Returns the
+/// next free node. Its own function, its state in plain values: the loop keeps them in registers.
+///
+/// # Safety
+/// `slot` has `mask + 1` entries; `uf` and `place` have room for one more node per record from
+/// `id`; every record's tag (`r & tag`) is inside `en`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn short_pass(recs: &[u64], slot: *mut Slot, mask: usize, base: u32, rmask: u64, tag: u64, uf: *mut Uf, place: *mut u64, mut id: u32, en: *mut u32) -> u32 {
+    for &r in recs {
+        let mu = r >> 24;
+        // ru + 1: nonzero, and the partition's users are told apart by ru alone.
+        let k = (mu & rmask) + 1;
+        let mut i = mu as usize & mask;
+        // SAFETY: the function's contract (i is masked; id is below the arrays' room; the tag is
+        // inside en).
+        unsafe {
+            let node = loop {
+                let s = slot.add(i);
+                // an entry of a node below the partition's first is stale: an empty slot
+                if (*s).n <= base {
+                    uf.add(id as usize).write(Uf { parent: id, wix: 0, okey: okey40(unmix40(mu)) });
+                    place.add(id as usize).write(mu);
+                    *s = Slot { k, n: id + 1 };
+                    id += 1;
+                    break id - 1;
+                }
+                if (*s).k == k {
+                    break (*s).n - 1;
+                }
+                i = (i + 1) & mask;
+            };
+            *en.add((r & tag) as usize) = node;
+        }
+    }
+    id
+}
+
 /// Steps 2 to 4 over every task's grouped ends (each end's record is overwritten with its node).
 fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
     let t0 = std::time::Instant::now();
@@ -446,12 +472,14 @@ fn resolve(tasks: &mut [Ends], b2: u32, sp: &mut Spent) -> Links {
         sbase[q] = base;
         for (t, te) in tasks.iter().enumerate() {
             let eb = 2 * ebase[t];
-            for &r in &te.short[te.soff[q] as usize..te.soff[q + 1] as usize] {
-                let mu = r >> 24;
-                // ru + 1: nonzero, and the partition's users are told apart by ru alone.
-                let id = tab.get((mu & rmask) + 1, mu, base, || nd.push(okey40(unmix40(mu)), mu));
-                // SAFETY: r's tag < 2 * the task's lines, within its stretch of en.
-                unsafe { *en.get_unchecked_mut((eb + (r & tag)) as usize) = id };
+            let recs = &te.short[te.soff[q] as usize..te.soff[q + 1] as usize];
+            // SAFETY: uf and place have room for every end (each end adds at most one node) and
+            // hold the same number of nodes; a record's tag is below 2 * its task's lines, inside
+            // the task's stretch of en (from eb); the table's mask is its length - 1.
+            unsafe {
+                let id = short_pass(recs, tab.slot.as_mut_ptr(), tab.mask, base, rmask, tag, nd.uf.as_mut_ptr(), nd.place.as_mut_ptr(), nd.uf.len() as u32, en.as_mut_ptr().add(eb as usize));
+                nd.uf.set_len(id as usize);
+                nd.place.set_len(id as usize);
             }
         }
         let tw = tsc();

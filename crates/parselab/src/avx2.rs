@@ -21,11 +21,11 @@ unsafe fn c(x: u64) -> __m256i {
 #[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn digits_ok(x: __m256i, mask: u64) -> __m256i {
+    // A byte is a digit value (0..=9) iff neither it nor it + 6 has a high-nibble bit: one test.
     let z = _mm256_setzero_si256();
     let xd = _mm256_and_si256(x, unsafe { c(mask) });
-    let hi = _mm256_cmpeq_epi64(_mm256_and_si256(xd, unsafe { c(0xF0F0_F0F0_F0F0_F0F0) }), z);
-    let ov = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_add_epi8(xd, _mm256_set1_epi8(6)), unsafe { c(0x1010_1010_1010_1010) }), z);
-    _mm256_and_si256(hi, ov)
+    let t = _mm256_or_si256(_mm256_add_epi8(xd, _mm256_set1_epi8(6)), xd);
+    _mm256_cmpeq_epi64(_mm256_and_si256(t, unsafe { c(0xF0F0_F0F0_F0F0_F0F0) }), z)
 }
 
 #[target_feature(enable = "avx2")]
@@ -148,6 +148,7 @@ unsafe fn ld_len(a: &[u32; 8], h: usize) -> __m256i {
 }
 
 /// The batch's ts and ingest decoders for 8 lanes (as the scalar loops in `fast2::batch`).
+#[allow(dead_code)]
 #[target_feature(enable = "avx2")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -285,6 +286,7 @@ unsafe fn long4(w0: __m256i, w1: __m256i, w2: __m256i, w3: __m256i) -> (__m256i,
 
 /// The batch's ID decoders for 8 lanes: SHORT values (or u64::MAX) of the event and user IDs, and
 /// their LONG keys with the LONG test (length 33, prefix, 32 hex digits).
+#[allow(dead_code)]
 #[target_feature(enable = "avx2")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -300,23 +302,90 @@ pub(crate) unsafe fn keys(
     long_b: &mut [[u64; 8]; 2],
 ) {
     for id in 0..2 {
-        for h in 0..2 {
-            unsafe {
-                let len = ld_len(&lens[id], h);
-                let pre8 = _mm256_cvtepu8_epi64(_mm_cvtsi32_si128(i32::from_le_bytes(pres[id][4 * h..4 * h + 4].try_into().unwrap())));
-                let pre_ok = _mm256_cmpeq_epi64(pre8, _mm256_set1_epi64x(prefix[id] as i64));
-                let w = ld(last8[id], h);
-                let k = _mm256_sub_epi64(len, _mm256_set1_epi64x(1));
-                let v = ids4(w, k, pre_ok);
-                _mm256_storeu_si256(short[id].as_mut_ptr().add(4 * h) as *mut __m256i, v);
-                let (a, b, hx) = long4(ld(&words[id][0], h), ld(&words[id][1], h), ld(&words[id][2], h), w);
-                _mm256_storeu_si256(long_a[id].as_mut_ptr().add(4 * h) as *mut __m256i, a);
-                _mm256_storeu_si256(long_b[id].as_mut_ptr().add(4 * h) as *mut __m256i, b);
-                let okv = _mm256_and_si256(_mm256_and_si256(eq(len, 33), pre_ok), hx);
-                let m = _mm256_movemask_pd(_mm256_castsi256_pd(okv));
-                for l in 0..4 {
-                    long_ok[id][4 * h + l] = m >> l & 1 != 0;
-                }
+        unsafe { key1(&lens[id], &pres[id], prefix[id], last8[id], words[id], &mut short[id], &mut long_ok[id], &mut long_a[id], &mut long_b[id]) };
+    }
+}
+
+/// One ID column of `keys` (the click batch's user IDs).
+#[allow(dead_code)]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn key1(
+    lens: &[u32; 8],
+    pres: &[u8; 8],
+    prefix: u8,
+    last8: &[u64; 8],
+    words: &[[u64; 8]; 3],
+    short: &mut [u64; 8],
+    long_ok: &mut [bool; 8],
+    long_a: &mut [u64; 8],
+    long_b: &mut [u64; 8],
+) {
+    for h in 0..2 {
+        unsafe {
+            let len = ld_len(lens, h);
+            let pre8 = _mm256_cvtepu8_epi64(_mm_cvtsi32_si128(i32::from_le_bytes(pres[4 * h..4 * h + 4].try_into().unwrap())));
+            let pre_ok = _mm256_cmpeq_epi64(pre8, _mm256_set1_epi64x(prefix as i64));
+            let w = ld(last8, h);
+            let k = _mm256_sub_epi64(len, _mm256_set1_epi64x(1));
+            let v = ids4(w, k, pre_ok);
+            _mm256_storeu_si256(short.as_mut_ptr().add(4 * h) as *mut __m256i, v);
+            let (a, b, hx) = long4(ld(&words[0], h), ld(&words[1], h), ld(&words[2], h), w);
+            _mm256_storeu_si256(long_a.as_mut_ptr().add(4 * h) as *mut __m256i, a);
+            _mm256_storeu_si256(long_b.as_mut_ptr().add(4 * h) as *mut __m256i, b);
+            let okv = _mm256_and_si256(_mm256_and_si256(eq(len, 33), pre_ok), hx);
+            let m = _mm256_movemask_pd(_mm256_castsi256_pd(okv));
+            for l in 0..4 {
+                long_ok[4 * h + l] = m >> l & 1 != 0;
+            }
+        }
+    }
+}
+
+/// The ts decoder of `ts_ingest` alone, for 8 lanes (click batches; as `fast2::ts_lane`).
+#[allow(dead_code)]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn ts8(
+    f: &Fast,
+    dates: &Dates,
+    tlen: &[u32; 8],
+    t_hi: &[u64; 8],
+    t_mid: &[u64; 8],
+    t_16: &[u64; 8],
+    t_17: &[u64; 8],
+    ts_rel: &mut [i64; 8],
+    ts_fast: &mut [bool; 8],
+) {
+    let ff = unsafe { c(0xFF) };
+    for h in 0..2 {
+        unsafe {
+            let (hi, mid, t16, t17) = (ld(t_hi, h), ld(t_mid, h), ld(t_16, h), ld(t_17, h));
+            let len = ld_len(tlen, h);
+            let (day, date_ok) = date(dates, hi, mid);
+            let t_ok = eq(_mm256_and_si256(_mm256_srli_epi64::<16>(mid), ff), b'T' as u64);
+            let (secs, hms_ok) = hms(_mm256_or_si256(_mm256_srli_epi64::<24>(mid), _mm256_slli_epi64::<40>(t16)));
+            let z = eq(_mm256_and_si256(_mm256_srli_epi64::<24>(t16), ff), b'Z' as u64);
+            let (off, off_ok) = offset(t17);
+            let dt_ok = _mm256_and_si256(date_ok, _mm256_and_si256(t_ok, hms_ok));
+            let f1 = _mm256_and_si256(eq(len, 20), _mm256_and_si256(z, dt_ok));
+            let f2 = _mm256_and_si256(eq(len, 25), _mm256_and_si256(off_ok, dt_ok));
+            let (dhi, hi_ok) = dec8(hi);
+            let (dlo, lo_ok) = dec8(_mm256_or_si256(_mm256_slli_epi64::<24>(mid), c(0x0030_3030)));
+            let f3 = _mm256_and_si256(eq(len, 13), _mm256_and_si256(hi_ok, lo_ok));
+            let local = _mm256_sub_epi64(
+                _mm256_add_epi64(_mm256_mul_epi32(day, _mm256_set1_epi64x(DAY_MS)), _mm256_mul_epu32(secs, _mm256_set1_epi64x(1000))),
+                _mm256_set1_epi64x(f.ws_frac),
+            );
+            let f12 = _mm256_sub_epi64(local, _mm256_and_si256(off, f2));
+            let v3 = _mm256_sub_epi64(_mm256_add_epi64(_mm256_mul_epu32(dhi, _mm256_set1_epi64x(100_000)), dlo), _mm256_set1_epi64x(f.ws_ms));
+            let ts = _mm256_blendv_epi8(f12, v3, f3);
+            _mm256_storeu_si256(ts_rel.as_mut_ptr().add(4 * h) as *mut __m256i, ts);
+            let fast = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(f1, _mm256_or_si256(f2, f3))));
+            for l in 0..4 {
+                ts_fast[4 * h + l] = fast >> l & 1 != 0;
             }
         }
     }
@@ -376,4 +445,235 @@ pub(crate) unsafe fn bounds7(sep: *const u32, w: u32, q: u64, ls: &mut [u32; 8],
             _mm256_storeu_si256(ve[j].as_mut_ptr() as *mut __m256i, e);
         }
     }
+}
+
+/// `bounds7` for the 8 click lines of a batch (4 fields, separator stride 4): `sep[0]` is the
+/// newline before the first line, bit 4 * lane + field of `q` says that field is quoted.
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(crate) unsafe fn bounds4(sep: *const u32, w: u32, q: u64, ls: &mut [u32; 8], end: &mut [u32; 8], vs: &mut [[u32; 8]; 4], ve: &mut [[u32; 8]; 4]) {
+    unsafe {
+        let r = |l: usize| _mm256_loadu_si256(sep.add(4 * l) as *const __m256i);
+        let (r0, r1, r2, r3, r4, r5, r6, r7) = (r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7));
+        let t0 = _mm256_unpacklo_epi32(r0, r1);
+        let t1 = _mm256_unpackhi_epi32(r0, r1);
+        let t2 = _mm256_unpacklo_epi32(r2, r3);
+        let t3 = _mm256_unpackhi_epi32(r2, r3);
+        let t4 = _mm256_unpacklo_epi32(r4, r5);
+        let t5 = _mm256_unpackhi_epi32(r4, r5);
+        let t6 = _mm256_unpacklo_epi32(r6, r7);
+        let t7 = _mm256_unpackhi_epi32(r6, r7);
+        let u0 = _mm256_unpacklo_epi64(t0, t2);
+        let u1 = _mm256_unpackhi_epi64(t0, t2);
+        let u2 = _mm256_unpacklo_epi64(t1, t3);
+        let u3 = _mm256_unpackhi_epi64(t1, t3);
+        let u4 = _mm256_unpacklo_epi64(t4, t6);
+        let u5 = _mm256_unpackhi_epi64(t4, t6);
+        let u6 = _mm256_unpacklo_epi64(t5, t7);
+        let u7 = _mm256_unpackhi_epi64(t5, t7);
+        // col[j] lane l = sep[4 * l + j]: the separator before field j of line l (j = 4: its newline).
+        let col = [
+            _mm256_permute2x128_si256::<0x20>(u0, u4),
+            _mm256_permute2x128_si256::<0x20>(u1, u5),
+            _mm256_permute2x128_si256::<0x20>(u2, u6),
+            _mm256_permute2x128_si256::<0x20>(u3, u7),
+            _mm256_permute2x128_si256::<0x31>(u0, u4),
+        ];
+        let x = _mm256_set1_epi32(q as u32 as i32);
+        let bits0 = _mm256_setr_epi32(1, 1 << 4, 1 << 8, 1 << 12, 1 << 16, 1 << 20, 1 << 24, 1 << 28);
+        let w1 = _mm256_set1_epi32(w.wrapping_add(1) as i32);
+        let wv = _mm256_set1_epi32(w as i32);
+        _mm256_storeu_si256(ls.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(col[0], w1));
+        _mm256_storeu_si256(end.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(col[4], wv));
+        for j in 0..4 {
+            let bits = _mm256_sll_epi32(bits0, _mm_cvtsi32_si128(j as i32));
+            let m = _mm256_cmpeq_epi32(_mm256_and_si256(x, bits), bits); // -1 where quoted
+            let s = _mm256_sub_epi32(_mm256_add_epi32(col[j], w1), m);
+            let e = _mm256_add_epi32(_mm256_add_epi32(col[j + 1], wv), m);
+            _mm256_storeu_si256(vs[j].as_mut_ptr() as *mut __m256i, s);
+            _mm256_storeu_si256(ve[j].as_mut_ptr() as *mut __m256i, e);
+        }
+    }
+}
+
+/// `key1` reading each ID's last 32 bytes itself: one 32-byte load per lane and a 4x4 transpose
+/// give the four words of 4 lanes (instead of four scalar loads and stores per lane and word).
+/// `ve[l]` is the ID's end offset from `base`; reads [ve - 32, ve), as the scalar loads did.
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn key1_at(
+    base: *const u8,
+    ve: &[u32; 8],
+    lens: &[u32; 8],
+    pres: &[u8; 8],
+    prefix: u8,
+    short: &mut [u64; 8],
+    long_ok: &mut [bool; 8],
+    long_a: &mut [u64; 8],
+    long_b: &mut [u64; 8],
+) {
+    for h in 0..2 {
+        unsafe {
+            let r = |l: usize| _mm256_loadu_si256(base.offset(ve[4 * h + l] as isize - 32) as *const __m256i);
+            let (r0, r1, r2, r3) = (r(0), r(1), r(2), r(3));
+            let t0 = _mm256_unpacklo_epi64(r0, r1);
+            let t1 = _mm256_unpackhi_epi64(r0, r1);
+            let t2 = _mm256_unpacklo_epi64(r2, r3);
+            let t3 = _mm256_unpackhi_epi64(r2, r3);
+            // word t of the 4 lanes: bytes [ve - 32 + 8t, ve - 24 + 8t)
+            let w0 = _mm256_permute2x128_si256::<0x20>(t0, t2);
+            let w1 = _mm256_permute2x128_si256::<0x20>(t1, t3);
+            let w2 = _mm256_permute2x128_si256::<0x31>(t0, t2);
+            let w = _mm256_permute2x128_si256::<0x31>(t1, t3);
+            let len = ld_len(lens, h);
+            let pre8 = _mm256_cvtepu8_epi64(_mm_cvtsi32_si128(i32::from_le_bytes(pres[4 * h..4 * h + 4].try_into().unwrap())));
+            let pre_ok = _mm256_cmpeq_epi64(pre8, _mm256_set1_epi64x(prefix as i64));
+            let k = _mm256_sub_epi64(len, _mm256_set1_epi64x(1));
+            let v = ids4(w, k, pre_ok);
+            _mm256_storeu_si256(short.as_mut_ptr().add(4 * h) as *mut __m256i, v);
+            let (a, b, hx) = long4(w0, w1, w2, w);
+            _mm256_storeu_si256(long_a.as_mut_ptr().add(4 * h) as *mut __m256i, a);
+            _mm256_storeu_si256(long_b.as_mut_ptr().add(4 * h) as *mut __m256i, b);
+            let okv = _mm256_and_si256(_mm256_and_si256(eq(len, 33), pre_ok), hx);
+            let m = _mm256_movemask_pd(_mm256_castsi256_pd(okv));
+            put4(long_ok, 4 * h, m);
+        }
+    }
+}
+
+/// The four 8-byte words at `base + at[l]` of lanes 4h..4h + 4, one vector per word: one 32-byte
+/// load per lane and a 4x4 transpose (reads [at, at + 32)).
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn rows4(base: *const u8, at: &[u32; 8], h: usize) -> (__m256i, __m256i, __m256i, __m256i) {
+    unsafe {
+        let r = |l: usize| _mm256_loadu_si256(base.add(at[4 * h + l] as usize) as *const __m256i);
+        let (r0, r1, r2, r3) = (r(0), r(1), r(2), r(3));
+        let t0 = _mm256_unpacklo_epi64(r0, r1);
+        let t1 = _mm256_unpackhi_epi64(r0, r1);
+        let t2 = _mm256_unpacklo_epi64(r2, r3);
+        let t3 = _mm256_unpackhi_epi64(r2, r3);
+        (
+            _mm256_permute2x128_si256::<0x20>(t0, t2),
+            _mm256_permute2x128_si256::<0x20>(t1, t3),
+            _mm256_permute2x128_si256::<0x31>(t0, t2),
+            _mm256_permute2x128_si256::<0x31>(t1, t3),
+        )
+    }
+}
+
+/// `ts_ingest` reading the two fields itself (`tvs`, `ivs`: their value starts from `base`): the
+/// words at +0, +8, +16 by `rows4`, and the ts word at +17 from those at +16 and +24.
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn ts_ingest_at(
+    f: &Fast,
+    dates: &Dates,
+    base: *const u8,
+    tvs: &[u32; 8],
+    tlen: &[u32; 8],
+    ivs: &[u32; 8],
+    ilen: &[u32; 8],
+    ts_rel: &mut [i64; 8],
+    ts_fast: &mut [bool; 8],
+    ingest: &mut [i64; 8],
+    ing_fast: &mut [bool; 8],
+) {
+    let ff = unsafe { c(0xFF) };
+    for h in 0..2 {
+        unsafe {
+            // ts
+            let (hi, mid, t16, w3) = rows4(base, tvs, h);
+            let t17 = _mm256_or_si256(_mm256_srli_epi64::<8>(t16), _mm256_slli_epi64::<56>(w3));
+            let len = ld_len(tlen, h);
+            let (day, date_ok) = date(dates, hi, mid);
+            let t_ok = eq(_mm256_and_si256(_mm256_srli_epi64::<16>(mid), ff), b'T' as u64);
+            let (secs, hms_ok) = hms(_mm256_or_si256(_mm256_srli_epi64::<24>(mid), _mm256_slli_epi64::<40>(t16)));
+            let z = eq(_mm256_and_si256(_mm256_srli_epi64::<24>(t16), ff), b'Z' as u64);
+            let (off, off_ok) = offset(t17);
+            let dt_ok = _mm256_and_si256(date_ok, _mm256_and_si256(t_ok, hms_ok));
+            let f1 = _mm256_and_si256(eq(len, 20), _mm256_and_si256(z, dt_ok));
+            let f2 = _mm256_and_si256(eq(len, 25), _mm256_and_si256(off_ok, dt_ok));
+            let (dhi, hi_ok) = dec8(hi);
+            let (dlo, lo_ok) = dec8(_mm256_or_si256(_mm256_slli_epi64::<24>(mid), c(0x0030_3030)));
+            let f3 = _mm256_and_si256(eq(len, 13), _mm256_and_si256(hi_ok, lo_ok));
+            let local = _mm256_sub_epi64(
+                _mm256_add_epi64(_mm256_mul_epi32(day, _mm256_set1_epi64x(DAY_MS)), _mm256_mul_epu32(secs, _mm256_set1_epi64x(1000))),
+                _mm256_set1_epi64x(f.ws_frac),
+            );
+            let f12 = _mm256_sub_epi64(local, _mm256_and_si256(off, f2));
+            let v3 = _mm256_sub_epi64(_mm256_add_epi64(_mm256_mul_epu32(dhi, _mm256_set1_epi64x(100_000)), dlo), _mm256_set1_epi64x(f.ws_ms));
+            let ts = _mm256_blendv_epi8(f12, v3, f3);
+            _mm256_storeu_si256(ts_rel.as_mut_ptr().add(4 * h) as *mut __m256i, ts);
+            let fast = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(f1, _mm256_or_si256(f2, f3))));
+            put4(ts_fast, 4 * h, fast);
+            // ingest
+            let (hi, mid, t16, _) = rows4(base, ivs, h);
+            let len = ld_len(ilen, h);
+            let (day, date_ok) = date(dates, hi, mid);
+            let t_ok = eq(_mm256_and_si256(_mm256_srli_epi64::<16>(mid), ff), b'T' as u64);
+            let (secs, hms_ok) = hms(_mm256_or_si256(_mm256_srli_epi64::<24>(mid), _mm256_slli_epi64::<40>(t16)));
+            let z = eq(_mm256_and_si256(_mm256_srli_epi64::<24>(t16), ff), b'Z' as u64);
+            let v = _mm256_add_epi64(_mm256_add_epi64(_mm256_mul_epi32(day, _mm256_set1_epi64x(86_400)), secs), _mm256_set1_epi64x(f.ingest_add));
+            _mm256_storeu_si256(ingest.as_mut_ptr().add(4 * h) as *mut __m256i, v);
+            let okv = _mm256_and_si256(_mm256_and_si256(eq(len, 20), date_ok), _mm256_and_si256(_mm256_and_si256(t_ok, hms_ok), z));
+            let ok = _mm256_movemask_pd(_mm256_castsi256_pd(okv));
+            put4(ing_fast, 4 * h, ok);
+        }
+    }
+}
+
+/// `ts8` reading the field itself, as `ts_ingest_at`.
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn ts8_at(
+    f: &Fast,
+    dates: &Dates,
+    base: *const u8,
+    tvs: &[u32; 8],
+    tlen: &[u32; 8],
+    ts_rel: &mut [i64; 8],
+    ts_fast: &mut [bool; 8],
+) {
+    let ff = unsafe { c(0xFF) };
+    for h in 0..2 {
+        unsafe {
+            let (hi, mid, t16, w3) = rows4(base, tvs, h);
+            let t17 = _mm256_or_si256(_mm256_srli_epi64::<8>(t16), _mm256_slli_epi64::<56>(w3));
+            let len = ld_len(tlen, h);
+            let (day, date_ok) = date(dates, hi, mid);
+            let t_ok = eq(_mm256_and_si256(_mm256_srli_epi64::<16>(mid), ff), b'T' as u64);
+            let (secs, hms_ok) = hms(_mm256_or_si256(_mm256_srli_epi64::<24>(mid), _mm256_slli_epi64::<40>(t16)));
+            let z = eq(_mm256_and_si256(_mm256_srli_epi64::<24>(t16), ff), b'Z' as u64);
+            let (off, off_ok) = offset(t17);
+            let dt_ok = _mm256_and_si256(date_ok, _mm256_and_si256(t_ok, hms_ok));
+            let f1 = _mm256_and_si256(eq(len, 20), _mm256_and_si256(z, dt_ok));
+            let f2 = _mm256_and_si256(eq(len, 25), _mm256_and_si256(off_ok, dt_ok));
+            let (dhi, hi_ok) = dec8(hi);
+            let (dlo, lo_ok) = dec8(_mm256_or_si256(_mm256_slli_epi64::<24>(mid), c(0x0030_3030)));
+            let f3 = _mm256_and_si256(eq(len, 13), _mm256_and_si256(hi_ok, lo_ok));
+            let local = _mm256_sub_epi64(
+                _mm256_add_epi64(_mm256_mul_epi32(day, _mm256_set1_epi64x(DAY_MS)), _mm256_mul_epu32(secs, _mm256_set1_epi64x(1000))),
+                _mm256_set1_epi64x(f.ws_frac),
+            );
+            let f12 = _mm256_sub_epi64(local, _mm256_and_si256(off, f2));
+            let v3 = _mm256_sub_epi64(_mm256_add_epi64(_mm256_mul_epu32(dhi, _mm256_set1_epi64x(100_000)), dlo), _mm256_set1_epi64x(f.ws_ms));
+            let ts = _mm256_blendv_epi8(f12, v3, f3);
+            _mm256_storeu_si256(ts_rel.as_mut_ptr().add(4 * h) as *mut __m256i, ts);
+            let fast = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(f1, _mm256_or_si256(f2, f3))));
+            put4(ts_fast, 4 * h, fast);
+        }
+    }
+}
+
+/// The low 4 bits of `m` as 4 bools at `out[at..at + 4]` in one store: the multiply puts bit i at
+/// bit 8 * i (the four partial products do not overlap), the mask keeps those.
+#[inline(always)]
+unsafe fn put4(out: &mut [bool; 8], at: usize, m: i32) {
+    debug_assert!(at + 4 <= 8);
+    let v = ((m as u32) & 0xF).wrapping_mul(0x0020_4081) & 0x0101_0101;
+    unsafe { (out.as_mut_ptr().add(at) as *mut u32).write_unaligned(v.to_le()) };
 }

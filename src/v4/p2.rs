@@ -332,6 +332,8 @@ pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a
     gs.ck_in.clear();
     gs.ck_in.reserve(cap);
     let mut mask = gs.keys.len() - 1;
+    // The number of persons at which the map is first past half full (it then doubles).
+    let mut full = (mask + 1) / 2 + 1;
     let (mut keys, mut vals) = (gs.keys.as_mut_ptr(), gs.vals.as_mut_ptr());
     let used = gs.used.as_mut_ptr();
     let cur = gs.cur.as_mut_ptr();
@@ -376,8 +378,9 @@ pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a
                             *pks.add(k) = pk;
                             *cur.add(k) = [0, 0];
                             np += 1;
-                            if 2 * np > mask + 1 {
+                            if np == full {
                                 mask = grow(gs, std::slice::from_raw_parts(pks, np));
+                                full = (mask + 1) / 2 + 1;
                                 keys = gs.keys.as_mut_ptr();
                                 vals = gs.vals.as_mut_ptr();
                             }

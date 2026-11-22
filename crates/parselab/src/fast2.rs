@@ -398,21 +398,31 @@ unsafe fn flatten<const ISA: u8>(mut m: u64, nl: u64, fq: u64, base: u32, out: *
     (n + cnt, rank_bits::<2>(nl, d, cnt), rank_bits::<3>(fq, d, cnt))
 }
 
-/// Appends `cnt` bits to each flag stream at bit n (bits n & !63 .. n of the current words are in
-/// the accumulators; full words are stored).
+/// Appends `cnt` bits to each flag stream at bit n, as the asm loop does: bit k of a stream is
+/// bit k & 7 of byte k >> 3, so the bits go in at byte n >> 3 shifted by n & 7, OR-ed into that
+/// byte's earlier bits; the 8 bytes written leave zeros above (`nb`, `qb` hold nothing past cnt).
+/// Byte 0 of each stream must be 0 before the first call.
 #[inline(always)]
-unsafe fn put_bits(fl: *mut u64, n: usize, cnt: usize, nb: u64, qb: u64, acc: &mut (u64, u64)) {
-    let off = n & 63;
-    let wn = acc.0 as u128 | ((nb as u128) << off);
-    let wq = acc.1 as u128 | ((qb as u128) << off);
-    if off + cnt >= 64 {
+unsafe fn put_bits(fl: *mut u64, n: usize, cnt: usize, nb: u64, qb: u64) {
+    #[inline(always)]
+    unsafe fn put(base: *mut u8, n: usize, bits: u64) {
         unsafe {
-            *fl.add(n >> 6) = wn as u64;
-            *fl.add(FLW + (n >> 6)) = wq as u64;
+            let p = base.add(n >> 3);
+            (p as *mut u64).write_unaligned(u64::from(*p) | (bits << (n & 7)));
         }
-        *acc = ((wn >> 64) as u64, (wq >> 64) as u64);
-    } else {
-        *acc = (wn as u64, wq as u64);
+    }
+    unsafe {
+        let (a, b) = (fl as *mut u8, (fl as *mut u8).add(QOFF));
+        if cnt <= 56 {
+            put(a, n, nb);
+            put(b, n, qb);
+        } else {
+            // 57..64 separators in one block (dense text): two halves, each under 57 bits
+            put(a, n, nb & 0xFFFF_FFFF);
+            put(a, n + 32, nb >> 32);
+            put(b, n, qb & 0xFFFF_FFFF);
+            put(b, n + 32, qb >> 32);
+        }
     }
 }
 
@@ -904,7 +914,11 @@ unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: us
     let sep = sc.sep_mut();
     let viol = sc.viol.as_mut_ptr();
     let fl = sc.fl.as_mut_ptr();
-    let mut acc = (0u64, 0u64);
+    // byte 0 of each stream is OR-ed into by the first block
+    unsafe {
+        *fl = 0;
+        *fl.add(FLW) = 0;
+    }
     sc.wq0 = unsafe { *base.add(wpos) } == b'"';
     let mut b = wpos;
     let (mut c, mut q, mut n) = unsafe { masks64::<ISA>(base.add(b)) };
@@ -944,7 +958,7 @@ unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: us
         };
         #[cfg(not(target_arch = "x86_64"))]
         let (n2_, nb, qb) = unsafe { flatten::<ISA>(d, n, fq, rel, sep, nsep, fastp) };
-        unsafe { put_bits(fl, nsep, cnt, nb, qb, &mut acc) };
+        unsafe { put_bits(fl, nsep, cnt, nb, qb) };
         nsep = n2_;
         dprev = d >> 63;
         eprev = e >> 63;
@@ -955,8 +969,6 @@ unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: us
     }
     let _ = c;
     unsafe {
-        *fl.add(nsep >> 6) = acc.0;
-        *fl.add(FLW + (nsep >> 6)) = acc.1;
         *viol.add(nviol) = u32::MAX;
     }
     sc.nsep = nsep;
@@ -1086,22 +1098,28 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
     unsafe {
         for l in 0..LANES {
             // ve >= line start >= wpos >= PRE - pre, so ve - 8 >= -pre: inside the readable bytes.
-            w_e[l] = rd(base.offset(ln.ve[0][l] as isize - 8) as *const u64);
-            w_u[l] = rd(base.offset(ln.ve[1][l] as isize - 8) as *const u64);
-            for t in 0..3 {
-                le_w[t][l] = rd(base.offset(ln.ve[0][l] as isize - 32 + 8 * t as isize) as *const u64);
-                lu_w[t][l] = rd(base.offset(ln.ve[1][l] as isize - 32 + 8 * t as isize) as *const u64);
+            // AVX2 reads the ID words itself (`avx2::key1_at`).
+            if !(cfg!(target_arch = "x86_64") && ISA == fast::ISA_AVX2) {
+                w_e[l] = rd(base.offset(ln.ve[0][l] as isize - 8) as *const u64);
+                w_u[l] = rd(base.offset(ln.ve[1][l] as isize - 8) as *const u64);
+                for t in 0..3 {
+                    le_w[t][l] = rd(base.offset(ln.ve[0][l] as isize - 32 + 8 * t as isize) as *const u64);
+                    lu_w[t][l] = rd(base.offset(ln.ve[1][l] as isize - 32 + 8 * t as isize) as *const u64);
+                }
             }
             pre_u[l] = *base.add(ln.vs[1][l] as usize);
-            let t = base.add(ln.vs[2][l] as usize);
-            t_hi[l] = rd(t as *const u64);
-            t_mid[l] = rd(t.add(8) as *const u64);
-            t_16[l] = rd(t.add(16) as *const u64);
-            t_17[l] = rd(t.add(17) as *const u64);
-            let g = base.add(ln.vs[3][l] as usize);
-            i_hi[l] = rd(g as *const u64);
-            i_mid[l] = rd(g.add(8) as *const u64);
-            i_16[l] = rd(g.add(16) as *const u64);
+            // AVX2 reads the ts and ingest words itself (`avx2::ts_ingest_at`).
+            if !(cfg!(target_arch = "x86_64") && ISA == fast::ISA_AVX2) {
+                let t = base.add(ln.vs[2][l] as usize);
+                t_hi[l] = rd(t as *const u64);
+                t_mid[l] = rd(t.add(8) as *const u64);
+                t_16[l] = rd(t.add(16) as *const u64);
+                t_17[l] = rd(t.add(17) as *const u64);
+                let g = base.add(ln.vs[3][l] as usize);
+                i_hi[l] = rd(g as *const u64);
+                i_mid[l] = rd(g.add(8) as *const u64);
+                i_16[l] = rd(g.add(16) as *const u64);
+            }
             tw[l] = rd(base.add(ln.vs[4][l] as usize) as *const u64);
         }
     }
@@ -1131,7 +1149,10 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
             lens[0][l] = ln.ve[0][l] - ln.vs[0][l];
             lens[1][l] = ln.ve[1][l] - ln.vs[1][l];
         }
-        unsafe { crate::avx2::keys(&lens, &[pre, pre_u], [b'e', b'u'], [&w_e, &w_u], [&le_w, &lu_w], &mut kshort, &mut klong, &mut ka, &mut kb) };
+        unsafe {
+            crate::avx2::key1_at(base, &ln.ve[0], &lens[0], &pre, b'e', &mut kshort[0], &mut klong[0], &mut ka[0], &mut kb[0]);
+            crate::avx2::key1_at(base, &ln.ve[1], &lens[1], &pre_u, b'u', &mut kshort[1], &mut klong[1], &mut ka[1], &mut kb[1]);
+        }
         x_e = kshort[0];
         x_u = kshort[1];
     }
@@ -1161,7 +1182,7 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
             ilen[l] = ln.ve[3][l] - ln.vs[3][l];
         }
         unsafe {
-            crate::avx2::ts_ingest(f, dates, &tlen, &t_hi, &t_mid, &t_16, &t_17, &ilen, &i_hi, &i_mid, &i_16, &mut ts_rel, &mut ts_fast, &mut ingest, &mut ing_fast)
+            crate::avx2::ts_ingest_at(f, dates, base, &ln.vs[2], &tlen, &ln.vs[3], &ilen, &mut ts_rel, &mut ts_fast, &mut ingest, &mut ing_fast)
         };
     }
     for l in 0..LANES {
@@ -1257,7 +1278,81 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
         std::hint::black_box((&e_la, &u_la, &base_ok, &purchase, &ts_rel, &ts_fast, &ingest, &ing_fast));
         return;
     }
-    // Emit: batchable lanes into one batch, the rest one by one.
+    // Emit. The usual batch first: every lane has a decided ts and ingest, a keyed event ID and an
+    // ingest in range, and every surviving lane a keyed user ID, so lane l is record l: the decoded
+    // arrays go into the batch whole and its four masks are built once (no push per lane). Nothing
+    // reaches the sink before that is known; any other batch takes the lane loop below.
+    if ISA == fast::ISA_AVX2 {
+        let mut all = true;
+        let mut pm = 0u32; // valid purchases (the price decides whether they survive)
+        let mut sv = 0u32; // surviving lanes
+        for l in 0..LANES {
+            let ing_ok = (ingest[l] >= 0) & (ingest[l] < INGEST_LIMIT as i64);
+            let ev_ok = (x_e[l] != NONE40) | e_long[l];
+            all &= ts_fast[l] & ing_fast[l] & (ln.ve[0][l] != ln.vs[0][l]) & ev_ok & ing_ok;
+            pm |= ((purchase[l] & base_ok[l]) as u32) << l;
+            sv |= (base_ok[l] as u32) << l;
+        }
+        if all {
+            let mut out = EvBatch::default();
+            let mut pp = pm;
+            while pp != 0 {
+                let l = pp.trailing_zeros() as usize;
+                pp &= pp - 1;
+                let (ps, pe) = (ln.vs[6][l] as usize, ln.ve[6][l] as usize);
+                let (price, ok) = if pe - ps > 8 {
+                    match crate::ts::parse_price(&buf.data[ps..pe]) {
+                        Some(v) => (v, true),
+                        None => (0, false),
+                    }
+                } else {
+                    let (v, ok) = unsafe { fast::dec_field(base, ps, pe) };
+                    (v as u32, ok & (v >= 1) & (v <= 10_000_000))
+                };
+                if ok {
+                    out.price[l] = price;
+                } else {
+                    sv &= !(1u32 << l);
+                    pm &= !(1u32 << l);
+                }
+            }
+            let mut users_ok = true;
+            for l in 0..LANES {
+                let s = (sv >> l) & 1 != 0;
+                users_ok &= !s | (x_u[l] != NONE40) | u_long[l];
+            }
+            if users_ok {
+                let mut pp = pm;
+                while pp != 0 {
+                    let l = pp.trailing_zeros() as usize;
+                    pp &= pp - 1;
+                    out.cat[l] = fast::category(f, &buf.data[ln.vs[5][l] as usize..ln.ve[5][l] as usize]);
+                }
+                let (mut evl, mut usl) = (0u32, 0u32);
+                for l in 0..LANES {
+                    let s = (sv >> l) & 1 != 0;
+                    let e_short = x_e[l] != NONE40;
+                    out.ev_a[l] = if e_short { x_e[l] } else { e_la[l] };
+                    out.ev_b[l] = if e_short { 0 } else { e_lb[l] };
+                    evl |= (!e_short as u32) << l;
+                    let u_short = x_u[l] != NONE40;
+                    out.user_a[l] = if !s { 0 } else if u_short { x_u[l] } else { u_la[l] };
+                    out.user_b[l] = if !s | u_short { 0 } else { u_lb[l] };
+                    usl |= ((s & !u_short) as u32) << l;
+                    out.ts[l] = if s { ts_rel[l] as u32 } else { 0 };
+                    out.ingest[l] = ingest[l] as u32;
+                }
+                out.n = LANES as u32;
+                out.ev_long = evl as u8;
+                out.user_long = usl as u8;
+                out.surv = sv as u8;
+                out.purch = pm as u8;
+                sink.events(&out);
+                return;
+            }
+        }
+    }
+    // The lane loop: batchable lanes into one batch, the rest one by one.
     let mut out = EvBatch::default();
     for l in 0..LANES {
         let start = ln.ls[l] as usize;
@@ -1360,6 +1455,12 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
     // Phase A blocks read [b, b + 128); phase B reads up to 32 bytes past a line end.
     let a_limit = (len + buf.post).saturating_sub(256);
     let lo_ok = PRE.saturating_sub(buf.pre);
+    // the vector switches are set once, before any chunk is parsed: read them once per chunk
+    #[cfg(target_arch = "x86_64")]
+    let (vec512, mul256) = (
+        crate::fast3::VEC512.load(std::sync::atomic::Ordering::Relaxed) && crate::fast3::READY,
+        crate::fast3::MUL256.load(std::sync::atomic::Ordering::Relaxed),
+    );
     let mut start = fast::first_start(data, from);
     while start < to {
         if start < lo_ok || start + 512 > a_limit || len >= (u32::MAX as usize) - 1024 {
@@ -1404,14 +1505,15 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
             }
             if k + nf * LANES - 1 <= last
                 && (wpos + sc.pos(k + nf * (LANES - 1) - 1) + 1) < to
-                && sc.viol[vi] as usize > wpos + sc.pos(k + nf * LANES - 1)
+                // SAFETY: vi stays at or below the terminator entry phase A wrote (u32::MAX)
+                && unsafe { *sc.viol.get_unchecked(vi) } as usize > wpos + sc.pos(k + nf * LANES - 1)
                 && nl_pattern(sc, k, nf)
             {
                 unsafe {
                     if KIND == EVENTS {
                         #[cfg(target_arch = "x86_64")]
-                        if ISA == fast::ISA_AVX512 && crate::fast3::VEC512.load(std::sync::atomic::Ordering::Relaxed) && crate::fast3::READY {
-                            if crate::fast3::MUL256.load(std::sync::atomic::Ordering::Relaxed) {
+                        if ISA == fast::ISA_AVX512 && vec512 {
+                            if mul256 {
                                 crate::fast3::ev_batch::<true>(f, dates, buf.data.as_ptr(), sc, wpos, k, &mut ev_out);
                             } else {
                                 crate::fast3::ev_batch::<false>(f, dates, buf.data.as_ptr(), sc, wpos, k, &mut ev_out);
@@ -1425,10 +1527,9 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
                         #[cfg(target_arch = "x86_64")]
                         if ISA == fast::ISA_AVX512
                             && !f.camp32.is_empty()
-                            && crate::fast3::VEC512.load(std::sync::atomic::Ordering::Relaxed)
-                            && crate::fast3::READY
+                            && vec512
                         {
-                            if crate::fast3::MUL256.load(std::sync::atomic::Ordering::Relaxed) {
+                            if mul256 {
                                 crate::fast3::click_batch::<true>(f, dates, buf.data.as_ptr(), file, sc, wpos, k, &mut cl_out);
                             } else {
                                 crate::fast3::click_batch::<false>(f, dates, buf.data.as_ptr(), file, sc, wpos, k, &mut cl_out);
@@ -1500,7 +1601,24 @@ unsafe fn batch_clicks<'b, S: Sink, const ISA: u8>(
     let mut vs = [[0u32; LANES]; 4];
     let mut ve = [[0u32; LANES]; 4];
     let mut pre_k = [0u8; LANES];
+    // AVX2: all 8 lanes at once (as `batch`; k0 == 0 has no separator before its first line).
+    #[cfg(target_arch = "x86_64")]
+    let vecb = ISA == fast::ISA_AVX2 && k0 > 0;
+    #[cfg(not(target_arch = "x86_64"))]
+    let vecb = false;
+    #[cfg(target_arch = "x86_64")]
+    if vecb {
+        unsafe {
+            crate::avx2::bounds4(sc.sep_ptr().add(k0 - 1), wpos as u32, sc.q_window(k0), &mut ls, &mut end, &mut vs, &mut ve);
+            for l in 0..LANES {
+                pre_k[l] = *base.add(vs[0][l] as usize);
+            }
+        }
+    }
     for l in 0..LANES {
+        if vecb {
+            break;
+        }
         let kl = k0 + 4 * l;
         let _ = i0;
         let w = wpos as u32;
@@ -1533,18 +1651,24 @@ unsafe fn batch_clicks<'b, S: Sink, const ISA: u8>(
         for l in 0..LANES {
             // ve >= line start >= wpos >= PRE - pre, so ve - 8 >= -pre.
             w_k[l] = rd(base.offset(ve[0][l] as isize - 8) as *const u64);
-            w_u[l] = rd(base.offset(ve[1][l] as isize - 8) as *const u64);
-            for t in 0..3 {
-                lu_w[t][l] = rd(base.offset(ve[1][l] as isize - 32 + 8 * t as isize) as *const u64);
+            // AVX2 reads the user ID words itself (`avx2::key1_at`).
+            if !(cfg!(target_arch = "x86_64") && ISA == fast::ISA_AVX2) {
+                w_u[l] = rd(base.offset(ve[1][l] as isize - 8) as *const u64);
+                for t in 0..3 {
+                    lu_w[t][l] = rd(base.offset(ve[1][l] as isize - 32 + 8 * t as isize) as *const u64);
+                }
             }
             pre_u[l] = *base.add(vs[1][l] as usize);
             c_pre[l] = rd(base.add(vs[2][l] as usize) as *const u16);
             c_w[l] = rd(base.offset(ve[2][l] as isize - 8) as *const u64);
-            let t = base.add(vs[3][l] as usize);
-            t_hi[l] = rd(t as *const u64);
-            t_mid[l] = rd(t.add(8) as *const u64);
-            t_16[l] = rd(t.add(16) as *const u64);
-            t_17[l] = rd(t.add(17) as *const u64);
+            // AVX2 reads the ts words itself (`avx2::ts8_at`).
+            if !(cfg!(target_arch = "x86_64") && ISA == fast::ISA_AVX2) {
+                let t = base.add(vs[3][l] as usize);
+                t_hi[l] = rd(t as *const u64);
+                t_mid[l] = rd(t.add(8) as *const u64);
+                t_16[l] = rd(t.add(16) as *const u64);
+                t_17[l] = rd(t.add(17) as *const u64);
+            }
         }
     }
     let mut x_u = [0u64; LANES];
@@ -1555,19 +1679,39 @@ unsafe fn batch_clicks<'b, S: Sink, const ISA: u8>(
     let mut ts_fast = [false; LANES];
     let mut camp_n = [0u64; LANES];
     let mut camp_ok = [false; LANES];
+    // AVX2: the user IDs and the ts of the 8 lanes by the event batch's lane decoders.
+    #[cfg(target_arch = "x86_64")]
+    let vec2 = ISA == fast::ISA_AVX2;
+    #[cfg(not(target_arch = "x86_64"))]
+    let vec2 = false;
+    #[cfg(target_arch = "x86_64")]
+    if vec2 {
+        let mut ulen = [0u32; LANES];
+        let mut tlen = [0u32; LANES];
+        for l in 0..LANES {
+            ulen[l] = ve[1][l] - vs[1][l];
+            tlen[l] = ve[3][l] - vs[3][l];
+        }
+        unsafe {
+            crate::avx2::key1_at(base, &ve[1], &ulen, &pre_u, b'u', &mut x_u, &mut u_long, &mut u_la, &mut u_lb);
+            crate::avx2::ts8_at(f, dates, base, &vs[3], &tlen, &mut ts_rel, &mut ts_fast);
+        }
+    }
     for l in 0..LANES {
-        let lu = (ve[1][l] - vs[1][l]) as u64;
-        x_u[l] = id_from(w_u[l], lu.wrapping_sub(1), pre_u[l] == b'u');
-        let (a0, k0) = fast::hex8(lu_w[0][l]);
-        let (a1, k1) = fast::hex8(lu_w[1][l]);
-        let (b0, k2) = fast::hex8(lu_w[2][l]);
-        let (b1, k3) = fast::hex8(w_u[l]);
-        u_long[l] = (lu == 33) & (pre_u[l] == b'u') & k0 & k1 & k2 & k3;
-        u_la[l] = (a0 << 32) | a1;
-        u_lb[l] = (b0 << 32) | b1;
-        let (r, fs) = ts_lane(f, dates, ve[3][l] - vs[3][l], t_hi[l], t_mid[l], t_16[l], t_17[l]);
-        ts_rel[l] = r;
-        ts_fast[l] = fs;
+        if !vec2 {
+            let lu = (ve[1][l] - vs[1][l]) as u64;
+            x_u[l] = id_from(w_u[l], lu.wrapping_sub(1), pre_u[l] == b'u');
+            let (a0, k0) = fast::hex8(lu_w[0][l]);
+            let (a1, k1) = fast::hex8(lu_w[1][l]);
+            let (b0, k2) = fast::hex8(lu_w[2][l]);
+            let (b1, k3) = fast::hex8(w_u[l]);
+            u_long[l] = (lu == 33) & (pre_u[l] == b'u') & k0 & k1 & k2 & k3;
+            u_la[l] = (a0 << 32) | a1;
+            u_lb[l] = (b0 << 32) | b1;
+            let (r, fs) = ts_lane(f, dates, ve[3][l] - vs[3][l], t_hi[l], t_mid[l], t_16[l], t_17[l]);
+            ts_rel[l] = r;
+            ts_fast[l] = fs;
+        }
         // Campaign `c_` + 1..8 canonical digits (the numbered table's only possible keys).
         let kc = ((ve[2][l] - vs[2][l]) as u64).wrapping_sub(2);
         let kcl = kc.clamp(1, 8);

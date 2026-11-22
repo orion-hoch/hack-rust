@@ -43,6 +43,9 @@ fn parts(b: &[u64]) -> Result<(&[u32], &[u64]), Error> {
     Ok((ev, &b[2 + w..2 + w + m]))
 }
 
+/// Without the network, persons up to this many events are sorted (insertion) and walked.
+const SMALL_SORT: usize = 24;
+
 /// How a person is cut: the network up to `MAX` events (0 = never), slots above.
 trait Cut {
     const MAX: usize;
@@ -326,6 +329,12 @@ unsafe fn blocks_partition<C: Cut>(pb: &PersonBlocks, sc: &mut Scratch, out: &mu
             if ts.len() <= C::MAX {
                 // SAFETY: 1 <= len <= MAX; ts < 2^31 (31-bit field); room reserved above.
                 unsafe { C::net(&ts, out) };
+            } else if C::MAX == 0 && ts.len() <= SMALL_SORT {
+                // No network on this CPU: a small person by insertion sort and one walk, instead
+                // of the slot method's fixed scan of every bitmap word (the v3 kernel's own small
+                // path; same sessions, proved equal on sorted input).
+                sort_ts(&mut ts, &mut sc.tmp);
+                walk_sorted(&ts, out, core::ptr::null_mut());
             } else {
                 sc.next_serial();
                 person_slots(&ts, sc, out, core::ptr::null_mut());
