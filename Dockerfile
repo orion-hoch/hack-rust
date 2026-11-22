@@ -21,7 +21,7 @@ COPY src ./src
 # session stages sat on a boundary. Costs half a percent more instructions; CPUs without the
 # erratum lose nothing measurable.
 ARG X86_TARGET_CPU=x86-64-v3
-RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=${X86_TARGET_CPU} -C target-feature=+prefer-256-bit -C llvm-args=--x86-align-branch-boundary=32 -C llvm-args=--x86-align-branch=fused+jcc+jmp+call+ret+indirect -C llvm-args=--x86-pad-max-prefix-size=5"; fi; \
+RUN if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=skylake-avx512 -C target-feature=-avx512f,+prefer-256-bit -C llvm-args=--x86-align-branch-boundary=32 -C llvm-args=--x86-align-branch=fused+jcc+jmp+call+ret+indirect -C llvm-args=--x86-pad-max-prefix-size=5"; fi; \
     cargo build --release --locked && \
     cp target/release/engine /engine
 
