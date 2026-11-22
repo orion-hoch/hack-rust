@@ -33,6 +33,8 @@ pub mod net;
 mod measure;
 pub use measure::*;
 pub mod walk;
+mod blocks;
+pub use blocks::{sessions_blocks, PersonBlocks};
 
 pub const GAP: u32 = 1_800_000;
 pub const SLOT: u32 = 900_000;
@@ -120,6 +122,9 @@ pub enum Error {
     DayOutOfRange(usize),
     /// `walk`: inputs that do not belong together (sizes, or `out` not from these purchases).
     WalkInput,
+    /// `sessions_blocks`: a block shorter than its header says, or its purchases not matching
+    /// its purch bits.
+    BlockShape,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -132,6 +137,8 @@ pub struct Out {
     pub events: Vec<u32>,
     /// Per purchase (input order), the index of its session.
     pub buy_session: Vec<u32>,
+    /// `sessions_blocks`: per purchase (same order), its payload `cat | price << 8`.
+    pub buy_pay: Vec<u32>,
 }
 
 impl Out {
@@ -141,6 +148,7 @@ impl Out {
         self.start.clear();
         self.events.clear();
         self.buy_session.clear();
+        self.buy_pay.clear();
     }
 }
 

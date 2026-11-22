@@ -14,7 +14,7 @@
 use std::arch::x86_64::*;
 
 use crate::fast::{self, Buf, Fast};
-use crate::fast2::{BAD_DAY, DATE_SLOTS, Dates, POS_MASK, Q_FLAG, Scratch};
+use crate::fast2::{BAD_DAY, DATE_SLOTS, Dates, Scratch};
 use crate::ids::MASK40;
 use crate::records::*;
 use crate::reference;
@@ -477,8 +477,9 @@ unsafe fn dword_bytes(base: *const u8, idx: __m256i) -> __m256i {
 }
 
 /// Separator positions of 8 lines at stride `nf` (from k0), window-relative, and the line
-/// starts and quote-adjusted value bounds of every field. Entries carry the flags (newline,
-/// next byte is a quote) in bits 31 and 30.
+/// starts and quote-adjusted value bounds of every field. The entries are pure positions; the
+/// quote flag before field j of lane l is bit NF * l + j of the quote window from k0 (one load
+/// and one pext per field).
 #[inline(always)]
 unsafe fn bounds<const NF: usize>(sc: &Scratch, k0: usize) -> ([__m256i; NF], [__m256i; NF], __m256i, [__m256i; NF]) {
     unsafe {
@@ -489,8 +490,8 @@ unsafe fn bounds<const NF: usize>(sc: &Scratch, k0: usize) -> ([__m256i; NF], [_
             _mm512_loadu_si512(sp.add(32) as *const __m512i),
             _mm512_loadu_si512(sp.add(48) as *const __m512i),
         ];
-        let mut raw = [_mm256_setzero_si256(); NF];
-        for (j, r) in raw.iter_mut().enumerate() {
+        let mut sep = [_mm256_setzero_si256(); NF];
+        for (j, r) in sep.iter_mut().enumerate() {
             *r = if NF == 7 {
                 column(&z, j as u32)
             } else {
@@ -502,28 +503,19 @@ unsafe fn bounds<const NF: usize>(sc: &Scratch, k0: usize) -> ([__m256i; NF], [_
                 _mm512_castsi512_si256(_mm512_permutex2var_epi32(z[0], iv, z[1]))
             };
         }
-        let posm = _mm256_set1_epi32(POS_MASK as i32);
-        let qf = _mm256_set1_epi32(Q_FLAG as i32);
-        let mut sep = [_mm256_setzero_si256(); NF];
-        for j in 0..NF {
-            sep[j] = _mm256_and_si256(raw[j], posm);
-        }
         // The separator before each line's field 0: the previous line's newline (lane l - 1), or
         // for lane 0 the entry before k0 (the window start when k0 == 0).
-        let (prev_pos, prev_q) = if k0 == 0 { (-1i32, sc.wq0) } else {
-            let e = *sc.sep_ptr().add(k0 - 1);
-            ((e & POS_MASK) as i32, e & Q_FLAG != 0)
-        };
+        let prev_pos = if k0 == 0 { -1i32 } else { *sp.sub(1) as i32 };
+        let qw = sc.q_window(k0);
+        let lanes: u64 = if NF == 7 { 0x0002_0408_1020_4081 } else { 0x1111_1111 };
         let rot = _mm256_setr_epi32(7, 0, 1, 2, 3, 4, 5, 6);
-        let prev_raw = _mm256_permutexvar_epi32(rot, raw[NF - 1]);
-        let q0 = (_mm256_test_epi32_mask(prev_raw, qf) & !1) | prev_q as u8;
         let shifted = _mm256_permutexvar_epi32(rot, sep[NF - 1]);
         let ls = _mm256_add_epi32(_mm256_mask_set1_epi32(shifted, 1, prev_pos), _mm256_set1_epi32(1));
         let one = _mm256_set1_epi32(1);
         let mut vs = [_mm256_setzero_si256(); NF];
         let mut ve = [_mm256_setzero_si256(); NF];
         for j in 0..NF {
-            let q = if j == 0 { q0 } else { _mm256_test_epi32_mask(raw[j - 1], qf) };
+            let q = _pext_u64(qw, lanes << j) as u8;
             let s = if j == 0 { ls } else { _mm256_add_epi32(sep[j - 1], one) };
             vs[j] = _mm256_mask_add_epi32(s, q, s, one);
             ve[j] = _mm256_mask_sub_epi32(sep[j], q, sep[j], one);
@@ -541,6 +533,23 @@ pub(crate) struct Out<B> {
     pub(crate) foreign: u8,
     pub(crate) ls: [u32; 8],
     pub(crate) le: [u32; 8],
+    /// Event lanes whose ts alone is undecided (every other field decided, keyed, ingest fitting): if the
+    /// ts is not valid inside the window the copy is dead, and its record is pushed from these fields
+    /// without the reference. The arrays are set only when `dead` is nonzero.
+    pub(crate) dead: u8,
+    pub(crate) d_long: u8,
+    pub(crate) d_a: [u64; 8],
+    pub(crate) d_b: [u64; 8],
+    pub(crate) d_ing: [u32; 8],
+    /// The ts value bounds (window-relative, quotes excluded).
+    pub(crate) t_vs: [u32; 8],
+    pub(crate) t_ve: [u32; 8],
+}
+
+impl<B> Out<B> {
+    pub(crate) fn new(b: B) -> Out<B> {
+        Out { b, slow: 0, foreign: 0, ls: [0; 8], le: [0; 8], dead: 0, d_long: 0, d_a: [0; 8], d_b: [0; 8], d_ing: [0; 8], t_vs: [0; 8], t_ve: [0; 8] }
+    }
 }
 
 /// Decodes 8 event lines (separators from k0). Not generic over the sink, so its code is the same
@@ -692,6 +701,17 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         out.foreign = fast_ok & nonempty & !batchable;
         _mm256_storeu_si256(out.ls.as_mut_ptr() as *mut __m256i, ls);
         _mm256_storeu_si256(out.le.as_mut_ptr() as *mut __m256i, sep[6]);
+        // Lanes undecided only by their ts (dirty ts text is most of the slow lanes).
+        let dead = !ts_fast & ing_fast & ev_ok & nonempty & ing_fits;
+        out.dead = dead;
+        if dead != 0 {
+            out.d_long = e_long;
+            store64(e_a, &mut out.d_a);
+            store64(e_b, &mut out.d_b);
+            store32(ingest, &mut out.d_ing);
+            _mm256_storeu_si256(out.t_vs.as_mut_ptr() as *mut __m256i, vs[2]);
+            _mm256_storeu_si256(out.t_ve.as_mut_ptr() as *mut __m256i, ve[2]);
+        }
     }
 }
 
@@ -785,10 +805,22 @@ pub(crate) fn emit_events<'b, S: Sink>(f: &Fast, file: u32, buf: Buf<'b>, wpos: 
         sink.events(&out.b);
     }
     let mut rest = out.slow | out.foreign;
+    let mut dead = EvBatch::default();
     while rest != 0 {
         let l = rest.trailing_zeros() as usize;
         rest &= rest - 1;
         let start = wpos + out.ls[l] as usize;
+        if out.dead & (1 << l) != 0 {
+            // The reference makes a dead copy of a line whose ts is not valid inside the window (every
+            // other field of this lane is decided, keyed and fits): the same record, without it.
+            let tv = &buf.data[wpos + out.t_vs[l] as usize..wpos + out.t_ve[l] as usize];
+            let ok = crate::ts::parse_ts(tv).is_some_and(|t| f.ctx.window_start_ms <= t && t < f.ctx.window_end_ms);
+            if !ok {
+                let ev = Key { long: out.d_long & (1 << l) != 0, a: out.d_a[l], b: out.d_b[l] };
+                dead.push(ev, Key::default(), false, false, 0, out.d_ing[l], 0, 0);
+                continue;
+            }
+        }
         if out.slow & (1 << l) != 0 {
             fast::count_slow();
             let line = &buf.data[start..wpos + out.le[l] as usize];
@@ -796,6 +828,9 @@ pub(crate) fn emit_events<'b, S: Sink>(f: &Fast, file: u32, buf: Buf<'b>, wpos: 
         } else {
             sink.foreign_event(Locator::new(file, start as u64));
         }
+    }
+    if dead.n > 0 {
+        sink.events(&dead);
     }
 }
 

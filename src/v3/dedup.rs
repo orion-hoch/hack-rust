@@ -26,7 +26,7 @@
 //! Move-2 records: 8 bytes `person << 32 | ts << 1 | purchase`; purchases also
 //! `[person << 32 | ts, category | price << 8]`.
 
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 use super::persons::People;
 use super::sink::Special;
@@ -271,9 +271,19 @@ pub struct Out {
     /// Chunks come from the fast path's 8 KB block class for this pool participant (blocks the
     /// worker freed first: no fresh pages), or from `blocks` when NO_ARENA.
     arena: usize,
+    /// Bins whose chunks were handed back early (`free_bin`): skipped on drop.
+    freed: Vec<AtomicBool>,
+    /// Block-class mode: each bin's FIRST chunk is a 2 KB block (B2K), the rest 8 KB. Every
+    /// worker opens a chunk in every bin while its first partition runs, before the stage has
+    /// freed anything, so those opens are fresh memory (v4 I2 at 60M: 8 x 2048 x 2 opens = 229 MB
+    /// of fresh 8 KB blocks); later chunks recycle the input's freed blocks.
+    small: bool,
 }
 
 const NO_ARENA: usize = usize::MAX;
+
+/// Lines of a bin's first chunk in block-class mode (one 2 KB block).
+const SMALL_LINES: usize = 2048 / 64;
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
@@ -322,6 +332,8 @@ impl Out {
         let n = n.next_power_of_two();
         Out {
             arena: NO_ARENA,
+            freed: (0..n).map(|_| AtomicBool::new(false)).collect(),
+            small: false,
             mask: n - 1,
             stage: vec![Line([0; 8]); n],
             fill: vec![0; n],
@@ -334,6 +346,26 @@ impl Out {
             block_lines: block.next_power_of_two().div_ceil(8).max(2 * chunk_lines),
             chunk_lines,
         }
+    }
+
+    /// The staging lines (8 words per partition), the fill counts and the partition mask, for a
+    /// caller that writes `push` out in its own loop with these held in registers: the next free
+    /// word of partition q is `stage[8 * q + (fill[q] & 7)]`; after storing the eighth word the
+    /// caller zeroes `fill[q]` and calls `flush_line(q)`, otherwise it stores the count plus one.
+    /// The pointers stay valid for the life of `self` (the two vectors never grow).
+    #[inline(always)]
+    pub(crate) fn raw_parts(&mut self) -> (*mut u64, *mut u32, usize) {
+        (self.stage.as_mut_ptr().cast::<u64>(), self.fill.as_mut_ptr(), self.mask)
+    }
+
+    /// Flushes partition q's full staging line (see `raw_parts`).
+    ///
+    /// # Safety
+    /// `q <= mask`, and the line holds eight words.
+    #[inline(never)]
+    pub(crate) unsafe fn flush_line(&mut self, q: usize) {
+        // SAFETY: the caller's contract.
+        unsafe { self.flush(q) }
     }
 
     /// Appends `x` to partition `q & mask` (callers pass q below the partition count).
@@ -379,25 +411,35 @@ impl Out {
         // Only when the class is attached with 8 KB blocks: a block is then exactly one chunk.
         if b == BLOCK_BYTES && w < rt::pool::MAX_WORKERS {
             o.arena = w;
+            o.small = super::mem::B2K.block_size() == SMALL_LINES * 64;
         }
         o
+    }
+
+    /// Lines of bin q's current chunk (the first one is small in block-class mode).
+    #[inline(always)]
+    fn lines_of(&self, q: usize) -> usize {
+        if self.small && self.full[q].is_empty() { SMALL_LINES } else { self.chunk_lines }
     }
 
     #[cold]
     #[inline(never)]
     fn refill(&mut self, q: usize) {
         if !self.cur[q].is_null() {
-            // SAFETY: end[q] is chunk_lines lines past the start of the same chunk.
-            let start = unsafe { self.end[q].sub(self.chunk_lines) };
-            self.full[q].push((start as *const u64, (self.chunk_lines * 8) as u32));
+            let lines = self.lines_of(q);
+            // SAFETY: end[q] is `lines` lines past the start of the same chunk.
+            let start = unsafe { self.end[q].sub(lines) };
+            self.full[q].push((start as *const u64, (lines * 8) as u32));
         }
         if self.arena != NO_ARENA {
             // SAFETY: only this worker uses index `arena` while the stage runs (new_in's caller);
-            // the block is BLOCK_BYTES = chunk_lines lines, aligned to its size (so to 64 bytes).
-            let p = unsafe { super::mem::B8K.alloc(self.arena) } as *mut Line;
+            // a block is lines_of(q) lines (2 KB for a bin's first chunk, else BLOCK_BYTES),
+            // aligned to its size (so to 64 bytes).
+            let lines = self.lines_of(q);
+            let p = unsafe { if lines == SMALL_LINES && self.small { super::mem::B2K.alloc(self.arena) } else { super::mem::B8K.alloc(self.arena) } } as *mut Line;
             self.cur[q] = p;
-            // SAFETY: the block holds chunk_lines lines.
-            self.end[q] = unsafe { p.add(self.chunk_lines) };
+            // SAFETY: the block holds `lines` lines.
+            self.end[q] = unsafe { p.add(lines) };
             return;
         }
         if self.bump == self.bump_end {
@@ -440,9 +482,9 @@ impl Out {
                 }
             }
             if !self.cur[q].is_null() {
-                // SAFETY: end[q] is chunk_lines lines past the start of the chunk; cur[q] is
+                // SAFETY: end[q] is lines_of(q) lines past the start of the chunk; cur[q] is
                 // within it, and the last written line holds c records (8 when c is 0).
-                let start = unsafe { self.end[q].sub(self.chunk_lines) };
+                let start = unsafe { self.end[q].sub(self.lines_of(q)) };
                 let lines = (self.cur[q] as usize - start as usize) / 64;
                 let n = if c > 0 { (lines - 1) * 8 + c } else { lines * 8 };
                 if n > 0 {
@@ -460,10 +502,65 @@ impl Out {
         };
     }
 
+    /// Hands bin q's chunks back to the block class under participant `w` (block-class mode).
+    /// SAFETY: after `finish`; bin q is never read again; `w` is the caller's own participant
+    /// index; one call per bin (later ones do nothing).
+    pub unsafe fn free_bin(&self, q: usize, w: usize) {
+        if self.arena == NO_ARENA || self.freed[q].swap(true, Relaxed) {
+            return;
+        }
+        for (i, &(p, _)) in self.full[q].iter().enumerate() {
+            // SAFETY: each listed chunk is one whole block, B2K for a bin's first one when small,
+            // else B8K (caller's contract for the rest).
+            unsafe { self.free_chunk(w, i, p as *mut u8) };
+        }
+    }
+
+    /// Chunk i of a bin back to its class under participant `w`.
+    /// SAFETY: `p` is chunk i of a bin of this Out, dead from here on.
+    #[inline(always)]
+    unsafe fn free_chunk(&self, w: usize, i: usize, p: *mut u8) {
+        unsafe {
+            if i == 0 && self.small {
+                super::mem::B2K.free(w, p);
+            } else {
+                super::mem::B8K.free(w, p);
+            }
+        }
+    }
+
     /// The finished chunks of partition `q` (after `finish`).
     pub fn slices(&self, q: usize) -> impl Iterator<Item = &[u64]> + '_ {
         // SAFETY: each (ptr, len) is a written prefix of a chunk inside a block owned by self.
         self.full[q].iter().map(|&(p, n)| unsafe { std::slice::from_raw_parts(p, n as usize) })
+    }
+}
+
+/// Block-class chunks go back to the class on drop, on every path (a decline to v3 included), so
+/// whatever runs next takes them before fresh memory. Dropped where no pool run is active (the
+/// driver, between stages), so participant `arena`'s list is not in use elsewhere.
+impl Drop for Out {
+    fn drop(&mut self) {
+        if self.arena == NO_ARENA {
+            return;
+        }
+        let w = self.arena;
+        // SAFETY: in block-class mode every chunk is one whole B8K block from alloc(w), listed
+        // once (closed chunks in `full`, the open one by cur/end), dead once its Out is dropped.
+        unsafe {
+            for q in 0..self.cur.len() {
+                if self.freed[q].load(Relaxed) {
+                    continue;
+                }
+                if !self.cur[q].is_null() {
+                    let i = self.full[q].len();
+                    self.free_chunk(w, i, self.end[q].sub(self.lines_of(q)) as *mut u8);
+                }
+                for (i, &(p, _)) in self.full[q].iter().enumerate() {
+                    self.free_chunk(w, i, p as *mut u8);
+                }
+            }
+        }
     }
 }
 

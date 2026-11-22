@@ -48,7 +48,7 @@ unsafe extern "C" {
 
 /// (system CPU ms, minor faults, major faults) of the whole process so far.
 /// (user ms, system ms, minor faults, major faults) of the whole process so far.
-fn usage() -> (f64, f64, i64, i64) {
+pub(crate) fn usage() -> (f64, f64, i64, i64) {
     let mut r = Rusage::default();
     // SAFETY: `r` is a writable struct with the layout of Linux `struct rusage`.
     unsafe { getrusage(0, &mut r) };
@@ -90,7 +90,18 @@ impl Clock {
 /// same files as `Dataset::open` (regular `*.csv`, not starting with '.', in name order).
 /// Err(why) when a folder holds more files than the parser's locator can number (named refusal,
 /// decided before anything is mapped).
-fn open_rt(dir: &Path) -> io::Result<Result<(Dataset, &'static rt::input::Inputs), String>> {
+pub(crate) fn open_rt(dir: &Path) -> io::Result<Result<(Dataset, &'static rt::input::Inputs), String>> {
+    let r = open_rt_files(dir)?;
+    Ok(r.map(|(mut ds, inp)| {
+        let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_default();
+        (ds.products, ds.campaigns, ds.manifest) = (read("products.csv"), read("campaigns.csv"), read("manifest.json"));
+        (ds, inp)
+    }))
+}
+
+/// `open_rt` without the side tables (products, campaigns and manifest left empty): for a caller
+/// that reads them on another thread meanwhile.
+pub(crate) fn open_rt_files(dir: &Path) -> io::Result<Result<(Dataset, &'static rt::input::Inputs), String>> {
     use std::os::unix::ffi::OsStrExt;
     let errno = |e: rt::sys::Errno| io::Error::from_raw_os_error(e.0);
     let subs = ["events", "clicks", "links"];
@@ -122,8 +133,7 @@ fn open_rt(dir: &Path) -> io::Result<Result<(Dataset, &'static rt::input::Inputs
             })
             .collect()
     });
-    let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_default();
-    let ds = Dataset { dir: dir.to_path_buf(), files, products: read("products.csv"), campaigns: read("campaigns.csv"), manifest: read("manifest.json") };
+    let ds = Dataset { dir: dir.to_path_buf(), files, products: Vec::new(), campaigns: Vec::new(), manifest: Vec::new() };
     Ok(Ok((ds, inp)))
 }
 

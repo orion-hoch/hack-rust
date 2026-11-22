@@ -11,6 +11,7 @@ mod csv;
 mod dedup;
 mod fast;
 mod v3;
+mod v4;
 mod hash;
 mod id;
 mod input;
@@ -360,21 +361,38 @@ pub fn huge_pages(input_bytes: u64) {
     alloc::set_thp_budget(budget);
 }
 
+/// Removes whatever a declined fast path wrote, so the next path starts clean.
+fn clear_outputs(out: &std::path::Path) {
+    for table in ["user_daily", "campaign_daily"] {
+        let dir = out.join(table);
+        if dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&dir) {
+                eprintln!("engine: cannot clear {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 fn main() {
+    v4::lap("main");
     // First, while single-threaded: grow the descriptor table (growing it once threads share it
     // waits an RCU grace period, 11 to 22 ms measured on the x86 box) and start the stage clock.
     rt::init(0);
     let cfg = config();
-    if env::var_os("ENGINE_PATH").is_some_and(|v| v == "v1") {
+    let retry = env::var_os("ENGINE_PATH").filter(|v| v == "v1" || v == "v3");
+    if retry.is_some() {
         // Possibly started by rt's fallback after a fault: no fast-path thread exists any more,
         // so this removes whatever partial output it left, race-free.
         use std::os::unix::ffi::OsStrExt;
         for table in ["user_daily", "campaign_daily"] {
             rt::out::sweep(cfg.out.join(table).as_os_str().as_bytes());
         }
-    } else {
+    }
+    if retry.as_ref().is_none_or(|v| v != "v1") {
         // SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT or SIGTRAP anywhere in the fast path: rt removes
-        // its output and re-executes this binary with ENGINE_PATH=v1 (on the thread's alt stack).
+        // its output and re-executes this binary with ENGINE_PATH=v1 (v3 while v4 runs), on the
+        // thread's alt stack.
         rt::fail::install();
     }
     // The dataset-level switch: the fast path when the ID keys are recovered (or forced), v1
@@ -384,7 +402,30 @@ fn main() {
         // A refusal, failed check or I/O error in the fast path falls back to v1 here, after
         // removing whatever the fast path may have written. A panic (panic = "abort") or a fault
         // signal goes through rt's handler instead: it re-executes this binary with ENGINE_PATH=v1.
-        let fast = v3::try_run(&cfg.data, &cfg.out, cfg.threads, cfg.timing);
+        // ENGINE_V4=1: the user-partitioned pipeline first; whatever it declines goes to v3 after
+        // its partial output is cleared.
+        let mut fast = Ok(fast::Outcome::Fallback(String::new()));
+        if path != "v3" && env::var_os("ENGINE_V4").is_none_or(|v| v != "0") {
+            // A fault inside v4 re-executes with ENGINE_PATH=v3 (which sweeps the output first).
+            rt::fail::retry_v3(true);
+            fast = v4::try_run(&cfg.data, &cfg.out, cfg.threads, cfg.timing);
+            rt::fail::retry_v3(false);
+            // Every route out of v4 but Done clears what its workers may already have written.
+            match &fast {
+                Ok(fast::Outcome::Done) => {}
+                Ok(fast::Outcome::Fallback(why)) => {
+                    eprintln!("engine: v4 declined ({why}); running v3");
+                    clear_outputs(&cfg.out);
+                }
+                Err(e) => {
+                    eprintln!("engine: v4 failed ({e}); running v3");
+                    clear_outputs(&cfg.out);
+                }
+            }
+        }
+        if !matches!(fast, Ok(fast::Outcome::Done)) {
+            fast = v3::try_run(&cfg.data, &cfg.out, cfg.threads, cfg.timing);
+        }
         let why = match fast {
             // Done: release input and memory in parallel, then exit_group (no destructors); with
             // everything still mapped the kernel's single-thread teardown took 80 to 90 ms.
@@ -403,15 +444,7 @@ fn main() {
             std::process::exit(2);
         }
         eprintln!("engine: fast path declined ({why}); running v1");
-        for table in ["user_daily", "campaign_daily"] {
-            let dir = cfg.out.join(table);
-            if dir.exists() {
-                if let Err(e) = fs::remove_dir_all(&dir) {
-                    eprintln!("engine: cannot clear {}: {e}", dir.display());
-                    std::process::exit(1);
-                }
-            }
-        }
+        clear_outputs(&cfg.out);
     }
     if let Err(e) = run(&cfg) {
         eprintln!("engine: {e}");

@@ -45,8 +45,17 @@ static SCRATCH: Scratch = Scratch {
     envp: UnsafeCell::new([0; MAX_PTRS]),
 };
 
+/// Where a failure re-executes to: false = ENGINE_PATH=v1 (the general engine), true =
+/// ENGINE_PATH=v3 (set while a newer fast path runs, so its faults fall back to v3, not to v1).
+static TO_V3: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// While on, a failure re-executes with ENGINE_PATH=v3 instead of v1.
+pub fn retry_v3(on: bool) {
+    TO_V3.store(on, Release);
+}
+
 /// Abandons the fast path: removes partial output and re-executes this binary with
-/// ENGINE_PATH=v1. Never returns.
+/// ENGINE_PATH=v1 (or v3, see `retry_v3`). Never returns.
 pub fn fail(reason: &[u8]) -> ! {
     claim();
     let mut b = Buf::<512>::new();
@@ -120,6 +129,10 @@ fn reexec() -> ! {
             continue;
         }
         if var.starts_with(b"ENGINE_PATH=") {
+            if var == b"ENGINE_PATH=v3" {
+                // This run already is the v3 retry: its failure goes to v1.
+                TO_V3.store(false, Release);
+            }
             if var == b"ENGINE_PATH=v1" {
                 crate::fmt::eprint(&[b"rt: already in the general engine; not re-executing\n"]);
                 sys::exit_group(70);
@@ -129,9 +142,9 @@ fn reexec() -> ! {
         envp[nv] = env.as_ptr() as usize + s;
         nv += 1;
     }
-    // Append ENGINE_PATH=v1 after the copied block.
+    // Append ENGINE_PATH=v1 (or v3) after the copied block.
     let tail = ARG_BYTES;
-    let v = b"ENGINE_PATH=v1\0";
+    let v = if TO_V3.load(Acquire) { b"ENGINE_PATH=v3\0" } else { b"ENGINE_PATH=v1\0" };
     env[tail..tail + v.len()].copy_from_slice(v);
     envp[nv] = env.as_ptr() as usize + tail;
     envp[nv + 1] = 0;

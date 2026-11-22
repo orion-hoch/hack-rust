@@ -1,12 +1,12 @@
 //! Event lines, v2: line structure per 64-byte block, decoding 8 lines at a time.
 //!
 //! Phase A walks a window of the buffer in 64-byte blocks: comma, quote and newline masks; every
-//! separator flattened into `sep` as a window-relative position with two flags (newline; the next
-//! byte is a quote); quote legality as mask identities with
+//! separator flattened into `sep` as a window-relative position, its two flags (newline; the next
+//! byte is a quote) as bit k of two bit streams; quote legality as mask identities with
 //! carries across blocks, any violation position into `viol`.
 //!
 //! Phase B takes 8 consecutive lines whose separators sit at stride 7 (6 commas and the newline)
-//! and no violation: field bounds come from `sep` and its flags, and the decoders run lane-wise on
+//! and no violation: field bounds come from `sep` and the flag streams, and the decoders run lane-wise on
 //! [u64; 8] arrays (the same arithmetic as v1, so it vectorizes with the target features of the
 //! entry function). Any other line goes through the v1 per-line path, which falls back to the
 //! reference itself, so every line ends up exact.
@@ -51,14 +51,32 @@ impl Drop for ScratchGuard {
     }
 }
 
-/// A separator entry: window-relative position (bits 0..30), bit 31 set when the separator is a
-/// newline, bit 30 set when the byte after it is a quote (the next field is quoted).
-pub(crate) const NL_FLAG: u32 = 1 << 31;
-pub(crate) const Q_FLAG: u32 = 1 << 30;
-pub(crate) const POS_MASK: u32 = (1 << 30) - 1;
+/// The OLD separator entry format (position in bits 0..30, bit 31 newline, bit 30 next byte is a
+/// quote): only the differential test's oracle `phase_a_avx512` still writes it.
+const NL_FLAG: u32 = 1 << 31;
+const Q_FLAG: u32 = 1 << 30;
+const POS_MASK: u32 = (1 << 30) - 1;
 
+/// Words per flag stream: a window has at most W + 64 separators, and the asm's last stream store
+/// writes 8 bytes from the byte holding the last bit; rounded up generously.
+const FLW: usize = W / 64 + 16;
+/// Byte distance from the newline stream to the quote stream in `Scratch::fl`.
+const QOFF: usize = FLW * 8;
+/// Phase A's software prefetch distance (bytes ahead of the block being decoded).
+const PF_DIST: usize = 4096;
+
+/// Phase A's output for one window. `sep` holds pure window-relative separator positions; the
+/// two flags of separator k are bit k of two bit streams in `fl` (little-endian bit order: bit k
+/// is bit k & 7 of byte k >> 3): the newline stream (separator k is a newline) and the quote
+/// stream (the byte after separator k is a quote, so the next field is quoted).
 pub(crate) struct Scratch {
     sep: Vec<u32>,
+    /// Offset of the first entry in `sep`: entries start 64-byte aligned, because the asm derives
+    /// stream bit k from the entry address (k = (address - start) / 4, byte k >> 3 = address >> 5
+    /// minus a constant).
+    so: usize,
+    /// FLW words of newline stream, then FLW words of quote stream.
+    fl: Vec<u64>,
     /// Index in `sep` of the last newline of the window (valid when `has_nl`).
     last_nl: usize,
     has_nl: bool,
@@ -72,73 +90,89 @@ pub(crate) struct Scratch {
 impl Scratch {
     #[inline(always)]
     pub(crate) fn sep_ptr(&self) -> *const u32 {
-        self.sep.as_ptr()
+        unsafe { self.sep.as_ptr().add(self.so) }
+    }
+    #[inline(always)]
+    fn sep_mut(&mut self) -> *mut u32 {
+        unsafe { self.sep.as_mut_ptr().add(self.so) }
     }
     /// Window-relative position of separator k.
     #[inline(always)]
     fn pos(&self, k: usize) -> usize {
-        (self.sep[k] & POS_MASK) as usize
+        unsafe { *self.sep_ptr().add(k) as usize }
+    }
+    /// Newline flags of separators k.. (bit 0 = separator k; 57 bits are from the stream).
+    #[inline(always)]
+    pub(crate) fn nl_bits(&self, k: usize) -> u64 {
+        debug_assert!((k >> 3) + 8 <= QOFF);
+        unsafe { rd((self.fl.as_ptr() as *const u8).add(k >> 3) as *const u64) >> (k & 7) }
+    }
+    /// Quote-after flags of separators k.. (bit 0 = separator k; 57 bits are from the stream).
+    #[inline(always)]
+    pub(crate) fn q_bits(&self, k: usize) -> u64 {
+        debug_assert!((k >> 3) + 8 <= QOFF);
+        unsafe { rd((self.fl.as_ptr() as *const u8).add(QOFF + (k >> 3)) as *const u64) >> (k & 7) }
+    }
+    /// Quote flags before the fields of the separators from k: bit 0 for the field that starts
+    /// at the line start before separator k (the flag of separator k - 1, or `wq0` when k == 0),
+    /// bit i for the field after separator k + i - 1. 57 bits valid.
+    #[inline(always)]
+    pub(crate) fn q_window(&self, k: usize) -> u64 {
+        if k == 0 { (self.q_bits(0) << 1) | self.wq0 as u64 } else { self.q_bits(k - 1) }
+    }
+    /// Whether the byte after separator k is a quote.
+    #[inline(always)]
+    fn q_after(&self, k: usize) -> bool {
+        self.q_bits(k) & 1 != 0
     }
     /// Index of the first newline separator at or after k (k <= last_nl).
     #[inline(always)]
     fn next_nl(&self, k: usize) -> usize {
         let mut k = k;
-        while self.sep[k] & NL_FLAG == 0 {
-            k += 1;
+        loop {
+            let w = self.nl_bits(k) & ((1u64 << 56) - 1);
+            if w != 0 {
+                return k + w.trailing_zeros() as usize;
+            }
+            k += 56;
         }
-        k
+    }
+    /// last_nl and has_nl from the newline stream (the window ends inside a line).
+    #[inline(always)]
+    fn set_last_nl(&mut self) {
+        let mut k = self.nsep;
+        while k > 0 {
+            let lo = k.saturating_sub(56);
+            let w = self.nl_bits(lo) & ((1u64 << (k - lo)) - 1);
+            if w != 0 {
+                self.last_nl = lo + 63 - w.leading_zeros() as usize;
+                self.has_nl = true;
+                return;
+            }
+            k = lo;
+        }
+        self.last_nl = 0;
+        self.has_nl = false;
     }
     /// Window-relative start of the line whose first separator is k.
     #[inline(always)]
     fn line_start(&self, k: usize) -> usize {
         if k == 0 { 0 } else { self.pos(k - 1) + 1 }
     }
-    /// Whether separator k - 1 (the one before field 0 of the line starting at k) is followed by a
-    /// quote.
-    #[inline(always)]
-    fn q_before(&self, k: usize) -> bool {
-        if k == 0 { self.wq0 } else { self.sep[k - 1] & Q_FLAG != 0 }
-    }
     fn new() -> Scratch {
         let n = W + 256;
-        Scratch { sep: vec![0; n + 128], last_nl: 0, has_nl: false, wq0: false, viol: vec![0; n + 64], nsep: 0, nviol: 0 }
+        let sep = vec![0u32; n + 128 + 16];
+        let so = ((64 - (sep.as_ptr() as usize & 63)) & 63) / 4;
+        Scratch { sep, so, fl: vec![0; 2 * FLW], last_nl: 0, has_nl: false, wq0: false, viol: vec![0; n + 64], nsep: 0, nviol: 0 }
     }
 }
 
 /// Whether the 8 * nf entries from k are 8 well-formed lines: a newline exactly at every nf-th.
 #[inline(always)]
-unsafe fn nl_pattern<const ISA: u8>(sc: &Scratch, k: usize, nf: usize) -> bool {
-    let n = 8 * nf;
-    let p = unsafe { sc.sep.as_ptr().add(k) };
-    let mut bits = 0u64;
-    #[cfg(target_arch = "x86_64")]
-    {
-        if ISA != fast::ISA_SCALAR {
-            for c in 0..n.div_ceil(8) {
-                bits |= (unsafe { signs8(p.add(8 * c)) } as u64) << (8 * c);
-            }
-        } else {
-            for i in 0..n {
-                bits |= ((unsafe { *p.add(i) } >> 31) as u64) << i;
-            }
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    for i in 0..n {
-        bits |= ((unsafe { *p.add(i) } >> 31) as u64) << i;
-    }
-    let span = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+fn nl_pattern(sc: &Scratch, k: usize, nf: usize) -> bool {
+    let span = (1u64 << (8 * nf)) - 1;
     let pattern: u64 = if nf == 7 { 0x0081_0204_0810_2040 } else { 0x8888_8888 };
-    bits & span == pattern
-}
-
-/// The sign bits (newline flags) of 8 entries.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn signs8(p: *const u32) -> u32 {
-    use std::arch::x86_64::*;
-    unsafe { _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_loadu_si256(p as *const __m256i))) as u32 }
+    sc.nl_bits(k) & span == pattern
 }
 
 /// Days table indexed by (year - y0) * 384 + month * 32 + day, for two years.
@@ -257,27 +291,53 @@ unsafe fn pext_bmi2(x: u64, mask: u64) -> u64 {
     std::arch::x86_64::_pext_u64(x, mask)
 }
 
-/// Writes the entries of the set bits of `m` (position base + bit, flags from `nl` and `fq`) at
-/// out[n..]; returns the new n.
+/// Writes the positions of the set bits of `m` (base + bit) at out[n..]; returns the new n and
+/// the flags of those separators as bit strings (bit i = the i-th separator; `nl` and `fq` are
+/// indexed by byte), without pext (microcoded on Zen 2).
 #[inline(always)]
-unsafe fn flatten(mut m: u64, nl: u64, fq: u64, base: u32, out: *mut u32, n: usize) -> usize {
+unsafe fn flatten(mut m: u64, nl: u64, fq: u64, base: u32, out: *mut u32, n: usize) -> (usize, u64, u64) {
     let cnt = m.count_ones() as usize;
     let p = unsafe { out.add(n) };
-    let entry = |t: u32| (base + t) | (((nl >> t) as u32 & 1) << 31) | (((fq >> t) as u32 & 1) << 30);
+    let (mut nb, mut qb) = (0u64, 0u64);
     for i in 0..8 {
         let t = m.trailing_zeros() & 63;
-        unsafe { *p.add(i) = entry(t) };
+        unsafe { *p.add(i) = base + t };
+        nb |= ((nl >> t) & 1) << i;
+        qb |= ((fq >> t) & 1) << i;
         m &= m.wrapping_sub(1);
     }
     if cnt > 8 {
         let mut i = 8;
         while m != 0 {
-            unsafe { *p.add(i) = entry(m.trailing_zeros()) };
+            let t = m.trailing_zeros();
+            unsafe { *p.add(i) = base + t };
+            nb |= ((nl >> t) & 1) << i;
+            qb |= ((fq >> t) & 1) << i;
             m &= m.wrapping_sub(1);
             i += 1;
         }
     }
-    n + cnt
+    // The fixed steps past the last separator read bit 0: drop those.
+    let keep = if cnt >= 64 { u64::MAX } else { (1u64 << cnt) - 1 };
+    (n + cnt, nb & keep, qb & keep)
+}
+
+/// Appends `cnt` bits to each flag stream at bit n (bits n & !63 .. n of the current words are in
+/// the accumulators; full words are stored).
+#[inline(always)]
+unsafe fn put_bits(fl: *mut u64, n: usize, cnt: usize, nb: u64, qb: u64, acc: &mut (u64, u64)) {
+    let off = n & 63;
+    let wn = acc.0 as u128 | ((nb as u128) << off);
+    let wq = acc.1 as u128 | ((qb as u128) << off);
+    if off + cnt >= 64 {
+        unsafe {
+            *fl.add(n >> 6) = wn as u64;
+            *fl.add(FLW + (n >> 6)) = wq as u64;
+        }
+        *acc = ((wn >> 64) as u64, (wq >> 64) as u64);
+    } else {
+        *acc = (wn as u64, wq as u64);
+    }
 }
 
 /// Plain position list (the violation list).
@@ -292,25 +352,21 @@ unsafe fn flatten_pos(mut m: u64, base: u32, out: *mut u32, n: usize) -> usize {
     i
 }
 
-/// Separator entries of one block by compress (AVX-512F vpcompressd in 16-bit pieces), flags
-/// set by masked ors: writes out[n..n + popcnt(m)] (and up to 16 more entries of scratch).
+/// Separator positions of one block by compress (AVX-512F vpcompressd in 16-bit pieces): writes
+/// out[n..n + popcnt(m)] (and up to 16 more entries of scratch).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline]
-unsafe fn flatten_compress(m: u64, nl: u64, fq: u64, base: u32, out: *mut u32, n: usize) -> usize {
+unsafe fn flatten_compress(m: u64, base: u32, out: *mut u32, n: usize) -> usize {
     use std::arch::x86_64::*;
     let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let b = _mm512_add_epi32(_mm512_set1_epi32(base as i32), iota);
-    let nlf = _mm512_set1_epi32(NL_FLAG as i32);
-    let qf = _mm512_set1_epi32(Q_FLAG as i32);
     let mut n = n;
     let pieces = [0i32, 16, 32, 48];
     for (piece, &off) in pieces.iter().enumerate() {
         let sh = 16 * piece as u32;
         let k = (m >> sh) as u16;
         let v = _mm512_add_epi32(b, _mm512_set1_epi32(off));
-        let v = _mm512_mask_or_epi32(v, (nl >> sh) as u16, v, nlf);
-        let v = _mm512_mask_or_epi32(v, (fq >> sh) as u16, v, qf);
         let v = _mm512_maskz_compress_epi32(k, v);
         unsafe { _mm512_storeu_si512(out.add(n) as *mut __m512i, v) };
         n += k.count_ones() as usize;
@@ -386,26 +442,39 @@ unsafe fn phase_a_avx512(p0: *const u8, nblocks: usize, pf: usize, sep: *mut u32
     }
 }
 
-/// Phase A, the same function as `phase_a_avx512` (same entries, violations and count), as one
-/// assembly loop with a register plan: two blocks per iteration with the roles of the mask
-/// registers swapped (no moves), the carry as a borrow in rcx (`sbb`: s - d - borrow equals
-/// !d + s + carry, and the borrow out is the carry out inverted), `q & !(fs ^ fe)` for the two
-/// quote-placement terms, the piece offsets from prefix popcounts, the newline and comma masks
-/// shifted in mask registers. Violations are recorded as (mask, block) pairs in `vbuf` (rare
-/// path, cursor in xmm15) and expanded in order afterwards. Reads [p0, p0 + 64 * nblocks + 64).
+/// Phase A as one assembly loop (v3): positions into `sep` (64-byte aligned), the newline and
+/// quote-after flags as two bit streams in `fl` (bit k = separator k), violations into `viol`.
+/// Returns the number of separators, or None when a block holds more than 56 separators (the
+/// stream append below assumes 7 + count <= 63 bits; the caller then redoes the window portably).
+///
+/// Register plan: two blocks per iteration with the roles of the mask registers swapped (no
+/// moves); the carry as a borrow in rcx (`sbb`: s - d - borrow equals !d + s + carry, and the
+/// borrow out is the carry out inverted); `q & !(fs ^ fe)` for the two quote-placement terms.
+/// Per block, no masked ors: the separator mask stays in a k register (piece 0's compress mask;
+/// three kshiftrq for the others; `kmovw k, m16` was tried and costs a port-5 uop too). The
+/// flags: pext(n, d) and
+/// pext(fq, d) (port 1), shifted by s = count & 7, OR-ed with the stream's current byte (byte
+/// count >> 3, which the previous block's 8-byte store holds with zeros above its bits, so the
+/// load forwards) and stored as 8 bytes; count is (out - sep) / 4, so the stream byte is
+/// out >> 5 plus a constant (rdx) and s = (out >> 2) & 7. Violations are recorded as (mask, block)
+/// pairs in `vbuf` (rare path, cursor in xmm15) and expanded in order afterwards. Reads
+/// [p0, p0 + 64 * nblocks + 64).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,bmi1,bmi2,popcnt,lzcnt")]
 #[inline(never)]
-unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut u32, viol: &mut ViolList) -> usize {
+unsafe fn phase_a_avx512_v3(p0: *const u8, nblocks: usize, sep: *mut u32, fl: *mut u64, viol: &mut ViolList) -> Option<usize> {
     use std::arch::x86_64::*;
     const VB: usize = W / 64 + 8;
     if nblocks == 0 {
-        return 0;
+        return Some(0);
     }
-    if nblocks > VB {
-        return unsafe { phase_a_avx512(p0, nblocks, pf, sep, viol) };
+    if nblocks > VB || sep as usize & 31 != 0 {
+        return None;
     }
     unsafe {
+        // Byte 0 of each stream is OR-ed into by the first block.
+        *fl = 0;
+        *fl.add(FLW) = 0;
         let v = _mm512_loadu_si512(p0 as *const __m512i);
         let q0: u64 = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
         let kn0: __mmask64 = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
@@ -413,7 +482,9 @@ unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut 
         let mut vbuf = [0u64; 2 * VB];
         let vstart = vbuf.as_mut_ptr() as u64;
         let pend = p0.add(64 * nblocks);
+        let fc = (fl as u64).wrapping_sub(sep as u64 >> 5);
         let out_end: *mut u32;
+        let left: isize;
         let cursor: __m128i;
         std::arch::asm!(
             "test edi, 64",
@@ -422,18 +493,21 @@ unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut 
             "xchg r9, r12",
             "mov r11, r15",
             "kmovq k2, k1",
+            "kmovq k4, k3",
             "jmp 3f",
+            // Block A: d r9 and k3, q r8, n k1, previous d r12, eprev r15; next block into r12,
+            // k4, r13, k2. Block B: the roles swapped.
             "2:",
             "mov r10, r9",
             "shld r10, r12, 1",
             "vmovdqu64 zmm0, zmmword ptr [rsi + rdi + 64]",
             "vpcmpeqb k2, zmm0, zmm18",
-            "vpcmpeqb k3, zmm0, zmm16",
-            "vpcmpeqb k4, zmm0, zmm17",
-            "korq k3, k3, k2",
-            "kmovq r12, k3",
-            "kmovq r13, k4",
-            "prefetcht0 byte ptr [rdx + rdi]",
+            "vpcmpeqb k5, zmm0, zmm16",
+            "vpcmpeqb k6, zmm0, zmm17",
+            "korq k4, k5, k2",
+            "kmovq r12, k4",
+            "kmovq r13, k6",
+            "prefetcht0 byte ptr [rsi + rdi + {pf}]",
             "mov r11, r9",
             "shrd r11, r12, 1",
             "mov r14, r10",
@@ -451,48 +525,46 @@ unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut 
             "jnz 4f",
             "5:",
             "shr r11, 63",
+            "popcnt r15, r9",
+            "cmp r15d, 56",
+            "ja 8f",
             "shrd r8, r13, 1",
-            "and r8, r9",
-            "kmovq k5, r9",
-            "kmovq k6, r8",
+            "pext r8, r8, r9",
+            "kmovq r10, k1",
+            "pext r10, r10, r9",
+            "rorx r14, rax, 2",
+            "and r14d, 7",
+            "shlx r8, r8, r14",
+            "shlx r10, r10, r14",
+            "mov r14, rax",
+            "shr r14, 5",
+            "add r14, rdx",
+            "or r10b, byte ptr [r14]",
+            "mov qword ptr [r14], r10",
+            "or r8b, byte ptr [r14 + {qoff}]",
+            "mov qword ptr [r14 + {qoff}], r8",
+            "kshiftrq k5, k3, 16",
+            "kshiftrq k6, k3, 32",
+            "kshiftrq k1, k3, 48",
             "movzx r10d, r9w",
             "popcnt r10d, r10d",
             "mov r14d, r9d",
             "popcnt r14d, r14d",
-            "mov r15, r9",
-            "shl r15, 16",
-            "popcnt r15, r15",
-            "popcnt r8, r9",
-            "vmovdqa64 zmm1, zmm25",
-            "vpord zmm1 {{k1}}, zmm1, zmm19",
-            "vpord zmm1 {{k6}}, zmm1, zmm20",
-            "vpcompressd zmm1 {{k5}} {{z}}, zmm1",
+            "mov r8, r9",
+            "shl r8, 16",
+            "popcnt r8, r8",
+            "vpcompressd zmm1 {{k3}} {{z}}, zmm25",
             "vmovdqu64 zmmword ptr [rax], zmm1",
-            "kshiftrq k3, k1, 16",
-            "kshiftrq k4, k6, 16",
-            "kshiftrq k7, k5, 16",
             "vpaddd zmm1, zmm25, zmm21",
-            "vpord zmm1 {{k3}}, zmm1, zmm19",
-            "vpord zmm1 {{k4}}, zmm1, zmm20",
-            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vpcompressd zmm1 {{k5}} {{z}}, zmm1",
             "vmovdqu64 zmmword ptr [rax + r10*4], zmm1",
-            "kshiftrq k3, k1, 32",
-            "kshiftrq k4, k6, 32",
-            "kshiftrq k7, k5, 32",
             "vpaddd zmm1, zmm25, zmm22",
-            "vpord zmm1 {{k3}}, zmm1, zmm19",
-            "vpord zmm1 {{k4}}, zmm1, zmm20",
-            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vpcompressd zmm1 {{k6}} {{z}}, zmm1",
             "vmovdqu64 zmmword ptr [rax + r14*4], zmm1",
-            "kshiftrq k3, k1, 48",
-            "kshiftrq k4, k6, 48",
-            "kshiftrq k7, k5, 48",
             "vpaddd zmm1, zmm25, zmm23",
-            "vpord zmm1 {{k3}}, zmm1, zmm19",
-            "vpord zmm1 {{k4}}, zmm1, zmm20",
-            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
-            "vmovdqu64 zmmword ptr [rax + r15*4], zmm1",
-            "lea rax, [rax + r8*4]",
+            "vpcompressd zmm1 {{k1}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax + r8*4], zmm1",
+            "lea rax, [rax + r15*4]",
             "vpaddd zmm25, zmm25, zmm24",
             "add rdi, 64",
             "jz 9f",
@@ -501,12 +573,12 @@ unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut 
             "shld r10, r9, 1",
             "vmovdqu64 zmm0, zmmword ptr [rsi + rdi + 64]",
             "vpcmpeqb k1, zmm0, zmm18",
-            "vpcmpeqb k3, zmm0, zmm16",
-            "vpcmpeqb k4, zmm0, zmm17",
-            "korq k3, k3, k1",
+            "vpcmpeqb k5, zmm0, zmm16",
+            "vpcmpeqb k6, zmm0, zmm17",
+            "korq k3, k5, k1",
             "kmovq r9, k3",
-            "kmovq r8, k4",
-            "prefetcht0 byte ptr [rdx + rdi]",
+            "kmovq r8, k6",
+            "prefetcht0 byte ptr [rsi + rdi + {pf}]",
             "mov r15, r12",
             "shrd r15, r9, 1",
             "mov r14, r10",
@@ -524,48 +596,46 @@ unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut 
             "jnz 6f",
             "7:",
             "shr r15, 63",
+            "popcnt r11, r12",
+            "cmp r11d, 56",
+            "ja 8f",
             "shrd r13, r8, 1",
-            "and r13, r12",
-            "kmovq k5, r12",
-            "kmovq k6, r13",
+            "pext r13, r13, r12",
+            "kmovq r10, k2",
+            "pext r10, r10, r12",
+            "rorx r14, rax, 2",
+            "and r14d, 7",
+            "shlx r13, r13, r14",
+            "shlx r10, r10, r14",
+            "mov r14, rax",
+            "shr r14, 5",
+            "add r14, rdx",
+            "or r10b, byte ptr [r14]",
+            "mov qword ptr [r14], r10",
+            "or r13b, byte ptr [r14 + {qoff}]",
+            "mov qword ptr [r14 + {qoff}], r13",
+            "kshiftrq k5, k4, 16",
+            "kshiftrq k6, k4, 32",
+            "kshiftrq k2, k4, 48",
             "movzx r10d, r12w",
             "popcnt r10d, r10d",
             "mov r14d, r12d",
             "popcnt r14d, r14d",
-            "mov r11, r12",
-            "shl r11, 16",
-            "popcnt r11, r11",
-            "popcnt r13, r12",
-            "vmovdqa64 zmm1, zmm25",
-            "vpord zmm1 {{k2}}, zmm1, zmm19",
-            "vpord zmm1 {{k6}}, zmm1, zmm20",
-            "vpcompressd zmm1 {{k5}} {{z}}, zmm1",
+            "mov r13, r12",
+            "shl r13, 16",
+            "popcnt r13, r13",
+            "vpcompressd zmm1 {{k4}} {{z}}, zmm25",
             "vmovdqu64 zmmword ptr [rax], zmm1",
-            "kshiftrq k3, k2, 16",
-            "kshiftrq k4, k6, 16",
-            "kshiftrq k7, k5, 16",
             "vpaddd zmm1, zmm25, zmm21",
-            "vpord zmm1 {{k3}}, zmm1, zmm19",
-            "vpord zmm1 {{k4}}, zmm1, zmm20",
-            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vpcompressd zmm1 {{k5}} {{z}}, zmm1",
             "vmovdqu64 zmmword ptr [rax + r10*4], zmm1",
-            "kshiftrq k3, k2, 32",
-            "kshiftrq k4, k6, 32",
-            "kshiftrq k7, k5, 32",
             "vpaddd zmm1, zmm25, zmm22",
-            "vpord zmm1 {{k3}}, zmm1, zmm19",
-            "vpord zmm1 {{k4}}, zmm1, zmm20",
-            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vpcompressd zmm1 {{k6}} {{z}}, zmm1",
             "vmovdqu64 zmmword ptr [rax + r14*4], zmm1",
-            "kshiftrq k3, k2, 48",
-            "kshiftrq k4, k6, 48",
-            "kshiftrq k7, k5, 48",
             "vpaddd zmm1, zmm25, zmm23",
-            "vpord zmm1 {{k3}}, zmm1, zmm19",
-            "vpord zmm1 {{k4}}, zmm1, zmm20",
-            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
-            "vmovdqu64 zmmword ptr [rax + r11*4], zmm1",
-            "lea rax, [rax + r13*4]",
+            "vpcompressd zmm1 {{k2}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax + r13*4], zmm1",
+            "lea rax, [rax + r11*4]",
             "vpaddd zmm25, zmm25, zmm24",
             "add rdi, 64",
             "jnz 2b",
@@ -584,10 +654,14 @@ unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut 
             "add r10, 16",
             "vmovq xmm15, r10",
             "jmp 7b",
+            // More than 56 separators in a block: leave with rdi != 0.
+            "8:",
             "9:",
-            inout("rdi") -((64 * nblocks) as isize) => _,
+            pf = const PF_DIST,
+            qoff = const QOFF,
+            inout("rdi") -((64 * nblocks) as isize) => left,
             in("rsi") pend,
-            in("rdx") pend.wrapping_add(pf),
+            in("rdx") fc,
             inout("rax") sep => out_end,
             inout("rcx") -1i64 => _,
             inout("r8") q0 => _,
@@ -600,18 +674,15 @@ unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut 
             out("r14") _,
             inout("k1") kn0 => _,
             out("k2") _,
-            out("k3") _,
+            inout("k3") d0 => _,
             out("k4") _,
             out("k5") _,
             out("k6") _,
-            out("k7") _,
             out("zmm0") _,
             out("zmm1") _,
             in("zmm16") _mm512_set1_epi8(b',' as i8),
             in("zmm17") _mm512_set1_epi8(b'"' as i8),
             in("zmm18") _mm512_set1_epi8(b'\n' as i8),
-            in("zmm19") _mm512_set1_epi32(NL_FLAG as i32),
-            in("zmm20") _mm512_set1_epi32(Q_FLAG as i32),
             in("zmm21") _mm512_set1_epi32(16),
             in("zmm22") _mm512_set1_epi32(32),
             in("zmm23") _mm512_set1_epi32(48),
@@ -620,50 +691,100 @@ unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut 
             inout("xmm15") _mm_cvtsi64_si128(vstart as i64) => cursor,
             options(nostack),
         );
+        if left != 0 {
+            return None;
+        }
         let nrec = (_mm_cvtsi128_si64(cursor) as u64 - vstart) as usize / 16;
         for r in 0..nrec {
             let (bad, idx) = (vbuf[2 * r], vbuf[2 * r + 1] as i64);
             viol.push_mask(bad, (idx + (64 * nblocks) as i64) as u32);
         }
-        out_end.offset_from(sep) as usize
+        Some(out_end.offset_from(sep) as usize)
     }
 }
 
-/// Differential test of the two AVX-512 phase A versions on [wpos, wend) of `data` (which must
-/// be readable to wend + 256): None when the entries (and the 16 slots after them), the count
-/// and the violations are identical, else a description of the first difference.
+/// Differential test of phase A on [wpos, wend) of `data` (which must be readable to wend + 256):
+/// the original AVX-512 phase A (`phase_a_avx512`, entries with the flags inside) against every
+/// path of the current format (the v3 asm with its portable fallback, the portable AVX-512, AVX2
+/// and scalar versions): positions, both flags, count, violations and the last newline. None when
+/// all agree, else a description of the first difference.
 #[cfg(target_arch = "x86_64")]
 pub fn phase_a_diff(data: &[u8], wpos: usize, wend: usize) -> Option<String> {
-    if !std::is_x86_feature_detected!("avx512bw") || wend <= wpos || wend - wpos > W {
+    if !std::is_x86_feature_detected!("avx512bw") || !std::is_x86_feature_detected!("bmi2") || wend <= wpos || wend - wpos > W {
         return None;
     }
     let mut a = Scratch::new();
-    let mut b = Scratch::new();
     a.sep.fill(0xA5A5_A5A5);
-    b.sep.fill(0xA5A5_A5A5);
     let nblocks = (wend - wpos).div_ceil(64);
     let base = data.as_ptr();
     let mut va = ViolList { ptr: a.viol.as_mut_ptr(), n: 0, base: wpos as u32 };
-    let mut vb = ViolList { ptr: b.viol.as_mut_ptr(), n: 0, base: wpos as u32 };
-    let na = unsafe { phase_a_avx512(base.add(wpos), nblocks, 0, a.sep.as_mut_ptr(), &mut va) };
-    let nb = unsafe { phase_a_avx512_v2(base.add(wpos), nblocks, 4096, b.sep.as_mut_ptr(), &mut vb) };
-    if na != nb {
-        return Some(format!("nsep {na} != {nb} at window {wpos}..{wend}"));
+    let na = unsafe { phase_a_avx512(base.add(wpos), nblocks, 0, a.sep_mut(), &mut va) };
+    let old = |k: usize| unsafe { *a.sep_ptr().add(k) };
+    let (mut has_nl, mut last_nl) = (false, 0usize);
+    for k in (0..na).rev() {
+        if old(k) & NL_FLAG != 0 {
+            has_nl = true;
+            last_nl = k;
+            break;
+        }
     }
-    if va.n != vb.n || a.viol[..va.n] != b.viol[..vb.n] {
-        return Some(format!("violations differ at window {wpos}..{wend}: {} vs {}", va.n, vb.n));
-    }
-    for k in 0..(na + 16) {
-        if a.sep[k] != b.sep[k] {
-            return Some(format!("entry {k} of {na}: {:#x} != {:#x} at window {wpos}..{wend}", a.sep[k], b.sep[k]));
+    for path in 0..4u8 {
+        let mut b = Scratch::new();
+        b.sep.fill(0x5A5A_5A5A);
+        b.fl.fill(0xA5A5_A5A5_A5A5_A5A5);
+        let end = unsafe {
+            match path {
+                0 => phase_a::<{ fast::ISA_AVX512 }>(base, wpos, wend, &mut b),
+                1 => phase_a_portable::<{ fast::ISA_AVX512 }>(base, wpos, wend, &mut b),
+                2 => phase_a_portable::<{ fast::ISA_AVX2 }>(base, wpos, wend, &mut b),
+                _ => phase_a_portable::<{ fast::ISA_SCALAR }>(base, wpos, wend, &mut b),
+            }
+        };
+        let at = format!("path {path} window {wpos}..{wend}");
+        if end != wpos + 64 * nblocks {
+            return Some(format!("{at}: end {end} != {}", wpos + 64 * nblocks));
+        }
+        if b.nsep != na {
+            return Some(format!("{at}: nsep {na} != {}", b.nsep));
+        }
+        if va.n != b.nviol || a.viol[..va.n] != b.viol[..b.nviol] || b.viol[b.nviol] != u32::MAX {
+            return Some(format!("{at}: violations differ: {} vs {}", va.n, b.nviol));
+        }
+        if b.has_nl != has_nl || (has_nl && b.last_nl != last_nl) {
+            return Some(format!("{at}: last newline {has_nl} {last_nl} vs {} {}", b.has_nl, b.last_nl));
+        }
+        if b.wq0 != (data[wpos] == b'"') {
+            return Some(format!("{at}: wq0"));
+        }
+        for k in 0..na {
+            let e = old(k);
+            let (p, nl, q) = ((e & POS_MASK) as usize, e & NL_FLAG != 0, e & Q_FLAG != 0);
+            if b.pos(k) != p || (b.nl_bits(k) & 1 != 0) != nl || b.q_after(k) != q {
+                return Some(format!(
+                    "{at}: entry {k} of {na}: old {p} nl {nl} q {q}, new {} nl {} q {}",
+                    b.pos(k),
+                    b.nl_bits(k) & 1,
+                    b.q_after(k)
+                ));
+            }
+        }
+        // The windows the consumers read: 56-bit stream windows from every k, against the bits.
+        for k in 0..na {
+            let (wn, wq) = (b.nl_bits(k), b.q_bits(k));
+            for i in 0..56.min(na - k) {
+                let e = old(k + i);
+                if ((wn >> i) & 1 != 0) != (e & NL_FLAG != 0) || ((wq >> i) & 1 != 0) != (e & Q_FLAG != 0) {
+                    return Some(format!("{at}: stream window at {k} bit {i}"));
+                }
+            }
         }
     }
     None
 }
 
-/// Which phase A the AVX-512 path runs: 2 (default) or 1 (the original), for measurement and
-/// for the differential test.
-pub static PHASE_A_V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+/// Which phase A the AVX-512 path runs: 3 (default, the asm loop) or anything else (the
+/// portable AVX-512 version), for measurement.
+pub static PHASE_A_V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(3);
 
 /// Violation positions (absolute), filled on the rare path.
 pub(crate) struct ViolList {
@@ -684,32 +805,23 @@ impl ViolList {
     }
 }
 
-/// Phase A over blocks starting at wpos (a line start) up to wend: separator entries (window-
-/// relative, with flags), the violation list, and the index of the last newline.
+/// Phase A over blocks starting at wpos (a line start) up to wend: separator positions, the two
+/// flag streams, the violation list, and the index of the last newline.
 #[inline(always)]
 unsafe fn phase_a<const ISA: u8>(base: *const u8, wpos: usize, wend: usize, sc: &mut Scratch) -> usize {
     #[cfg(target_arch = "x86_64")]
-    if ISA == fast::ISA_AVX512 {
+    if ISA == fast::ISA_AVX512 && PHASE_A_V.load(std::sync::atomic::Ordering::Relaxed) == 3 {
         sc.wq0 = unsafe { *base.add(wpos) } == b'"';
         let nblocks = (wend - wpos).div_ceil(64);
-        let pf = PREFETCH.load(std::sync::atomic::Ordering::Relaxed);
         let mut vl = ViolList { ptr: sc.viol.as_mut_ptr(), n: 0, base: wpos as u32 };
-        let nsep = if PHASE_A_V.load(std::sync::atomic::Ordering::Relaxed) == 1 {
-            unsafe { phase_a_avx512(base.add(wpos), nblocks, pf, sc.sep.as_mut_ptr(), &mut vl) }
-        } else {
-            unsafe { phase_a_avx512_v2(base.add(wpos), nblocks, pf, sc.sep.as_mut_ptr(), &mut vl) }
-        };
-        unsafe { *sc.viol.as_mut_ptr().add(vl.n) = u32::MAX };
-        sc.nviol = vl.n;
-        sc.nsep = nsep;
-        // The last newline: scan back over the flags (the window ends inside a line).
-        let mut k = nsep;
-        while k > 0 && sc.sep[k - 1] & NL_FLAG == 0 {
-            k -= 1;
+        let sep = sc.sep_mut();
+        if let Some(nsep) = unsafe { phase_a_avx512_v3(base.add(wpos), nblocks, sep, sc.fl.as_mut_ptr(), &mut vl) } {
+            unsafe { *sc.viol.as_mut_ptr().add(vl.n) = u32::MAX };
+            sc.nviol = vl.n;
+            sc.nsep = nsep;
+            sc.set_last_nl();
+            return wpos + 64 * nblocks;
         }
-        sc.has_nl = k > 0;
-        sc.last_nl = k.saturating_sub(1);
-        return wpos + 64 * nblocks;
     }
     unsafe { phase_a_portable::<ISA>(base, wpos, wend, sc) }
 }
@@ -717,10 +829,10 @@ unsafe fn phase_a<const ISA: u8>(base: *const u8, wpos: usize, wend: usize, sc: 
 #[inline(always)]
 unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: usize, sc: &mut Scratch) -> usize {
     let (mut nsep, mut nviol) = (0usize, 0usize);
-    let mut last_nl = 0usize;
-    let mut has_nl = false;
-    let sep = sc.sep.as_mut_ptr();
+    let sep = sc.sep_mut();
     let viol = sc.viol.as_mut_ptr();
+    let fl = sc.fl.as_mut_ptr();
+    let mut acc = (0u64, 0u64);
     sc.wq0 = unsafe { *base.add(wpos) } == b'"';
     let mut b = wpos;
     let (mut c, mut q, mut n) = unsafe { masks64::<ISA>(base.add(b)) };
@@ -749,27 +861,18 @@ unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: us
             nviol = unsafe { flatten_pos(bad, b as u32, viol, nviol) };
         }
         let fq = ((q >> 1) | ((q2 & 1) << 63)) & d;
-        // Index of the block's last newline separator.
-        let top = 63 - (n | 1).leading_zeros();
-        let below = u64::MAX >> (63 - top);
-        let idx = nsep + (d & below).count_ones() as usize - 1;
-        if n != 0 {
-            last_nl = idx;
-            has_nl = true;
-        }
         let rel = (b - wpos) as u32;
+        let cnt = d.count_ones() as usize;
         #[cfg(target_arch = "x86_64")]
-        {
-            nsep = if ISA == fast::ISA_AVX512 {
-                unsafe { flatten_compress(d, n, fq, rel, sep, nsep) }
-            } else {
-                unsafe { flatten(d, n, fq, rel, sep, nsep) }
-            };
-        }
+        let (n2_, nb, qb) = if ISA == fast::ISA_AVX512 {
+            (unsafe { flatten_compress(d, rel, sep, nsep) }, pext::<ISA>(n, d), pext::<ISA>(fq, d))
+        } else {
+            unsafe { flatten(d, n, fq, rel, sep, nsep) }
+        };
         #[cfg(not(target_arch = "x86_64"))]
-        {
-            nsep = unsafe { flatten(d, n, fq, rel, sep, nsep) };
-        }
+        let (n2_, nb, qb) = unsafe { flatten(d, n, fq, rel, sep, nsep) };
+        unsafe { put_bits(fl, nsep, cnt, nb, qb, &mut acc) };
+        nsep = n2_;
         dprev = d >> 63;
         eprev = e >> 63;
         c = c2;
@@ -778,14 +881,16 @@ unsafe fn phase_a_portable<const ISA: u8>(base: *const u8, wpos: usize, wend: us
         b += 64;
     }
     let _ = c;
-    unsafe { *viol.add(nviol) = u32::MAX };
+    unsafe {
+        *fl.add(nsep >> 6) = acc.0;
+        *fl.add(FLW + (nsep >> 6)) = acc.1;
+        *viol.add(nviol) = u32::MAX;
+    }
     sc.nsep = nsep;
     sc.nviol = nviol;
-    sc.last_nl = last_nl;
-    sc.has_nl = has_nl;
+    sc.set_last_nl();
     b
 }
-
 
 /// A conforming ID's base-36 value from the 8 bytes ending at its end, its digit count and whether
 /// the prefix byte matched, or NONE40.
@@ -856,13 +961,14 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
         let ls = w + sc.line_start(kl) as u32;
         ln.ls[l] = ls;
         ln.end[l] = w + sc.pos(kl + 6) as u32;
-        let q0 = sc.q_before(kl);
+        let qw = sc.q_window(kl);
+        let q0 = qw & 1 != 0;
         let b01 = unsafe { rd(base.add(ls as usize) as *const u16) };
         pre[l] = if q0 { (b01 >> 8) as u8 } else { b01 as u8 };
         ln.vs[0][l] = ls + q0 as u32;
         ln.ve[0][l] = w + sc.pos(kl) as u32 - q0 as u32;
         for j in 1..7 {
-            let q = (sc.sep[kl + j - 1] & Q_FLAG != 0) as u32;
+            let q = ((qw >> j) & 1) as u32;
             ln.vs[j][l] = w + sc.pos(kl + j - 1) as u32 + 1 + q;
             ln.ve[j][l] = w + sc.pos(kl + j) as u32 - q;
         }
@@ -1157,9 +1263,9 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
     let sc = guard.0.as_mut().unwrap();
     let dates = &f.dates2;
     #[cfg(target_arch = "x86_64")]
-    let mut ev_out = crate::fast3::Out { b: EvBatch::default(), slow: 0, foreign: 0, ls: [0; 8], le: [0; 8] };
+    let mut ev_out = crate::fast3::Out::new(EvBatch::default());
     #[cfg(target_arch = "x86_64")]
-    let mut cl_out = crate::fast3::Out { b: ClickBatch::default(), slow: 0, foreign: 0, ls: [0; 8], le: [0; 8] };
+    let mut cl_out = crate::fast3::Out::new(ClickBatch::default());
     // Phase A blocks read [b, b + 128); phase B reads up to 32 bytes past a line end.
     let a_limit = (len + buf.post).saturating_sub(256);
     let lo_ok = PRE.saturating_sub(buf.pre);
@@ -1181,7 +1287,8 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
         let last = sc.last_nl;
         let next_window = wpos + sc.pos(last) + 1;
         if KIND == EVENTS && phase() <= 1 {
-            std::hint::black_box(&sc.sep[..sc.nsep]);
+            std::hint::black_box(unsafe { std::slice::from_raw_parts(sc.sep_ptr(), sc.nsep) });
+            std::hint::black_box(&sc.fl);
             if next_window >= to {
                 return;
             }
@@ -1190,16 +1297,24 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
         }
         let (mut k, mut vi) = (0usize, 0usize);
         let mut finished = false;
+        let mut carry = None;
         while k <= last {
             let ls = wpos + sc.line_start(k);
             if ls >= to {
                 finished = true;
                 break;
             }
+            // Fewer than 8 lines left in this window: the next window starts at this line (its phase A
+            // covers them again) instead of taking them one at a time; not when no line of this window
+            // was decided yet (progress) or the chunk ends inside the next window's first lines.
+            if k > 0 && k + nf * LANES - 1 > last && next_window < to {
+                carry = Some(ls);
+                break;
+            }
             if k + nf * LANES - 1 <= last
                 && (wpos + sc.pos(k + nf * (LANES - 1) - 1) + 1) < to
                 && sc.viol[vi] as usize > wpos + sc.pos(k + nf * LANES - 1)
-                && unsafe { nl_pattern::<ISA>(sc, k, nf) }
+                && nl_pattern(sc, k, nf)
             {
                 unsafe {
                     if KIND == EVENTS {
@@ -1249,7 +1364,7 @@ unsafe fn lines<S: Sink, const ISA: u8, const KIND: u8>(f: &Fast, file: u32, buf
         if finished {
             return;
         }
-        start = next_window;
+        start = carry.unwrap_or(next_window);
     }
 }
 
@@ -1301,13 +1416,14 @@ unsafe fn batch_clicks<'b, S: Sink, const ISA: u8>(
         let s = w + sc.line_start(kl) as u32;
         ls[l] = s;
         end[l] = w + sc.pos(kl + 3) as u32;
-        let q0 = sc.q_before(kl);
+        let qw = sc.q_window(kl);
+        let q0 = qw & 1 != 0;
         let b01 = unsafe { rd(base.add(s as usize) as *const u16) };
         pre_k[l] = if q0 { (b01 >> 8) as u8 } else { b01 as u8 };
         vs[0][l] = s + q0 as u32;
         ve[0][l] = w + sc.pos(kl) as u32 - q0 as u32;
         for j in 1..4 {
-            let q = (sc.sep[kl + j - 1] & Q_FLAG != 0) as u32;
+            let q = ((qw >> j) & 1) as u32;
             vs[j][l] = w + sc.pos(kl + j - 1) as u32 + 1 + q;
             ve[j][l] = w + sc.pos(kl + j) as u32 - q;
         }
@@ -1420,3 +1536,44 @@ unsafe fn batch_clicks<'b, S: Sink, const ISA: u8>(
     let _ = (&w_k, &pre_k);
 }
 
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    /// Every phase A path against the original on random text: from sparse separators to blocks
+    /// of nothing but separators (more than 56 per block: the asm's portable fallback).
+    #[test]
+    fn phase_a_matches_original() {
+        if !std::is_x86_feature_detected!("avx512bw") || !std::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let alphabets: [&[u8]; 4] = [b",\n\"", b",,,,\n", b",,\n\"\"a", b",\"\n"];
+        for density in [1u64, 2, 3, 8, 30, 200] {
+            for alpha in alphabets {
+                let len = 70_000;
+                let mut data = vec![0u8; len + 512];
+                for x in data[..len].iter_mut() {
+                    let r = next();
+                    *x = if r % density == 0 { alpha[((r >> 8) % alpha.len() as u64) as usize] } else { b'a' + ((r >> 16) % 26) as u8 };
+                }
+                let mut wins = vec![(0usize, super::W), (1, 5000), (77, 64), (100, 1), (3, 129), (len - 40, 40), (len - super::W, super::W)];
+                for _ in 0..60 {
+                    let w = (next() as usize) % len;
+                    wins.push((w, 1 + (next() as usize) % super::W));
+                }
+                for (w, l) in wins {
+                    let wend = (w + l).min(len);
+                    if let Some(m) = super::phase_a_diff(&data, w, wend) {
+                        panic!("density {density} alphabet {:?}: {m}", std::str::from_utf8(alpha).unwrap());
+                    }
+                }
+            }
+        }
+    }
+}
