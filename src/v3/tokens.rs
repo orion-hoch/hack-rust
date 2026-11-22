@@ -8,6 +8,10 @@
 //! a reader that sees "being written" waits for "ready" before comparing.
 //! FOREIGN: a locked map from bytes to index (rare: dirt only).
 //!
+//! Probing is linear from a home slot that starts a 64-byte line (8 SHORT slots, 2 LONG slots), so
+//! a key is found in one line unless its bucket filled before it; a SHORT hit is taken from one
+//! compare of the whole line, everything else (inserts, misses, overflow) from the atomic loop.
+//!
 //! Probes for up to 8 IDs are batched: all hashes first, prefetch, then probe.
 
 use std::collections::HashMap;
@@ -19,6 +23,9 @@ use super::ids::{Key, long_bytes, short_bytes};
 pub struct Tokens<'a> {
     short: Table,
     short_mask: usize,
+    /// Home slots start a 64-byte line: SHORT at a multiple of 8, LONG at an even slot.
+    short_home: usize,
+    long_home: usize,
     /// LONG slots, 4 words each: state, a, b, unused (two slots a cache line).
     long: Table,
     long_cap: usize,
@@ -230,7 +237,8 @@ fn prefetch_w<T>(p: *const T) {
 
 impl<'a> Tokens<'a> {
     /// Tables for about `users` distinct user IDs (load at most 0.75 before falling back).
-    /// SHORT gets next_pow2(2 x users) slots (load 0.155 at p20v5, 0.23 at f60v5) and LONG
+    /// SHORT gets next_pow2(users) slots (load 0.31 at p20v5, 0.46 at f60v5; a lookup reads one
+    /// 64-byte line, its home line, unless all 8 slots before the key are taken) and LONG
     /// next_pow2(users / 4) (0.18, 0.27). Half the SHORT slots, measured interleaved: at p20v5 a
     /// wash (6 ms less prefault, 1 to 3 ms more probing); at f60v5 25 ms slower in all (load 0.46:
     /// links and clicks +11 ms, events +25 ms, prefault -12 ms). Kept at twice.
@@ -244,7 +252,7 @@ impl<'a> Tokens<'a> {
     /// 3/4 limit. The rate estimate assumes one ID in eight is LONG; the fuzz "volume" shape (20K
     /// one-event LONG users among 61K, 5,000 events) filled LONG at 12K of 16K slots and fell back.
     pub fn with_bound(users: usize, bound: usize) -> Self {
-        let mut short_cap = (users * 2).next_power_of_two().max(1 << 12);
+        let mut short_cap = users.next_power_of_two().max(1 << 12);
         let mut long_cap = (users / 4).next_power_of_two().max(1 << 10);
         if bound > 0 {
             let (s, l) = ((bound * 2).next_power_of_two(), (bound * 4 / 3 + 1).next_power_of_two());
@@ -258,9 +266,11 @@ impl<'a> Tokens<'a> {
         Tokens {
             short: Table::new(short_cap, huge),
             short_mask: short_cap - 1,
+            short_home: (short_cap - 1) & !7,
             long: Table::new(long_cap * 4, huge),
             long_cap,
             long_mask: long_cap - 1,
+            long_home: (long_cap - 1) & !1,
             foreign: Mutex::new((HashMap::new(), Vec::new())),
             full: AtomicBool::new(false),
             short_used: AtomicU64::new(0),
@@ -312,9 +322,35 @@ impl<'a> Tokens<'a> {
         (self.short.len() + self.long_cap) as u32
     }
 
+    /// The slot of the home line (8 slots from `home`, a multiple of 8) that holds `want`, if one
+    /// does: the line compared at once. Only a hit is taken from it (keys are unique); everything
+    /// else, inserts included, goes through the atomic loop.
+    #[inline(always)]
+    fn line_hit(&self, want: u64, home: usize) -> Option<usize> {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        // SAFETY: home is a multiple of 8 below the table's length (a multiple of 8, the base 2 MB
+        // aligned), so both 32-byte loads are aligned and inside the table.
+        unsafe {
+            use core::arch::x86_64::*;
+            let p = self.short.as_ptr().add(home) as *const __m256i;
+            let w = _mm256_set1_epi64x(want as i64);
+            let lo = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256(p), w)));
+            let hi = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_load_si256(p.add(1)), w)));
+            let m = (lo | (hi << 4)) as u32;
+            if m != 0 { Some(home + m.trailing_zeros() as usize) } else { None }
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            (home..home + 8).find(|&i| self.short[i].load(Relaxed) == want)
+        }
+    }
+
     #[inline(always)]
     fn short_token(&self, v: u64, mut i: usize) -> u32 {
         let want = v + 1;
+        if let Some(t) = self.line_hit(want, i) {
+            return t as u32;
+        }
         let start = i;
         loop {
             let cur = self.short[i].load(Relaxed);
@@ -400,11 +436,11 @@ impl<'a> Tokens<'a> {
     pub fn start_hint<const W: bool>(&self, long: bool, a: u64, b: u64) -> Pending {
         let slot;
         if !long {
-            slot = (mix(a) as usize) & self.short_mask;
+            slot = (mix(a) as usize) & self.short_home;
             let at = &self.short[slot];
             if W { prefetch_w(at) } else { prefetch(at) }
         } else {
-            slot = (mix(a ^ b.rotate_left(29)) as usize) & self.long_mask;
+            slot = (mix(a ^ b.rotate_left(29)) as usize) & self.long_home;
             let at = &self.long[4 * slot];
             if W { prefetch_w(at) } else { prefetch(at) }
         }
@@ -415,7 +451,7 @@ impl<'a> Tokens<'a> {
     #[inline(always)]
     pub fn home(&self, long: bool, a: u64, b: u64) -> u32 {
         let h = mix(if long { a ^ b.rotate_left(29) } else { a }) as usize;
-        let slot = h & if long { self.long_mask } else { self.short_mask };
+        let slot = h & if long { self.long_home } else { self.short_home };
         let at = if long { self.long.as_ptr().wrapping_add(4 * slot) } else { self.short.as_ptr().wrapping_add(slot) };
         prefetch(at);
         slot as u32
@@ -456,6 +492,9 @@ impl<'a> Tokens<'a> {
         let mut i = p.slot;
         if !p.long {
             let want = p.a + 1;
+            if let Some(t) = self.line_hit(want, i) {
+                return t as u32;
+            }
             loop {
                 let cur = self.short[i].load(Relaxed);
                 if cur == want {
@@ -500,10 +539,10 @@ impl<'a> Tokens<'a> {
                 continue;
             }
             if long >> k & 1 == 0 {
-                slot[k] = (mix(a[k]) as usize) & self.short_mask;
+                slot[k] = (mix(a[k]) as usize) & self.short_home;
                 prefetch(&self.short[slot[k]]);
             } else {
-                slot[k] = (mix(a[k] ^ b[k].rotate_left(29)) as usize) & self.long_mask;
+                slot[k] = (mix(a[k] ^ b[k].rotate_left(29)) as usize) & self.long_home;
                 prefetch(&self.long[4 * slot[k]]);
             }
         }
@@ -521,8 +560,8 @@ impl<'a> Tokens<'a> {
     /// Token of one ID of any kind (FOREIGN interned by its bytes).
     pub fn token(&self, key: Key, bytes: &'a [u8]) -> u32 {
         match key {
-            Key::Short(v) => self.short_token(v, (mix(v) as usize) & self.short_mask),
-            Key::Long(a, b) => self.long_token(a, b, (mix(a ^ b.rotate_left(29)) as usize) & self.long_mask),
+            Key::Short(v) => self.short_token(v, (mix(v) as usize) & self.short_home),
+            Key::Long(a, b) => self.long_token(a, b, (mix(a ^ b.rotate_left(29)) as usize) & self.long_home),
             Key::Foreign => {
                 let mut g = self.foreign.lock().unwrap();
                 if let Some(&i) = g.0.get(bytes) {

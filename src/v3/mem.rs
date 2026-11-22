@@ -48,17 +48,6 @@ pub fn init(expected_peak: usize) -> bool {
     ok
 }
 
-/// Faults `bytes` of fresh region memory now, split over `threads` participants of the engine
-/// pool; it goes to the region's free list, first in line for takes and blocks.
-pub fn prefault(bytes: usize, threads: usize) {
-    if bytes == 0 || !READY.load(Ordering::Acquire) {
-        return;
-    }
-    let threads = threads.max(1);
-    let part = bytes.div_ceil(threads).next_multiple_of(rt::arena::CHUNK);
-    crate::par::run(threads, threads, |_| (), |_, _| REG.prefault(part, true));
-}
-
 /// Persons: the token-indexed person map (read by move 2 and the clicks stage) and the persons
 /// build's node arrays, on their own mapping so that the huge-page verdict is asked for their own
 /// size (at f60v5 the 75 MB map on 4 KB pages cost about a page walk per lookup). The map is
@@ -103,13 +92,6 @@ impl<T: Copy + 'static> Buf<T> {
         Buf { p, len, reg }
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
 impl<T: Copy + 'static> std::ops::Deref for Buf<T> {

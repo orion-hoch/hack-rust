@@ -23,9 +23,6 @@ impl StrColumn {
         self.offsets.push(self.data.len());
     }
 
-    pub fn len(&self) -> usize {
-        self.offsets.len() - 1
-    }
 }
 
 /// `top_category` value meaning null.

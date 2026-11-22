@@ -5,7 +5,7 @@
 //! group), counts assists by one sweep (the interval union) and makes the user-day rows; here
 //! only the names are added. Nothing is quadratic in a person's size.
 
-use parselab::{Ctx, Dataset, Stream};
+use parselab::{Dataset, Stream};
 
 use crate::fast::agg::FastAgg;
 use crate::fast::scan::{CLICK_REACH, Rows, SESSION_GAP};
@@ -19,9 +19,7 @@ use super::tokens::Tokens;
 
 pub struct PeopleCtx<'a, 'b> {
     pub ds: &'a Dataset,
-    pub ctx: &'b Ctx,
     pub tok: &'b Tokens<'a>,
-    pub organic: u32,
     /// The sortlab session kernel.
     pub kernel: sortlab::Kernel,
     /// Click base, day shift, cells shape for sortlab's walk.
@@ -45,14 +43,12 @@ pub struct Worker {
     pub agg: FastAgg,
     pub sessions: u64,
     pub events: u64,
-    ev: Vec<u64>,
     buys: Vec<[u64; 2]>,
     cl: Vec<[u64; 2]>,
     sc: sortlab::Scratch,
     out: sortlab::Out,
     ws: sortlab::walk::WalkScratch,
     wrows: sortlab::walk::Rows,
-    name_buf: Vec<u8>,
 }
 
 /// The click_id of the click line at `loc`: its first field, unquoted (the line was accepted by
@@ -93,24 +89,19 @@ impl Worker {
             agg,
             sessions: 0,
             events: 0,
-            ev: Vec::new(),
             buys: Vec::new(),
             cl: Vec::new(),
             sc: sortlab::Scratch::new(),
             out: sortlab::Out::default(),
             ws: sortlab::walk::WalkScratch::new(),
             wrows: sortlab::walk::Rows::default(),
-            name_buf: Vec::new(),
         }
     }
 
     /// One person partition: survivor records, purchase records and click records of it.
     pub fn partition(&mut self, ev: &[&[u64]], buys: &[&[[u64; 2]]], clicks: &[&[[u64; 2]]], cx: &PeopleCtx) {
-        self.ev.clear();
-        for c in ev {
-            self.ev.extend_from_slice(c);
-        }
-        if self.ev.is_empty() {
+        let nev: usize = ev.iter().map(|c| c.len()).sum();
+        if nev == 0 {
             if buys.iter().any(|c| !c.is_empty()) {
                 self.bad = true;
             }
@@ -121,7 +112,7 @@ impl Worker {
             self.buys.extend_from_slice(c);
         }
         // Sessions per person (start, event count, in time order) and each purchase's session.
-        if sortlab::sessions(&self.ev, &self.buys, cx.kernel, None, &mut self.sc, &mut self.out).is_err() {
+        if sortlab::sessions_chunks(ev, &self.buys, cx.kernel, &mut self.sc, &mut self.out).is_err() {
             self.bad = true;
             return;
         }
@@ -164,6 +155,6 @@ impl Worker {
         r.revenue.extend(wr.revenue.iter().map(|&x| x as i64));
         r.top.extend_from_slice(&wr.top);
         self.sessions += out.start.len() as u64;
-        self.events += self.ev.len() as u64;
+        self.events += nev as u64;
     }
 }

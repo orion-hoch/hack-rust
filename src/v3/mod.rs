@@ -159,11 +159,6 @@ fn l2_per_thread() -> usize {
     size / siblings
 }
 
-/// `bits` moved by the signed integer in env `var` (measurement sweeps), kept in [lo, hi].
-fn bits_delta(bits: u32, var: &str, lo: u32, hi: u32) -> u32 {
-    let d: i32 = std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    (bits as i32 + d).clamp(lo as i32, hi as i32) as u32
-}
 
 /// Rows per user_daily file written during the session stage (about 1 MB of output).
 const ROWS_PER_FILE: usize = 1 << 16;
@@ -197,9 +192,6 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         );
     }
     crate::par::init_pool(threads);
-    if cfg!(feature = "measure") && std::env::var("ENGINE_BINPF").as_deref() == Ok("0") {
-        crate::fast::sink::BINPF.store(false, std::sync::atomic::Ordering::Relaxed);
-    }
     let (ds, inp) = match open_rt(data)? {
         Ok(x) => x,
         Err(why) => return Ok(Outcome::Fallback(why)),
@@ -248,7 +240,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     // of 2^11 about 2%.
     let p1_raw = (est_events / 16_000).max(1).next_power_of_two().trailing_zeros();
     let p1_cap = if l2_per_thread() < (448 << 10) { 10 } else { 11 };
-    let p1_bits = bits_delta(p1_raw.saturating_sub(1).min(p1_cap).clamp(4, 14), "ENGINE_P1_DELTA", 4, 14);
+    let p1_bits = p1_raw.saturating_sub(1).min(p1_cap).clamp(4, 14);
     clock.mark("open");
 
     // Parse A: links, then clicks.
@@ -256,26 +248,17 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     // person partitions, with read-only token lookups.
     let chunks = parselab::par::plan(&ds, &[Stream::Links], 4 << 20);
     let per_thread = est_events / threads.max(1);
-    let reference = std::env::var("ENGINE_PARSER").is_ok_and(|v| v == "ref");
     let fp = parselab::fast::Fast::new(&ctx);
     let isa = parselab::fast::Isa::detect();
     let parse = |c: &parselab::par::Chunk, s: &mut V3Sink| {
         let file = &ds.stream(c.stream)[c.file as usize];
         let bytes = file.bytes();
-        if reference {
-            match c.stream {
-                Stream::Events => parselab::reference::events(&ctx, c.file, bytes, c.from, c.to, s),
-                Stream::Clicks => parselab::reference::clicks(&ctx, c.file, bytes, c.from, c.to, s),
-                Stream::Links => parselab::reference::links(&ctx, c.file, bytes, c.from, c.to, s),
-            }
-        } else {
-            let kind = match c.stream {
-                Stream::Events => parselab::fast::Kind::Events,
-                Stream::Clicks => parselab::fast::Kind::Clicks,
-                Stream::Links => parselab::fast::Kind::Links,
-            };
-            parselab::fast::parse(&fp, isa, kind, c.file, parselab::fast::Buf::plain(bytes), c.from, c.to, s);
-        }
+        let kind = match c.stream {
+            Stream::Events => parselab::fast::Kind::Events,
+            Stream::Clicks => parselab::fast::Kind::Clicks,
+            Stream::Links => parselab::fast::Kind::Links,
+        };
+        parselab::fast::parse(&fp, isa, kind, c.file, parselab::fast::Buf::plain(bytes), c.from, c.to, s);
         // Release the parsed range: pages stay in the page cache, so a later re-read by locator
         // faults them back; keeping them mapped costs 70 ms at exit at practice size. Click lines
         // stay mapped: the session stage re-reads the click_id of every click in a ts tie
@@ -355,9 +338,6 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     };
     inp.flush();
     clock.mark("parse.events");
-    if cfg!(feature = "measure") && std::env::var("ENGINE_STOP").is_ok() {
-        std::process::exit(0);
-    }
     // Finish first: the final drain resolves the last lookups and can raise the flags checked next.
     for s in sinks.iter_mut() {
         s.finish();
@@ -398,7 +378,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let est_surv = est_events;
     // Move-2 (person) partitions: likewise one bit coarser, at most 2^11 (swept with move 1).
     let p2_raw = (est_surv / 24_000).max(1).next_power_of_two().trailing_zeros();
-    let p2_bits = bits_delta(p2_raw.saturating_sub(1).min(11).clamp(4, 13), "ENGINE_P2_DELTA", 4, 13);
+    let p2_bits = p2_raw.saturating_sub(1).min(11).clamp(4, 13);
     let cx3 = Ctx3 { people: &people, ingest_base_ms: ctx.ingest_base_s * 1000 };
     let sinks_ref = &sinks;
     let spec_ref = &spec_by_part;
@@ -422,11 +402,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             if i < nck {
                 let c = &ck_chunks[i];
                 let bytes = ds.stream(c.stream)[c.file as usize].bytes();
-                if reference {
-                    parselab::reference::clicks(&ctx, c.file, bytes, c.from, c.to, cs);
-                } else {
-                    parselab::fast::parse(&fp, isa, parselab::fast::Kind::Clicks, c.file, parselab::fast::Buf::plain(bytes), c.from, c.to, cs);
-                }
+                parselab::fast::parse(&fp, isa, parselab::fast::Kind::Clicks, c.file, parselab::fast::Buf::plain(bytes), c.from, c.to, cs);
                 return;
             }
             let p = i - nck;
@@ -481,13 +457,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let campaigns_with_organic = ctx.campaigns.ids.len() + 1;
     let organic = ctx.campaigns.ids.len() as u32;
     // The session kernel: sorting network for small persons where AVX-512 exists, slots otherwise.
-    // Test builds can force another (ENGINE_KERNEL=slots|sort|radix).
-    let kernel = match if cfg!(feature = "plant") { std::env::var("ENGINE_KERNEL").unwrap_or_default() } else { String::new() }.as_str() {
-        "slots" => sortlab::Kernel::Slots,
-        "sort" => sortlab::Kernel::Sort,
-        "radix" => sortlab::Kernel::Radix,
-        _ => sortlab::Kernel::Net,
-    };
+    let kernel = sortlab::Kernel::Net;
     let walk = sortlab::walk::Params {
         base: ctx.click_base_ms - ctx.window_start_ms,
         day_shift: ctx.window_start_ms.rem_euclid(DAY) as u32,
@@ -495,7 +465,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         campaigns: campaigns_with_organic,
         organic,
     };
-    let pcx = PeopleCtx { ds: &ds, ctx: &ctx, tok: &tok, organic, kernel, walk, day0: day0 as i32 };
+    let pcx = PeopleCtx { ds: &ds, tok: &tok, kernel, walk, day0: day0 as i32 };
     let (m2s_ref, ck_ref) = (&m2s, &ck_parts);
     // Each worker writes its own user_daily file as soon as the queue is empty for it, while the
     // others finish their partitions (no write stage for these rows).

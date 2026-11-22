@@ -471,6 +471,112 @@ fn group_with(
     Ok(np)
 }
 
+/// `group` in token mode with timestamps moved, over the records in pieces (no gather copy),
+/// written for instruction count: the table's pointers, mask and shift live in registers for the
+/// whole pass (only the cold insert, which may grow the table, reloads them), no bounds checks.
+/// Pass 1 per record: token, hash, probe, local index stored, count; pass 2: index, cursor, store.
+fn group_chunks(ev: &[&[u64]], buys: &[[u64; 2]], sc: &mut Scratch, out: &mut Out) -> Result<usize, Error> {
+    let n: usize = ev.iter().map(|c| c.len()).sum();
+    sc.reset_table();
+    sc.first.clear();
+    sc.idx.clear();
+    sc.idx.reserve(n);
+    let mut i = 0usize;
+    for c in ev {
+        let mut j = 0usize;
+        let m = c.len();
+        let rec = c.as_ptr();
+        'table: while j < m {
+            let shift = 32 - sc.tbits;
+            let mask = (1usize << sc.tbits) - 1;
+            let keys = sc.keys.as_ptr();
+            let vals = sc.vals.as_ptr();
+            let first = sc.first.as_mut_ptr();
+            let idx = sc.idx.as_mut_ptr();
+            while j < m {
+                // SAFETY: j < m = c.len(); h is masked below keys.len() = 1 << tbits = vals.len();
+                // p < first.len() (every index handed out has its count slot); i < n <= capacity.
+                unsafe {
+                    let tok = (*rec.add(j) >> 32) as u32;
+                    if tok == EMPTY {
+                        return Err(Error::BadPerson(i));
+                    }
+                    let mut h = (tok.wrapping_mul(0x9E37_79B1) >> shift) as usize;
+                    loop {
+                        let k = *keys.add(h);
+                        if k == tok {
+                            break;
+                        }
+                        if k == EMPTY {
+                            // new person (cold): may grow the table, so the registers reload
+                            let p = sc.insert(tok, h);
+                            *sc.idx.as_mut_ptr().add(i) = p;
+                            *sc.first.as_mut_ptr().add(p as usize) += 1;
+                            i += 1;
+                            j += 1;
+                            continue 'table;
+                        }
+                        h = (h + 1) & mask;
+                    }
+                    let p = *vals.add(h);
+                    *idx.add(i) = p;
+                    *first.add(p as usize) += 1;
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    // SAFETY: idx[0..n] were all written above (one per record).
+    unsafe { sc.idx.set_len(n) };
+    out.persons.extend(sc.pos.iter().map(|&h| sc.keys[h as usize]));
+    let np = sc.pos.len();
+    let mut sum = 0u32;
+    sc.cur.clear();
+    sc.cur.resize(np, 0);
+    for p in 0..np {
+        let c = sc.first[p];
+        sc.first[p] = sum;
+        sc.cur[p] = sum;
+        sum += c;
+    }
+    sc.grouped.clear();
+    sc.grouped.reserve(n);
+    {
+        let cur = sc.cur.as_mut_ptr();
+        let grouped = sc.grouped.as_mut_ptr();
+        let idx = sc.idx.as_ptr();
+        let mut i = 0usize;
+        for c in ev {
+            for &r in c.iter() {
+                // SAFETY: i < n; idx[i] < np = cur.len(); cur[p] < n (counts sum to n).
+                unsafe {
+                    let at = cur.add(*idx.add(i) as usize);
+                    *grouped.add(*at as usize) = ts_of(r);
+                    *at += 1;
+                }
+                i += 1;
+            }
+        }
+        // SAFETY: the cursors cover 0..n exactly once (prefix sums of the counts).
+        unsafe { sc.grouped.set_len(n) };
+    }
+    group_buys(buys, None, np, sc)?;
+    Ok(np)
+}
+
+/// `sessions` in token mode over the partition's records in pieces (no gather copy).
+pub fn sessions_chunks(ev: &[&[u64]], buys: &[[u64; 2]], kernel: Kernel, sc: &mut Scratch, out: &mut Out) -> Result<(), Error> {
+    if let Kernel::Radix = kernel {
+        let flat: Vec<u64> = ev.iter().flat_map(|c| c.iter().copied()).collect();
+        return sessions(&flat, buys, kernel, None, sc, out);
+    }
+    out.clear();
+    out.buy_session.resize(buys.len(), u32::MAX);
+    let np = group_chunks(ev, buys, sc, out)?;
+    finish(np, buys, kernel, sc, out)
+}
+
 /// Purchases grouped by local person into `sc.bgrouped` (`sc.bfirst[p]..sc.bcur[p]`).
 fn group_buys(buys: &[[u64; 2]], dense: Option<usize>, np: usize, sc: &mut Scratch) -> Result<(), Error> {
     let m = buys.len();

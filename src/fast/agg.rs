@@ -30,29 +30,6 @@ impl FastAgg {
         (&mut self.hot, &mut self.buy)
     }
 
-    /// Day offset of an absolute day number.
-    #[inline(always)]
-    pub fn offset(&self, day: i32) -> usize {
-        (i64::from(day) - self.day0) as usize
-    }
-
-    /// One credited session.
-    #[inline(always)]
-    pub fn credit(&mut self, campaign: u32, off: usize, purchase: bool, revenue: u64) {
-        let c = off * self.campaigns + campaign as usize;
-        self.hot[c][0] += 1;
-        if purchase {
-            let b = &mut self.buy[c];
-            b[0] += 1;
-            b[1] += revenue;
-        }
-    }
-
-    /// `n` sessions assisted.
-    #[inline(always)]
-    pub fn assist(&mut self, campaign: u32, off: usize, n: u32) {
-        self.hot[off * self.campaigns + campaign as usize][1] += n;
-    }
 
     pub fn merge(&mut self, other: &FastAgg) {
         for (a, b) in self.hot.iter_mut().zip(&other.hot) {

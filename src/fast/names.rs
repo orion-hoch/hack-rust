@@ -15,8 +15,6 @@ pub const POW36: [u64; 9] = [
     2_821_109_907_456,
 ];
 
-const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-
 /// Order key of the canonical base-36 string of `x` (x < 2^40, so at most 8 digits).
 #[inline(always)]
 pub fn order_key(x: u64) -> u64 {
@@ -27,29 +25,7 @@ pub fn order_key(x: u64) -> u64 {
     ((x * POW36[8 - len]) << 4) | len as u64
 }
 
-/// Appends `prefix` and the digits of an order key.
-#[inline]
-pub fn append_bytes(prefix: u8, key: u64, out: &mut Vec<u8>) {
-    let (buf, n) = key_bytes(prefix, key);
-    out.extend_from_slice(&buf[..n]);
-}
 
-/// The bytes of an order key with its prefix, on the stack: (buffer, length). One division by a
-/// table power, then base-36 digits with constant divisors.
-#[inline]
-pub fn key_bytes(prefix: u8, key: u64) -> ([u8; 9], usize) {
-    let mut buf = [0u8; 9];
-    buf[0] = prefix;
-    let len = (key & 15) as usize;
-    let mut x = (key >> 4) / POW36[8 - len];
-    let mut at = len;
-    while at > 0 {
-        buf[at] = DIGITS[(x % 36) as usize];
-        x /= 36;
-        at -= 1;
-    }
-    (buf, 1 + len)
-}
 
 #[cfg(test)]
 mod tests {
@@ -70,7 +46,7 @@ mod tests {
     }
 
     #[test]
-    fn order_key_is_byte_order_and_round_trips() {
+    fn order_key_is_byte_order() {
         let mut values = vec![0u64, 1, 9, 10, 35, 36, 37, 1295, 1296, 46655, (1 << 40) - 1, 123_456_789];
         let mut s = 0x1234_5678_9abc_def0u64;
         for _ in 0..2000 {
@@ -80,9 +56,6 @@ mod tests {
         }
         let strings: Vec<Vec<u8>> = values.iter().map(|&x| b36(x)).collect();
         for (i, &x) in values.iter().enumerate() {
-            let mut back = Vec::new();
-            append_bytes(b'u', order_key(x), &mut back);
-            assert_eq!(&back[1..], strings[i].as_slice());
             for (j, &y) in values.iter().enumerate().take(300) {
                 assert_eq!(order_key(x).cmp(&order_key(y)), strings[i].cmp(&strings[j]));
             }

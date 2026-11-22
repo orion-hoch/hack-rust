@@ -39,10 +39,6 @@ unsafe impl<T: Copy + Send> Send for Bins<T> {}
 unsafe impl<T: Copy + Sync> Sync for Bins<T> {}
 
 impl<T: Copy> Bins<T> {
-    /// `n` bins; arena blocks of `block` records; chunks of 512 records.
-    pub fn new(n: usize, block: usize) -> Self {
-        Self::with_chunk(n, block, 512)
-    }
 
     /// `n` bins, arena blocks of `block` records, chunks of `chunk` records (small chunks for
     /// sparse streams: every bin touched costs one chunk).
@@ -187,9 +183,6 @@ impl<T: Copy> Bins<T> {
         self.full[b].iter().map(|&(p, n)| unsafe { std::slice::from_raw_parts(p, n as usize) })
     }
 
-    pub fn bins(&self) -> usize {
-        self.full.len()
-    }
 
     pub fn len(&self) -> usize {
         self.full.iter().flatten().map(|&(_, n)| n as usize).sum()

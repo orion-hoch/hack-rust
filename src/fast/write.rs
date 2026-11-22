@@ -8,7 +8,6 @@ use parselab::Ctx;
 use pqw::{Col, Data, Ids, Options, Strings};
 
 use super::scan::Rows;
-use crate::output::{NO_CATEGORY, UserDaily as V1UserDaily};
 use crate::sessions::CampaignAgg;
 
 pub fn user_rows(path: &Path, rows: &Rows, categories: &[&[u8]]) -> io::Result<()> {
@@ -25,24 +24,6 @@ pub fn user_rows(path: &Path, rows: &Rows, categories: &[&[u8]]) -> io::Result<(
     Ok(())
 }
 
-/// Rows from v1's sessionizer (the pool), converted to pqw's shapes.
-pub fn v1_user_rows(path: &Path, u: &V1UserDaily, categories: &[&[u8]]) -> io::Result<()> {
-    let offsets: Vec<u32> = u.user_id.offsets.iter().map(|&o| o as u32).collect();
-    let sessions: Vec<u32> = u.sessions.iter().map(|&v| v as u32).collect();
-    let events: Vec<u32> = u.events.iter().map(|&v| v as u32).collect();
-    let top: Vec<u8> = u.top_category.iter().map(|&c| if c == NO_CATEGORY { pqw::NULL8 } else { c as u8 }).collect();
-    pqw::UserDaily {
-        user_id: Ids::Rows(Strings::new(&u.user_id.data, &offsets)),
-        day: &u.day,
-        sessions: &sessions,
-        events: &events,
-        revenue_cents: &u.revenue_cents,
-        top_category: &top,
-        categories,
-    }
-    .write_file(path)?;
-    Ok(())
-}
 
 pub fn campaigns(path: &Path, agg: &CampaignAgg, ctx: &Ctx) -> io::Result<()> {
     let organic: &[u8] = b"organic";
