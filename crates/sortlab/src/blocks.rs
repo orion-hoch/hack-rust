@@ -286,6 +286,19 @@ unsafe fn blocks_partition<C: Cut>(pb: &PersonBlocks, sc: &mut Scratch, out: &mu
     let mut paid: Vec<(&[u32], &[u64])> = Vec::new();
     let mut res = Ok(());
     'person: for k in 0..np {
+        // A person's blocks sit wherever P1's streams put them: ask for the first two lines of
+        // the block of the person three ahead while this one is cut (each block read was a miss).
+        #[cfg(target_arch = "x86_64")]
+        if k + 3 < np {
+            if let Some(nb) = pb.ev.get(pb.ev_at[k + 3] as usize) {
+                let q = nb.as_ptr() as *const i8;
+                // SAFETY: a prefetch never faults; the addresses are in or just past a live block.
+                unsafe {
+                    core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(q);
+                    core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(q.wrapping_add(64));
+                }
+            }
+        }
         let blocks = &pb.ev[pb.ev_at[k] as usize..pb.ev_at[k + 1] as usize];
         ts.clear();
         paid.clear();

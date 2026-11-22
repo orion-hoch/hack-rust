@@ -822,9 +822,16 @@ pub fn partition(plain: &[&[Unit]], rare: &[&[Unit]], t: &mut Tables, out: &mut 
         out.emit_short(mu, ts, purch, pay);
     }
     for &at in &t.rw {
-        // SAFETY: as above.
-        let (uk, ua, ub, ts, purch, pay) = unsafe { ruser(at as *const Unit) };
-        out.emit_wide(uk, ua, ub, ts, purch, pay);
+        // A wide user's unit is u1 (SHORT event) or u2 (LONG event: such a record is big): no
+        // select between the unit and w1, as `ruser` needs for the other forms.
+        // SAFETY: as above; the record has 2 units, 3 when big.
+        unsafe {
+            let u = at as *const Unit;
+            let (h, w1) = ((*u)[0], (*u)[1]);
+            let x = *u.add(1 + ((h >> 60) & 1) as usize);
+            let pay = std::hint::select_unpredictable((h >> 23) & 3 == 0, w1 >> 32, w1);
+            out.emit_wide((h >> 25) & 3, x[0], x[1], (h >> 29) & TS, (h >> 28) & 1, pay);
+        }
     }
     // The exact table on the colliding records: key, ingest and address of each, plain first.
     let cd = &mut t.cd;

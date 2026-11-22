@@ -229,20 +229,23 @@ unsafe fn mullo64<const S: bool>(a: __m512i, b: __m512i) -> __m512i {
 /// length (prefix + k digits, as i64, any value) and whether its prefix byte matched.
 #[inline(always)]
 unsafe fn ids<const S: bool>(w: __m512i, len: __m512i, prefix_ok: __mmask8) -> __m512i {
-    // Keep the last k = len - 1 bytes: shift 8 * (8 - k). No clamp: for k outside 1..=8 the
-    // shift count is out of range (the lane becomes all '0') and k_ok rejects the lane.
-    let sh = _mm512_slli_epi64::<3>(_mm512_sub_epi64(_mm512_set1_epi64(9), len));
-    let keep = _mm512_sllv_epi64(_mm512_set1_epi64(-1), sh);
-    let c30 = unsafe { c64(0x3030_3030_3030_3030) };
-    let w = _mm512_ternarylogic_epi64::<0xCA>(keep, w, c30);
-    let digit = _mm512_cmpge_epu8_mask(w, _mm512_set1_epi8(b'0' as i8)) & _mm512_cmple_epu8_mask(w, _mm512_set1_epi8(b'9' as i8));
-    let lower = _mm512_cmpge_epu8_mask(w, _mm512_set1_epi8(b'a' as i8)) & _mm512_cmple_epu8_mask(w, _mm512_set1_epi8(b'z' as i8));
-    let all = _mm512_cmpeq_epi64_mask(_mm512_movm_epi8(digit | lower), _mm512_set1_epi64(-1));
-    let v = _mm512_sub_epi8(w, c30);
-    let v = _mm512_mask_sub_epi8(v, lower, v, _mm512_set1_epi8(39));
-    // bytes [36, 1] -> i16 [1296, 1] -> u32 pairs -> hi * 36^4 + lo
-    let value = unsafe {
-        chain::<S>(
+    unsafe {
+        // Keep the last k = len - 1 bytes: shift 8 * (8 - k). No clamp: for k outside 1..=8 the
+        // shift count is out of range (the lane becomes all '0') and the count check rejects it.
+        let sh = _mm512_slli_epi64::<3>(_mm512_sub_epi64(_mm512_set1_epi64(9), len));
+        let keep = _mm512_sllv_epi64(_mm512_set1_epi64(-1), sh);
+        let w = _mm512_ternarylogic_epi64::<0xCA>(keep, w, c64(0x3030_3030_3030_3030));
+        // t = c - '0' is 0..=9 only for a digit; a = c - 'a' is 0..=25 only for a letter (the
+        // letter test must be on a: c - 87 <= 35 would also take the ten characters before 'a').
+        // bad is nonzero in a byte that is neither. The value is the smaller of t and a + 10 (for a
+        // digit a + 10 is 217 and up, for a letter t is 49 and up). All byte arithmetic: no
+        // compare into a mask (those are port-5 only).
+        let t = _mm512_sub_epi8(w, _mm512_set1_epi8(b'0' as i8));
+        let a = _mm512_sub_epi8(w, _mm512_set1_epi8(b'a' as i8));
+        let bad = _mm512_min_epu8(_mm512_subs_epu8(t, _mm512_set1_epi8(9)), _mm512_subs_epu8(a, _mm512_set1_epi8(25)));
+        let v = _mm512_min_epu8(t, _mm512_add_epi8(a, _mm512_set1_epi8(10)));
+        // bytes [36, 1] -> i16 [1296, 1] -> u32 pairs -> hi * 36^4 + lo
+        let value = chain::<S>(
             v,
             |v| {
                 let t = _mm512_madd_epi16(_mm512_maddubs_epi16(v, _mm512_set1_epi16(0x0124)), _mm512_set1_epi32(0x0001_0510));
@@ -252,15 +255,19 @@ unsafe fn ids<const S: bool>(w: __m512i, len: __m512i, prefix_ok: __mmask8) -> _
                 let t = madd_1296(maddubs_36(v));
                 _mm256_add_epi64(mulu_36p4(t), _mm256_srli_epi64::<32>(t))
             },
-        )
-    };
-    // Canonical (first digit nonzero unless k == 1) and at most 40 bits: 36^(k-1) <= value (0 for
-    // k == 1) <= MASK40, the lower bound looked up by len & 7 (len 2..=9 for k 1..=8).
-    let low = _mm512_permutexvar_epi64(len, _mm512_setr_epi64(2_176_782_336, 78_364_164_096, 0, 36, 1296, 46_656, 1_679_616, 60_466_176));
-    let k_ok = _mm512_cmplt_epu64_mask(_mm512_sub_epi64(len, _mm512_set1_epi64(2)), _mm512_set1_epi64(8));
-    let in_range = _mm512_cmpge_epu64_mask(value, low) & _mm512_cmple_epu64_mask(value, _mm512_set1_epi64(MASK40 as i64));
-    let good = all & prefix_ok & k_ok & in_range;
-    _mm512_mask_blend_epi64(good, _mm512_set1_epi64(-1), value)
+        );
+        // Canonical (first digit nonzero unless k == 1) and at most 40 bits: 36^(k-1) <= value (0 for
+        // k == 1) <= MASK40, the lower bound looked up by len & 7 (len 2..=9 for k 1..=8).
+        let low = _mm512_permutexvar_epi64(len, _mm512_setr_epi64(2_176_782_336, 78_364_164_096, 0, 36, 1296, 46_656, 1_679_616, 60_466_176));
+        // Everything that can be wrong, OR-ed into one word and tested once: a bad character, bits
+        // above 40, value below the bound (the sign of value - low), a count outside 1..=8 (sh not
+        // one of 0, 8, .., 56).
+        let r = _mm512_ternarylogic_epi64::<0xF8>(bad, value, _mm512_set1_epi64(!(MASK40 as i64)));
+        let r = _mm512_ternarylogic_epi64::<0xF8>(r, _mm512_sub_epi64(value, low), _mm512_set1_epi64(i64::MIN));
+        let r = _mm512_ternarylogic_epi64::<0xF8>(r, sh, _mm512_set1_epi64(!0x38));
+        let good = _mm512_testn_epi64_mask(r, r) & prefix_ok;
+        _mm512_mask_blend_epi64(good, _mm512_set1_epi64(-1), value)
+    }
 }
 
 /// Per-byte digit test of the bytes selected by `mask` of x = bytes ^ 0x30.
@@ -295,7 +302,10 @@ unsafe fn date(dates: &Dates, hi: __m512i, mid: __m512i) -> (__m512i, __mmask8, 
         // mid against `3x3xT`: the day digits' high bits (part of the date), and the `T` after them
         // as a separate result (it is not part of what selects the day).
         let xm = _mm512_xor_si512(mid, c64(0x0054_3030));
-        let ok = _mm512_testn_epi64_mask(_mm512_xor_si512(hi, want), c64(0xFFF0_FEFF_FFFF_FFFF)) & _mm512_testn_epi64_mask(xm, c64(0xF0FC));
+        // One test for the date: the differences of hi (under its mask) and of mid's day digits.
+        let r = _mm512_ternarylogic_epi64::<0x28>(hi, want, c64(0xFFF0_FEFF_FFFF_FFFF));
+        let r = _mm512_ternarylogic_epi64::<0xF8>(r, xm, c64(0xF0FC));
+        let ok = _mm512_testn_epi64_mask(r, r);
         let t_ok = _mm512_testn_epi64_mask(xm, c64(0x00FF_0000));
         let day_s = _mm512_mask_srai_epi64::<32>(_mm512_set1_epi64(BAD_DAY as i64 * 86_400), ok, e);
         (day_s, ok, t_ok)
@@ -314,28 +324,29 @@ unsafe fn times1000(x: __m512i) -> __m512i {
 /// `HH:MM:SS` in t (8 bytes): (seconds of day, ok). Lane-wise copy of `fast::hms`.
 #[inline(always)]
 unsafe fn hms<const S: bool>(t: __m512i) -> (__m512i, __mmask8) {
-    // y: 0 at the colons and the digit values elsewhere, when the text is well formed. Two tests
-    // decide it: nothing but low nibbles (colons: nothing at all), and no digit above its limit
-    // (H 2 9, M 5 9, S 5 9: digit + (15 - limit) stays below 16). Minutes and seconds are then at
-    // most 59; the hour needs its own compare.
-    let y = _mm512_xor_si512(t, unsafe { c64(0x3030_3A30_303A_3030) });
-    let shape = _mm512_testn_epi64_mask(y, unsafe { c64(0xF0F0_FFF0_F0FF_F0F0) })
-        & _mm512_testn_epi64_mask(_mm512_add_epi8(y, unsafe { c64(0x060A_0006_0A00_060D) }), unsafe { c64(0x1010_0010_1000_1010) });
-    let x = _mm512_and_si512(y, unsafe { c64(0xFFFF_00FF_FF00_FFFF) });
-    let v = _mm512_add_epi64(_mm512_add_epi64(opaque::<S>(_mm512_slli_epi64::<3>(x)), _mm512_slli_epi64::<1>(x)), _mm512_srli_epi64::<8>(x));
-    let ff = _mm512_set1_epi64(0xFF);
-    let h = _mm512_and_si512(v, ff);
-    let m = _mm512_and_si512(_mm512_srli_epi64::<24>(v), ff);
-    let s = _mm512_and_si512(_mm512_srli_epi64::<48>(v), ff);
-    let ok = shape & _mm512_cmple_epu64_mask(h, _mm512_set1_epi64(23));
-    let secs = if S {
-        // (h * 60 + m) * 60 + s, each * 60 as (x << 6) - (x << 2): light work, no split.
-        let hm = _mm512_add_epi64(times60(h), m);
-        _mm512_add_epi64(times60(hm), s)
-    } else {
-        _mm512_add_epi64(_mm512_add_epi64(_mm512_mul_epu32(h, _mm512_set1_epi64(3600)), _mm512_mul_epu32(m, _mm512_set1_epi64(60))), s)
-    };
-    (secs, ok)
+    unsafe {
+        // y: 0 at the colons and the digit values elsewhere, when the text is well formed; z adds
+        // 15 - limit to each digit (H 2 9, M 5 9, S 5 9), so a digit over its limit reaches bit 4.
+        // Everything that can be wrong is OR-ed into one word r and tested once (mask compares and
+        // byte shuffles are port-5 only on the scorer's CPU; logic, shifts and adds are not):
+        // high nibbles of y and z, the colon bytes, and the hour over 23.
+        let y = _mm512_xor_si512(t, c64(0x3030_3A30_303A_3030));
+        let z = _mm512_add_epi8(y, c64(0x060A_0006_0A00_060D));
+        let r = _mm512_ternarylogic_epi64::<0xA8>(y, z, c64(0xF0F0_FFF0_F0FF_F0F0));
+        let x = _mm512_and_si512(y, c64(0xFFFF_00FF_FF00_FFFF));
+        // Bytes 0, 3, 6 of v: hour, minute, second. Byte 1 is 10 * (a digit): even.
+        let v = _mm512_add_epi64(_mm512_add_epi64(opaque::<S>(_mm512_slli_epi64::<3>(x)), _mm512_slli_epi64::<1>(x)), _mm512_srli_epi64::<8>(x));
+        // hour + 232 carries out of byte 0 exactly when the hour is over 23: bit 8 (clear before).
+        let over = _mm512_add_epi64(v, _mm512_set1_epi64(232));
+        let r = _mm512_ternarylogic_epi64::<0xF8>(r, over, _mm512_set1_epi64(0x100));
+        let ok = _mm512_testn_epi64_mask(r, r);
+        // (h * 60 + m) * 60 + s on the three fields in place (24 bits apart; each * 60 as
+        // (x << 6) - (x << 2) stays inside its field), no byte extraction.
+        let w = _mm512_and_si512(v, c64(0x00FF_0000_FF00_00FF));
+        let hm = _mm512_add_epi64(times60(w), _mm512_srli_epi64::<24>(w));
+        let secs = _mm512_and_si512(_mm512_add_epi64(times60(hm), _mm512_srli_epi64::<48>(w)), _mm512_set1_epi64(0xFF_FFFF));
+        (secs, ok)
+    }
 }
 
 /// 8 ASCII digits per lane to their value, and whether all are digits.
@@ -363,23 +374,29 @@ unsafe fn dec8<const S: bool>(w: __m512i) -> (__m512i, __mmask8) {
 /// Offset `SS±HH:MM` (bytes 0..8 of t17): (signed offset ms, ok).
 #[inline(always)]
 unsafe fn offset<const S: bool>(o: __m512i) -> (__m512i, __mmask8) {
-    let sign = unsafe { byte_at(o, 2) };
-    // As in `hms`: the colon and the digit limits (H 2 9, M 5 9) in two tests.
-    let y = _mm512_xor_si512(o, unsafe { c64(0x3030_3A30_3000_0000) });
-    let shape = _mm512_testn_epi64_mask(y, unsafe { c64(0xF0F0_FFF0_F000_0000) })
-        & _mm512_testn_epi64_mask(_mm512_add_epi8(y, unsafe { c64(0x060A_0006_0D00_0000) }), unsafe { c64(0x1010_0010_1000_0000) });
-    let x = _mm512_and_si512(y, unsafe { c64(0xFFFF_00FF_FF00_0000) });
-    let v = _mm512_add_epi64(_mm512_add_epi64(opaque::<S>(_mm512_slli_epi64::<3>(x)), _mm512_slli_epi64::<1>(x)), _mm512_srli_epi64::<8>(x));
-    let ff = _mm512_set1_epi64(0xFF);
-    let h = _mm512_and_si512(_mm512_srli_epi64::<24>(v), ff);
-    let m = _mm512_and_si512(_mm512_srli_epi64::<48>(v), ff);
-    let hm = if S { _mm512_add_epi64(unsafe { times60(h) }, m) } else { _mm512_add_epi64(_mm512_mul_epu32(h, _mm512_set1_epi64(60)), m) };
-    let mag = unsafe { chain::<S>(hm, |x| _mm512_mul_epu32(x, _mm512_set1_epi64(60_000)), |x| mulu_60000(x)) };
-    let plus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'+' as i64));
-    let minus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'-' as i64));
-    let off = _mm512_mask_sub_epi64(mag, !plus, _mm512_setzero_si512(), mag);
-    let ok = (plus | minus) & shape & _mm512_cmple_epu64_mask(h, _mm512_set1_epi64(23));
-    (off, ok)
+    unsafe {
+        let sign = byte_at(o, 2);
+        // As in `hms`: the colon, the digit limits (H 2 9, M 5 9) and the hour over 23 in one word,
+        // tested once.
+        let y = _mm512_xor_si512(o, c64(0x3030_3A30_3000_0000));
+        let z = _mm512_add_epi8(y, c64(0x060A_0006_0D00_0000));
+        let r = _mm512_ternarylogic_epi64::<0xA8>(y, z, c64(0xF0F0_FFF0_F000_0000));
+        let x = _mm512_and_si512(y, c64(0xFFFF_00FF_FF00_0000));
+        // Bytes 3 and 6 of v: hour and minute. Byte 4 is 10 * (a digit): even.
+        let v = _mm512_add_epi64(_mm512_add_epi64(opaque::<S>(_mm512_slli_epi64::<3>(x)), _mm512_slli_epi64::<1>(x)), _mm512_srli_epi64::<8>(x));
+        let over = _mm512_add_epi64(v, _mm512_set1_epi64(232 << 24));
+        let r = _mm512_ternarylogic_epi64::<0xF8>(r, over, _mm512_set1_epi64(1 << 32));
+        let shape = _mm512_testn_epi64_mask(r, r);
+        // h * 60 + m on the two fields in place, then down to bit 0.
+        let w = _mm512_and_si512(v, c64(0x00FF_0000_FF00_0000));
+        let hm = _mm512_and_si512(_mm512_srli_epi64::<24>(_mm512_add_epi64(times60(w), _mm512_srli_epi64::<24>(w))), _mm512_set1_epi64(0xFF_FFFF));
+        let mag = chain::<S>(hm, |x| _mm512_mul_epu32(x, _mm512_set1_epi64(60_000)), |x| mulu_60000(x));
+        let plus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'+' as i64));
+        let minus = _mm512_cmpeq_epi64_mask(sign, _mm512_set1_epi64(b'-' as i64));
+        let off = _mm512_mask_sub_epi64(mag, !plus, _mm512_setzero_si512(), mag);
+        let ok = (plus | minus) & shape;
+        (off, ok)
+    }
 }
 
 /// The LONG lanes of one ID field merged into its key vectors: (a, b, long lanes). `x` is the SHORT
@@ -573,18 +590,17 @@ unsafe fn bounds<const NF: usize>(sc: &Scratch, k0: usize) -> ([__m256i; NF], [_
         // The separator before each line's field 0: the previous line's newline (lane l - 1), or
         // for lane 0 the entry before k0 (the window start when k0 == 0).
         let prev_pos = if k0 == 0 { -1i32 } else { *sp.sub(1) as i32 };
-        // Lane l's NF quote flags in the low bits of 32-bit lane l: one test per field, and the
+        // Lane l's NF quote flags in the low bits of 64-bit lane l: one test per field, and the
         // value bounds are one masked add each.
         let n = NF as i64;
         let qv = _mm512_srlv_epi64(_mm512_set1_epi64(sc.q_window(k0) as i64), _mm512_setr_epi64(0, n, 2 * n, 3 * n, 4 * n, 5 * n, 6 * n, 7 * n));
-        let ql = _mm512_cvtepi64_epi32(qv);
         let m1 = _mm256_set1_epi32(-1);
         // [prev_pos, last separators of lanes 0..7] + 1: one element shift across the pair.
         let ls = _mm256_sub_epi32(_mm256_alignr_epi32::<7>(sep[NF - 1], _mm256_set1_epi32(prev_pos)), m1);
         let mut vs = [_mm256_setzero_si256(); NF];
         let mut ve = [_mm256_setzero_si256(); NF];
         for j in 0..NF {
-            let q = _mm256_test_epi32_mask(ql, _mm256_set1_epi32(1 << j));
+            let q = _mm512_test_epi64_mask(qv, _mm512_set1_epi64(1 << j));
             let s = if j == 0 { ls } else { _mm256_sub_epi32(sep[j - 1], m1) };
             vs[j] = mask_sub32(s, q, m1);
             ve[j] = mask_add32(sep[j], q, m1);
@@ -660,11 +676,12 @@ pub(crate) unsafe fn ev_batch<const S: bool>(f: &Fast, dates: &Dates, base: *con
         // ts.
         let t_hi = gather64(wbase, vs[2]);
         let t_mid = gather64o(wbase, vs[2], 8);
-        let t_16 = gather64o(wbase, vs[2], 16);
+        // HH:MM:SS (bytes 11..19) as its own gather: no shifts to join it from two others.
+        let t_11 = gather64o(wbase, vs[2], 11);
         let t_17 = gather64o(wbase, vs[2], 17);
         let (day_s, date_ok, t_ok) = date(dates, t_hi, t_mid);
-        let (secs, hms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(t_mid), _mm512_slli_epi64::<40>(t_16)));
-        let z = _mm512_cmpeq_epi64_mask(byte_at(t_16, 3), _mm512_set1_epi64(b'Z' as i64));
+        let (secs, hms_ok) = hms::<S>(t_11);
+        let z = _mm512_cmpeq_epi64_mask(byte_at(t_17, 2), _mm512_set1_epi64(b'Z' as i64));
         let (off, off_ok) = offset::<S>(t_17);
         let dt_ok = date_ok & t_ok & hms_ok;
         let f1 = _mm512_cmpeq_epi64_mask(len[2], _mm512_set1_epi64(20)) & z & dt_ok;
@@ -829,11 +846,12 @@ pub(crate) unsafe fn click_batch<const S: bool>(f: &Fast, dates: &Dates, base: *
         // ts.
         let t_hi = gather64(wbase, vs[3]);
         let t_mid = gather64o(wbase, vs[3], 8);
-        let t_16 = gather64o(wbase, vs[3], 16);
+        // HH:MM:SS (bytes 11..19) as its own gather: no shifts to join it from two others.
+        let t_11 = gather64o(wbase, vs[3], 11);
         let t_17 = gather64o(wbase, vs[3], 17);
         let (day_s, date_ok, t_ok) = date(dates, t_hi, t_mid);
-        let (secs, hms_ok) = hms::<S>(_mm512_or_si512(_mm512_srli_epi64::<24>(t_mid), _mm512_slli_epi64::<40>(t_16)));
-        let z = _mm512_cmpeq_epi64_mask(byte_at(t_16, 3), _mm512_set1_epi64(b'Z' as i64));
+        let (secs, hms_ok) = hms::<S>(t_11);
+        let z = _mm512_cmpeq_epi64_mask(byte_at(t_17, 2), _mm512_set1_epi64(b'Z' as i64));
         let (off, off_ok) = offset::<S>(t_17);
         let dt_ok = date_ok & t_ok & hms_ok;
         let f1 = _mm512_cmpeq_epi64_mask(len[3], _mm512_set1_epi64(20)) & z & dt_ok;

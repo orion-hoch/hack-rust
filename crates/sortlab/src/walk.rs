@@ -1433,6 +1433,19 @@ pub fn walk_blocks<F: FnMut(u64, u64) -> Ordering>(
     let mut r = usize::MAX;
     let mut s0 = 0usize;
     for p in 0..np {
+        // Click blocks sit wherever P1's streams put them: ask for the first two lines of the
+        // click block of the person three ahead (each block read was a miss).
+        #[cfg(target_arch = "x86_64")]
+        if p + 3 < np {
+            if let Some(nb) = pb.ck.get(pb.ck_at[p + 3] as usize) {
+                let q = nb.as_ptr() as *const i8;
+                // SAFETY: a prefetch never faults; the addresses are in or just past a live block.
+                unsafe {
+                    core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(q);
+                    core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(q.wrapping_add(64));
+                }
+            }
+        }
         let s1 = out.sess_end[p] as usize;
         if s1 < s0 || s1 > ns {
             res = Err(Error::WalkInput);

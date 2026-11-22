@@ -254,29 +254,33 @@ fn block_at(w: &[u64]) -> Option<(usize, bool, u64)> {
 pub struct GroupScratch {
     keys: Vec<u64>,
     vals: Vec<u32>,
-    /// Slots taken in this partition (only those are reset).
+    /// Slot of person k in this partition (only those are reset).
     used: Vec<u32>,
-    /// Blocks in input order: (person, click, block).
-    refs: Vec<(u32, bool, (*const u64, usize))>,
-    ev_cur: Vec<u32>,
-    ck_cur: Vec<u32>,
+    /// Person of each person block and of each click block, in input order.
+    kev: Vec<u32>,
+    kck: Vec<u32>,
+    /// The block lists in input order, for the placement by person.
+    ev_in: Vec<*const [u64]>,
+    ck_in: Vec<*const [u64]>,
+    /// Per person k: [person blocks, click blocks] counted by the pass, then their next places.
+    cur: Vec<[u32; 2]>,
 }
 
-// SAFETY: the raw block pointers in `refs` are only used inside `group`, while the chunks they
-// point into are borrowed.
+// SAFETY: the raw block pointers in `ev_in` / `ck_in` are only used inside `group`, while the
+// chunks they point into are borrowed.
 unsafe impl Send for GroupScratch {}
 
 const NO_KEY: u64 = u64::MAX;
 
 /// Doubles the person map and re-inserts `pks` (person k at its key); returns the new mask.
 #[cold]
+#[inline(never)]
 fn grow(gs: &mut GroupScratch, pks: &[u64]) -> usize {
     let n = gs.keys.len() * 2;
     gs.keys.clear();
     gs.keys.resize(n, NO_KEY);
     gs.vals.clear();
     gs.vals.resize(n, 0);
-    gs.used.clear();
     let mask = n - 1;
     for (k, &pk) in pks.iter().enumerate() {
         let mut h = (pk ^ (pk >> 29)) as usize & mask;
@@ -285,16 +289,20 @@ fn grow(gs: &mut GroupScratch, pks: &[u64]) -> usize {
         }
         gs.keys[h] = pk;
         gs.vals[h] = k as u32;
-        gs.used.push(h as u32);
+        // SAFETY: `used` has room for every person of the partition (reserved by `group`).
+        unsafe { *gs.used.as_mut_ptr().add(k) = h as u32 };
     }
     mask
 }
 
 /// Groups the blocks of `chunks` (each holding whole blocks, ended by its last word or a zero
 /// header word) by person key. None when a block does not fit its chunk.
+///
+/// One pass finds each block's person (opened at its first block), counts the person's blocks
+/// and notes the block reference with its person in input order; a prefix sum over the persons
+/// and one placement pass finish the counting sort. (On generator data a third of the blocks
+/// belong to a person opened earlier, in every partition: the blocks never arrive sorted.)
 pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a>) -> Option<()> {
-    g.pks.clear();
-    gs.refs.clear();
     // Sized for about one block per 8 words (generator data: one per 13), so the map stays in L1
     // or L2; it doubles if it passes half full.
     let words: usize = chunks.iter().map(|c| c.len()).sum();
@@ -304,92 +312,164 @@ pub fn group<'a>(chunks: &[&'a [u64]], gs: &mut GroupScratch, g: &mut Grouped<'a
         gs.keys.resize(want, NO_KEY);
         gs.vals.clear();
         gs.vals.resize(want, 0);
-        gs.used.clear();
     }
+    // A block has at least 2 words: at most words / 2 blocks and persons. Reserved once (the
+    // capacity stays), so the pass writes through raw pointers with no checks.
+    let cap = words / 2 + 2;
+    g.pks.clear();
+    g.pks.reserve(cap);
+    gs.used.clear();
+    gs.used.reserve(cap);
+    gs.cur.clear();
+    gs.cur.reserve(cap);
+    gs.kev.clear();
+    gs.kev.reserve(cap);
+    gs.kck.clear();
+    gs.kck.reserve(cap);
+    gs.ev_in.clear();
+    gs.ev_in.reserve(cap);
+    gs.ck_in.clear();
+    gs.ck_in.reserve(cap);
     let mut mask = gs.keys.len() - 1;
-    let (mut nev, mut nck) = (0u32, 0u32);
+    let (mut keys, mut vals) = (gs.keys.as_mut_ptr(), gs.vals.as_mut_ptr());
+    let used = gs.used.as_mut_ptr();
+    let cur = gs.cur.as_mut_ptr();
+    let (kev, kck) = (gs.kev.as_mut_ptr(), gs.kck.as_mut_ptr());
+    let (ev_in, ck_in) = (gs.ev_in.as_mut_ptr(), gs.ck_in.as_mut_ptr());
+    let pks = g.pks.as_mut_ptr();
+    let (mut np, mut nev, mut nck) = (0usize, 0usize, 0usize);
+    let mut ok = true;
     // A click block usually directly follows its person block: the same key as the last block
     // needs no lookup.
-    let (mut last_pk, mut last_k) = (NO_KEY, 0u32);
-    for c in chunks {
-        let mut at = 0usize;
-        while at < c.len() && c[at] != 0 {
-            let (len, click, pk) = block_at(&c[at..])?;
-            if pk == NO_KEY {
-                return None;
-            }
-            // pk is a mixed key (uniform low bits) or a wide index: its low bits hash it.
-            let mut h = (pk ^ (pk >> 29)) as usize & mask;
-            let k = if pk == last_pk { last_k } else { loop {
-                let key = gs.keys[h];
-                if key == pk {
-                    break gs.vals[h];
+    let (mut last_pk, mut last_k) = (NO_KEY, 0usize);
+    // SAFETY: every read is below the chunk's length (`at + 1 < n` for the two header words, the
+    // block's length checked against the rest before it is referenced); every write is below the
+    // capacity reserved above (at most words / 2 blocks, so at most that many persons); map slots
+    // are masked.
+    unsafe {
+        'all: for c in chunks {
+            let (p, n) = (c.as_ptr(), c.len());
+            let lim = n.saturating_sub(1);
+            let mut at = 0usize;
+            while at < lim {
+                let h0 = *p.add(at);
+                if h0 == 0 {
+                    break;
                 }
-                if key == NO_KEY {
-                    let k = g.pks.len() as u32;
-                    gs.keys[h] = pk;
-                    gs.vals[h] = k;
-                    gs.used.push(h as u32);
-                    g.pks.push(pk);
-                    if 2 * g.pks.len() > gs.keys.len() {
-                        mask = grow(gs, &g.pks);
+                let pk = *p.add(at + 1);
+                let k = if pk == last_pk {
+                    last_k
+                } else {
+                    // pk is a mixed key (uniform low bits) or a wide index: its low bits hash it.
+                    let mut h = (pk ^ (pk >> 29)) as usize & mask;
+                    loop {
+                        let key = *keys.add(h);
+                        if key == NO_KEY {
+                            if pk == NO_KEY {
+                                ok = false;
+                                break 'all;
+                            }
+                            let k = np;
+                            *keys.add(h) = pk;
+                            *vals.add(h) = k as u32;
+                            *used.add(k) = h as u32;
+                            *pks.add(k) = pk;
+                            *cur.add(k) = [0, 0];
+                            np += 1;
+                            if 2 * np > mask + 1 {
+                                mask = grow(gs, std::slice::from_raw_parts(pks, np));
+                                keys = gs.keys.as_mut_ptr();
+                                vals = gs.vals.as_mut_ptr();
+                            }
+                            break k;
+                        }
+                        if key == pk {
+                            break *vals.add(h) as usize;
+                        }
+                        h = (h + 1) & mask;
                     }
-                    break k;
+                };
+                last_pk = pk;
+                last_k = k;
+                let lo = (h0 & N24) as usize;
+                let len;
+                if h0 & CLICK_MARK != 0 {
+                    len = 2 + 2 * lo;
+                    if len > n - at {
+                        ok = false;
+                        break 'all;
+                    }
+                    *ck_in.add(nck) = std::ptr::slice_from_raw_parts(p.add(at), len);
+                    *kck.add(nck) = k as u32;
+                    (*cur.add(k))[1] += 1;
+                    nck += 1;
+                } else {
+                    len = 2 + lo.div_ceil(2) + ((h0 >> 24) & N24) as usize;
+                    if len > n - at {
+                        ok = false;
+                        break 'all;
+                    }
+                    *ev_in.add(nev) = std::ptr::slice_from_raw_parts(p.add(at), len);
+                    *kev.add(nev) = k as u32;
+                    (*cur.add(k))[0] += 1;
+                    nev += 1;
                 }
-                h = (h + 1) & mask;
-            } };
-            last_pk = pk;
-            last_k = k;
-            gs.refs.push((k, click, (c[at..].as_ptr(), len)));
-            if click {
-                nck += 1;
-            } else {
-                nev += 1;
+                at += len;
             }
-            at += len;
+            // a header word with no room for its key
+            if at < n && *p.add(at) != 0 {
+                ok = false;
+                break;
+            }
         }
-    }
-    for &h in &gs.used {
-        gs.keys[h as usize] = NO_KEY;
-    }
-    gs.used.clear();
-    // Counting sort of the block references by person, person blocks and click blocks apart.
-    let np = g.pks.len();
-    g.ev_at.clear();
-    g.ev_at.resize(np + 1, 0);
-    g.ck_at.clear();
-    g.ck_at.resize(np + 1, 0);
-    for &(k, click, _) in &gs.refs {
-        if click {
-            g.ck_at[k as usize + 1] += 1;
-        } else {
-            g.ev_at[k as usize + 1] += 1;
+        for i in 0..np {
+            *keys.add(*used.add(i) as usize) = NO_KEY;
         }
-    }
-    for k in 1..=np {
-        g.ev_at[k] += g.ev_at[k - 1];
-        g.ck_at[k] += g.ck_at[k - 1];
-    }
-    gs.ev_cur.clear();
-    gs.ev_cur.extend_from_slice(&g.ev_at[..np]);
-    gs.ck_cur.clear();
-    gs.ck_cur.extend_from_slice(&g.ck_at[..np]);
-    g.ev.clear();
-    g.ev.resize(nev as usize, &[]);
-    g.ck.clear();
-    g.ck.resize(nck as usize, &[]);
-    for &(k, click, (p, len)) in &gs.refs {
-        // SAFETY: (p, len) is a block inside one of `chunks` (borrowed for 'a), read above.
-        let b: &'a [u64] = unsafe { std::slice::from_raw_parts(p, len) };
-        if click {
-            let at = &mut gs.ck_cur[k as usize];
-            g.ck[*at as usize] = b;
-            *at += 1;
-        } else {
-            let at = &mut gs.ev_cur[k as usize];
-            g.ev[*at as usize] = b;
-            *at += 1;
+        if !ok {
+            return None;
         }
+        // Counts to offsets and next places.
+        g.ev_at.clear();
+        g.ev_at.reserve(np + 1);
+        g.ck_at.clear();
+        g.ck_at.reserve(np + 1);
+        let (ev_at, ck_at) = (g.ev_at.as_mut_ptr(), g.ck_at.as_mut_ptr());
+        let (mut a, mut b) = (0u32, 0u32);
+        for k in 0..np {
+            let [ca, cb] = *cur.add(k);
+            *ev_at.add(k) = a;
+            *ck_at.add(k) = b;
+            *cur.add(k) = [a, b];
+            a += ca;
+            b += cb;
+        }
+        *ev_at.add(np) = a;
+        *ck_at.add(np) = b;
+        // A key of NO_KEY is refused where a person is opened; blocks carrying it before the first
+        // person passed as "the same as the last key" and were counted for nobody.
+        if a as usize != nev || b as usize != nck {
+            return None;
+        }
+        g.pks.set_len(np);
+        g.ev_at.set_len(np + 1);
+        g.ck_at.set_len(np + 1);
+        g.ev.clear();
+        g.ev.reserve(nev);
+        g.ck.clear();
+        g.ck.reserve(nck);
+        let (ev, ck) = (g.ev.as_mut_ptr(), g.ck.as_mut_ptr());
+        for i in 0..nev {
+            let c = &mut (*cur.add(*kev.add(i) as usize))[0];
+            *ev.add(*c as usize) = &*(*ev_in.add(i));
+            *c += 1;
+        }
+        for i in 0..nck {
+            let c = &mut (*cur.add(*kck.add(i) as usize))[1];
+            *ck.add(*c as usize) = &*(*ck_in.add(i));
+            *c += 1;
+        }
+        g.ev.set_len(nev);
+        g.ck.set_len(nck);
     }
     Some(())
 }
