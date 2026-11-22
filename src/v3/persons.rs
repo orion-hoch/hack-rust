@@ -22,6 +22,36 @@ pub fn region_bytes(capacity: usize, endpoints: usize) -> usize {
     4 * capacity + capacity / 4 + 24 * endpoints + (8 << 20)
 }
 
+/// Rem's union with splicing, for parents never above their child (p[i] <= i, roots p[r] = r):
+/// both paths are walked at once, the one with the larger parent stepping up after its parent is
+/// replaced by the other's (smaller) parent; it stops when the parents meet (same component) or a
+/// root is linked under the other side. Roots stay their components' smallest index.
+#[inline(always)]
+fn rem_union(p: &mut [u32], a: u32, b: u32) {
+    let (mut x, mut y) = (a as usize, b as usize);
+    loop {
+        let (px, py) = (p[x] as usize, p[y] as usize);
+        if px == py {
+            return;
+        }
+        if px > py {
+            // p[x] = py < px <= x keeps p[i] <= i; x then moves to its old parent (smaller).
+            p[x] = py as u32;
+            if px == x {
+                return;
+            }
+            x = px;
+        } else {
+            p[y] = px as u32;
+            if py == y {
+                return;
+            }
+            y = py;
+        }
+    }
+}
+
+#[allow(dead_code)]
 #[inline]
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
@@ -152,11 +182,7 @@ impl People {
                     prefetch(&parent[nx[1] as usize]);
                     ring[j % D] = nx;
                 }
-                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-                if ra != rb {
-                    let (hi, lo) = if ra > rb { (ra, rb) } else { (rb, ra) };
-                    parent[hi as usize] = lo;
-                }
+                rem_union(&mut parent, a, b);
             }
         }
         drop(bits);

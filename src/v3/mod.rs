@@ -127,9 +127,63 @@ fn open_rt(dir: &Path) -> io::Result<Result<(Dataset, &'static rt::input::Inputs
     Ok(Ok((ds, inp)))
 }
 
+/// L2 bytes per hardware thread of CPU 0 (sysfs cache/index2 size over its thread siblings);
+/// 512 KB when unreadable.
+fn l2_per_thread() -> usize {
+    let rd = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string());
+    let base = "/sys/devices/system/cpu/cpu0";
+    let size = match (rd(&format!("{base}/cache/index2/level")), rd(&format!("{base}/cache/index2/size"))) {
+        (Some(l), Some(s)) if l == "2" => {
+            let (num, mul) = match s.strip_suffix('K') {
+                Some(n) => (n, 1usize << 10),
+                None => match s.strip_suffix('M') {
+                    Some(n) => (n, 1 << 20),
+                    None => (s.as_str(), 1),
+                },
+            };
+            num.parse::<usize>().ok().map(|v| v * mul)
+        }
+        _ => None,
+    };
+    let Some(size) = size else { return 512 << 10 };
+    // "0", "0,64", "0-1": count the listed threads.
+    let siblings = rd(&format!("{base}/topology/thread_siblings_list")).map_or(1, |l| {
+        l.split(',')
+            .map(|r| match r.split_once('-') {
+                Some((a, b)) => b.parse::<usize>().unwrap_or(0).saturating_sub(a.parse::<usize>().unwrap_or(0)) + 1,
+                None => 1,
+            })
+            .sum::<usize>()
+            .max(1)
+    });
+    size / siblings
+}
+
+/// `bits` moved by the signed integer in env `var` (measurement sweeps), kept in [lo, hi].
+fn bits_delta(bits: u32, var: &str, lo: u32, hi: u32) -> u32 {
+    let d: i32 = std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (bits as i32 + d).clamp(lo as i32, hi as i32) as u32
+}
+
 pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Result<Outcome> {
     let t0 = Instant::now();
     let mut clock = Clock { on: timing, last: t0, last_use: if timing { usage() } else { (0.0, 0.0, 0, 0) } };
+    if timing {
+        // The machine's caches as detected (partition sizes are set for half an L2 per thread).
+        let c = rt::cpu::caches();
+        let l = rt::cpu::topology(&rt::cpu::affinity(), b"/sys/devices/system/cpu");
+        eprintln!(
+            "v3: L2 {} KB shared by {} ({} KB per thread), L3 {} MB shared by {}, from {}; {} CPUs on {} cores",
+            c.l2 >> 10,
+            c.l2_shared,
+            c.l2_per_thread() >> 10,
+            c.l3 >> 20,
+            c.l3_shared,
+            match c.source { b's' => "sysfs", b'c' => "cpuid", _ => "nothing" },
+            l.n,
+            l.cores
+        );
+    }
     crate::par::init_pool(threads);
     if cfg!(feature = "measure") && std::env::var("ENGINE_BINPF").as_deref() == Ok("0") {
         crate::fast::sink::BINPF.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -167,7 +221,14 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         return Ok(Outcome::Fallback("persons region could not be reserved".into()));
     }
     // Move-1 partitions of about 16K records: the dedup table (32K slots) stays in L2.
-    let p1_bits = ((est_events / 16_000).max(1).next_power_of_two().trailing_zeros()).clamp(4, 14);
+    // Move-1 partitions: one bit coarser than about 16K records each, and at most 2^11 (2^10 when
+    // a thread has under 448 KB of L2): the sink's write fronts, one per partition and worker,
+    // cost more than the larger dedup tables save. Swept on box 2 (Zen 2, 512 KB L2) and box 1:
+    // at f60v5 2^11 instead of 2^13 took 6 to 9% off the whole run's CPU, at p20v5 2^10 instead
+    // of 2^11 about 2%.
+    let p1_raw = (est_events / 16_000).max(1).next_power_of_two().trailing_zeros();
+    let p1_cap = if l2_per_thread() < (448 << 10) { 10 } else { 11 };
+    let p1_bits = bits_delta(p1_raw.saturating_sub(1).min(p1_cap).clamp(4, 14), "ENGINE_P1_DELTA", 4, 14);
     clock.mark("open");
 
     // Parse A: links, then clicks.
@@ -309,7 +370,9 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let typical_short = (sinks.iter().map(|s| s.short.len()).sum::<usize>() / parts) * 2 + 64;
     let typical_long = (sinks.iter().map(|s| s.long.len()).sum::<usize>() / parts) * 2 + 64;
     let est_surv = est_events;
-    let p2_bits = ((est_surv / 24_000).max(1).next_power_of_two().trailing_zeros()).clamp(4, 13);
+    // Move-2 (person) partitions: likewise one bit coarser, at most 2^11 (swept with move 1).
+    let p2_raw = (est_surv / 24_000).max(1).next_power_of_two().trailing_zeros();
+    let p2_bits = bits_delta(p2_raw.saturating_sub(1).min(11).clamp(4, 13), "ENGINE_P2_DELTA", 4, 13);
     let cx3 = Ctx3 { people: &people, ingest_base_ms: ctx.ingest_base_s * 1000 };
     let sinks_ref = &sinks;
     let spec_ref = &spec_by_part;
