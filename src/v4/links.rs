@@ -645,6 +645,7 @@ pub struct LinkTasks<'a> {
     /// The finished links: the worker that completes the last link chunk resolves them itself
     /// and leaves the result here.
     out: Mutex<Option<super::Stage<Links>>>,
+    defer: std::sync::atomic::AtomicBool,
     timing: bool,
     t0: std::time::Instant,
     busy_ns: AtomicU64,
@@ -665,6 +666,7 @@ impl<'a> LinkTasks<'a> {
             done: Mutex::new(0),
             all_done: std::sync::Condvar::new(),
             out: Mutex::new(None),
+            defer: std::sync::atomic::AtomicBool::new(false),
             timing: cx.timing,
             t0: std::time::Instant::now(),
             busy_ns: AtomicU64::new(0),
@@ -698,7 +700,7 @@ impl<'a> LinkTasks<'a> {
             *d += 1;
             *d == self.chunks.len()
         };
-        if last {
+        if last && !self.defer.load(Relaxed) {
             // The worker that completes the links resolves them itself, beside the other workers'
             // event and click chunks: no extra thread (a ninth thread starved under SCHED_FIFO).
             let r = self.finish(self.b2);
@@ -707,8 +709,23 @@ impl<'a> LinkTasks<'a> {
         }
     }
 
+    /// The link chunks run in a pool run of their own (before the side tables are ready): the
+    /// last one must not resolve inline; `finish_deferred` does it as a task of the next run.
+    pub fn set_defer(&self) {
+        self.defer.store(true, Relaxed);
+    }
+
+    /// Resolves the links now (every link task has finished) and keeps the result for `result`.
+    pub fn finish_deferred(&self) {
+        let r = self.finish(self.b2);
+        *self.out.lock().unwrap() = Some(r);
+    }
+
     /// The links, after the pool run that held the link tasks has returned.
     pub fn result(&self) -> super::Stage<Links> {
+        if let Some(r) = self.out.lock().unwrap().take() {
+            return r;
+        }
         if self.chunks.is_empty() {
             return self.finish(self.b2);
         }

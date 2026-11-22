@@ -176,6 +176,19 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     if !crate::v3::mem::init((input_bytes as usize / 100) * 45) {
         return Ok(Outcome::Fallback("memory region could not be reserved".into()));
     }
+    // Link lines need no side table: their chunks run now, in a pool run of their own, while
+    // the side-table thread finishes (the main thread used to wait for it here, about 1 ms).
+    let est_events = ds.bytes(Stream::Events) as usize / 70 + 1;
+    let (b1, b2) = keys::part_bits(ds.bytes(Stream::Events));
+    let isa = parselab::fast::Isa::detect();
+    let Ok(ctx0) = parselab::Ctx::new((0, 1), Default::default(), Default::default()) else {
+        return Ok(Outcome::Fallback("v4: the provisional context could not be built".into()));
+    };
+    let cx0 = Cx { ds: &ds, ctx: &ctx0, inp, fp: parselab::fast::Fast::new(&ctx0), isa, plan: Plan { threads, est_events, b1, b2 }, timing };
+    let lt = links::LinkTasks::new(&cx0);
+    lt.set_defer();
+    lap("link run");
+    crate::par::run(threads, lt.len(), |t| t, |t, i| lt.task(&cx0, i, *t));
     let Ok(tables) = side.join() else {
         return Ok(Outcome::Fallback("v4: the side-table thread failed".into()));
     };
@@ -190,14 +203,12 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
         return Ok(Outcome::Fallback("v4: 4,096 campaigns or more (I3 keeps 12 bits)".into()));
     }
     // Partition bits (RECORDS-V4.md section 2): computed once here, read by every stage.
-    let est_events = ds.bytes(Stream::Events) as usize / 70 + 1;
-    let (b1, b2) = keys::part_bits(ds.bytes(Stream::Events));
     let cx = Cx {
         ds: &ds,
         ctx: &ctx,
         inp,
         fp: parselab::fast::Fast::new(&ctx),
-        isa: parselab::fast::Isa::detect(),
+        isa,
         plan: Plan { threads, est_events, b1, b2 },
         timing,
     };
@@ -207,9 +218,8 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     mark("open");
     // One pool run for the link, event and click chunks (links first); the worker that completes
     // the last link chunk runs the links' union-find and layout itself, beside the rest.
-    let lt = links::LinkTasks::new(&cx);
     lap("pool run");
-    let (ev, ck) = sink::parse_all(&cx, &lt);
+    let (ev, ck) = sink::parse_all(&cx, &lt, true);
     let links = lt.result();
     drop(lt);
     let (links, ev, ck) = (stage!(links), stage!(ev), stage!(ck));
