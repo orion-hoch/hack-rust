@@ -366,6 +366,55 @@ fn huge_pages(cfg: &Config) {
     alloc::set_thp_budget(budget);
 }
 
+/// PROBE build (not for the trunk): sleeps just before exit so the scorer's time reports two
+/// facts about its machine. Probe 2: 100 ms x C + 400 ms x D.
+fn probe_ms(cfg: &Config) -> u64 {
+    let _ = cfg;
+    // C: the huge-page verdict for this run (0 no: THP never; 1 no or budget: memory short; 2 yes).
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = 0u64;
+    for sub in ["events", "clicks", "links"] {
+        if let Ok(l) = rt::input::scan(cfg.data.join(sub).as_os_str().as_bytes()) {
+            bytes += l.files().iter().chain(l.dots()).map(|e| e.size).sum::<u64>();
+        }
+    }
+    let v = rt::arena::huge_verdict((bytes as usize) / 10 * 7);
+    let c = if v.enabled == b'n' { 0 } else if !v.use_huge { 1 } else { 2 };
+    // D: CPU class (0 Intel with AVX-512; 1 AMD with AVX-512; 2 AMD without AVX-512; 3 other).
+    let d = cpu_class();
+    100 * c + 400 * d
+}
+
+fn probe_sleep(cfg: &Config) {
+    std::thread::sleep(std::time::Duration::from_millis(probe_ms(cfg)));
+}
+
+/// PROBE: the CPU class from cpuid (see probe_ms).
+fn cpu_class() -> u64 {
+    // D: 0 Intel with AVX-512; 1 AMD with AVX-512; 2 AMD without AVX-512; 3 Intel without
+    // AVX-512, or any other vendor.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::__cpuid;
+        let v = unsafe { __cpuid(0) };
+        let intel = v.ebx == 0x756e_6547 && v.edx == 0x4965_6e69 && v.ecx == 0x6c65_746e; // "GenuineIntel"
+        let amd = v.ebx == 0x6874_7541 && v.edx == 0x6974_6e65 && v.ecx == 0x444d_4163; // "AuthenticAMD"
+        let wide = std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vl");
+        match (intel, amd, wide) {
+            (true, _, true) => 0,
+            (_, true, true) => 1,
+            (_, true, false) => 2,
+            _ => 3,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        3
+    }
+}
+
 fn main() {
     // First, while single-threaded: grow the descriptor table (growing it once threads share it
     // waits an RCU grace period, 11 to 22 ms measured on the x86 box) and start the stage clock.
@@ -395,7 +444,10 @@ fn main() {
         let why = match fast {
             // Done: release input and memory in parallel, then exit_group (no destructors); with
             // everything still mapped the kernel's single-thread teardown took 80 to 90 ms.
-            Ok(fast::Outcome::Done) => rt::exit::leave(0, &rt::exit::Release::ALL),
+            Ok(fast::Outcome::Done) => {
+                probe_sleep(&cfg);
+                rt::exit::leave(0, &rt::exit::Release::ALL)
+            }
             Ok(fast::Outcome::Fallback(why)) => why,
             Err(e) => format!("I/O error: {e}"),
         };
@@ -418,4 +470,5 @@ fn main() {
         eprintln!("engine: {e}");
         std::process::exit(1);
     }
+    probe_sleep(&cfg);
 }

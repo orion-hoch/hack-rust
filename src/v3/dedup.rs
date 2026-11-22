@@ -246,19 +246,11 @@ pub struct Out {
     chunk_lines: usize,
     /// Partitions - 1 (a power of two minus one): every per-partition array has mask + 1 entries.
     mask: usize,
-    /// Chunks come from the fast path's 8 KB block class for this pool participant (blocks the
-    /// worker freed first: no fresh pages), or from `blocks` when NO_ARENA.
-    arena: usize,
 }
-
-const NO_ARENA: usize = usize::MAX;
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct Line([u64; 8]);
-
-/// Bytes of a move-2 chunk in arena mode (the 8 KB block class).
-const BLOCK_BYTES: usize = 8 << 10;
 
 // SAFETY: the raw pointers point into `blocks`, owned by the struct; moving it moves that
 // ownership (the blocks' heap memory does not move).
@@ -299,7 +291,6 @@ impl Out {
         let chunk_lines = chunk.div_ceil(8).max(1);
         let n = n.next_power_of_two();
         Out {
-            arena: NO_ARENA,
             mask: n - 1,
             stage: vec![Line([0; 8]); n],
             fill: vec![0; n],
@@ -349,18 +340,6 @@ impl Out {
         }
     }
 
-    /// `n` partitions with chunks of one 8 KB block each (1,024 records) from the fast path's block
-    /// class, for pool participant `w` (unique among the stage's concurrent users).
-    pub fn new_in(n: usize, w: usize) -> Self {
-        let b = super::mem::B8K.block_size();
-        let mut o = Out::new(n, 0, b / 8);
-        // Only when the class is attached with 8 KB blocks: a block is then exactly one chunk.
-        if b == BLOCK_BYTES && w < rt::pool::MAX_WORKERS {
-            o.arena = w;
-        }
-        o
-    }
-
     #[cold]
     #[inline(never)]
     fn refill(&mut self, q: usize) {
@@ -368,15 +347,6 @@ impl Out {
             // SAFETY: end[q] is chunk_lines lines past the start of the same chunk.
             let start = unsafe { self.end[q].sub(self.chunk_lines) };
             self.full[q].push((start as *const u64, (self.chunk_lines * 8) as u32));
-        }
-        if self.arena != NO_ARENA {
-            // SAFETY: only this worker uses index `arena` while the stage runs (new_in's caller);
-            // the block is BLOCK_BYTES = chunk_lines lines, aligned to its size (so to 64 bytes).
-            let p = unsafe { super::mem::B8K.alloc(self.arena) } as *mut Line;
-            self.cur[q] = p;
-            // SAFETY: the block holds chunk_lines lines.
-            self.end[q] = unsafe { p.add(self.chunk_lines) };
-            return;
         }
         if self.bump == self.bump_end {
             // Blocks are plain u64 vectors of a power-of-two size, like every other big buffer
@@ -449,36 +419,15 @@ pub struct Move2 {
     pub ev: Out,
     pub buys: Bins<[u64; 2]>,
     pub bits: u32,
-    /// Block-class mode (`new_in`): the pool participant index, else NO_ARENA.
-    w: usize,
 }
 
 impl Move2 {
-    /// Block-class mode for pool participant `w` (unique among the stage's concurrent users):
-    /// survivor chunks are 8 KB blocks (`mem::B8K`), purchase chunks 256-byte blocks (`mem::B256`),
-    /// taken from the blocks this worker freed first. AND `partition` frees every move-1 chunk it
-    /// is handed once the partition no longer reads it: the caller promises that those chunks
-    /// are whole blocks of `mem::B8K` (SHORT), `mem::B2K` (LONG) and `mem::B256` (purchases), each
-    /// in exactly one partition's lists and read by nobody after its partition (the sink's
-    /// `Bins::from_blocks` chunks, as the driver hands them over).
-    pub fn new_in(bits: u32, hint: usize, w: usize) -> Self {
-        let mut m = Move2::new(bits, hint);
-        let parts = 1usize << bits;
-        m.ev = Out::new_in(parts, w);
-        if m.ev.arena == w && super::mem::B256.block_size() == 256 {
-            m.buys = Bins::from_blocks(parts, &super::mem::B256, w);
-            m.w = w;
-        }
-        m
-    }
-
     pub fn new(bits: u32, hint: usize) -> Self {
         let parts = 1usize << bits;
         Move2 {
             ev: Out::new(parts, hint.clamp(1 << 14, 1 << 21), (hint / parts / 2).clamp(64, 512)),
             buys: Bins::with_chunk(parts, 1 << 12, (hint / parts / 64).clamp(4, 64)),
             bits,
-            w: NO_ARENA,
         }
     }
 
@@ -898,13 +847,6 @@ pub fn partition(
         }
     }
     t.marked.clear();
-    // The move-1 chunks are read for the last time above: in block-class mode they go back to
-    // this worker's lists now, so the move-2 output below reuses them (no fresh pages).
-    if m2.w != NO_ARENA {
-        // SAFETY: new_in's contract: every chunk is a whole block of its class, in this
-        // partition only, and nothing reads it after this partition.
-        unsafe { release(m2.w, short, long, pshort, plong) };
-    }
 
     // Survivor scan: the winners' survivor words, densely; the slots are zeroed after.
     let mut n = 0usize;
@@ -1003,32 +945,6 @@ pub fn partition(
         core::arch::x86_64::_mm_sfence()
     };
     Ok(n + t.spec.len())
-}
-
-/// Returns a partition's move-1 chunks to their block classes for pool participant `w`.
-/// SAFETY: as Move2::new_in's contract; `w` is the caller's participant index. The blocks are
-/// addressed by number, as the classes themselves keep them (their free lists are addresses), so
-/// the pointer takes the region's exposed provenance, not the read-only one of the slices; the
-/// slices are not read again.
-unsafe fn release(w: usize, short: &[&[[u64; 2]]], long: &[&[[u64; 4]]], pshort: &[&[[u64; 2]]], plong: &[&[[u64; 4]]]) {
-    use super::mem::{B256, B2K, B8K};
-    let blk = |c: usize| std::ptr::with_exposed_provenance_mut::<u8>(c);
-    // SAFETY (each free): the block came from that class's alloc (the sink's from_blocks) and is
-    // dead from here on (caller).
-    unsafe {
-        for c in short {
-            B8K.free(w, blk(c.as_ptr() as usize));
-        }
-        for c in long {
-            B2K.free(w, blk(c.as_ptr() as usize));
-        }
-        for c in pshort {
-            B256.free(w, blk(c.as_ptr() as usize));
-        }
-        for c in plong {
-            B256.free(w, blk(c.as_ptr() as usize));
-        }
-    }
 }
 
 /// FOREIGN event IDs: copies only of each other; smallest ingest by bytes, then to move 2.

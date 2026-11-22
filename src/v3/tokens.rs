@@ -252,8 +252,7 @@ impl<'a> Tokens<'a> {
                 long_cap = long_cap.max(l);
             }
         }
-        let tbytes = (short_cap + long_cap * 4) * 8;
-        let huge = tables_huge(tbytes) && rt::arena::take_huge(tbytes);
+        let huge = tables_huge((short_cap + long_cap * 4) * 8);
         Tokens {
             short: Table::new(short_cap, huge),
             short_mask: short_cap - 1,
@@ -424,47 +423,6 @@ impl<'a> Tokens<'a> {
     #[inline(always)]
     pub fn finish(&self, p: &Pending) -> u32 {
         if !p.long { self.short_token(p.a, p.slot) } else { self.long_token(p.a, p.b, p.slot) }
-    }
-
-    /// `finish` without inserting: the token of a started lookup, or NO_TOKEN if the ID is not in
-    /// the table. For phases that run after every insert (no writer runs meanwhile).
-    #[inline(always)]
-    pub fn find(&self, p: &Pending) -> u32 {
-        let mut i = p.slot;
-        if !p.long {
-            let want = p.a + 1;
-            loop {
-                let cur = self.short[i].load(Relaxed);
-                if cur == want {
-                    return i as u32;
-                }
-                if cur == 0 {
-                    return NO_TOKEN;
-                }
-                i = (i + 1) & self.short_mask;
-                if i == p.slot {
-                    return NO_TOKEN;
-                }
-            }
-        }
-        loop {
-            if self.long[4 * i].load(Acquire) == 0 {
-                return NO_TOKEN;
-            }
-            if self.long[4 * i + 1].load(Relaxed) == p.a && self.long[4 * i + 2].load(Relaxed) == p.b {
-                return (self.short.len() + i) as u32;
-            }
-            i = (i + 1) & self.long_mask;
-            if i == p.slot {
-                return NO_TOKEN;
-            }
-        }
-    }
-
-    /// Token of an interned FOREIGN ID, or NO_TOKEN (no insert).
-    pub fn find_foreign(&self, bytes: &[u8]) -> u32 {
-        let g = self.foreign.lock().unwrap();
-        g.0.get(bytes).map_or(NO_TOKEN, |&i| self.foreign_base() + i)
     }
 
     /// Tokens of up to 8 SHORT/LONG user IDs: lane i is LONG when bit i of `long` is set; lanes
