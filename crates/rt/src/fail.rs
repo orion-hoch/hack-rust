@@ -89,8 +89,17 @@ fn reexec() -> ! {
     let env = unsafe { &mut *SCRATCH.env.get() };
     let argv = unsafe { &mut *SCRATCH.argv.get() };
     let envp = unsafe { &mut *SCRATCH.envp.get() };
-    let nc = read_proc(b"/proc/self/cmdline", &mut cmd[..ARG_BYTES - 1]);
-    let ne = read_proc(b"/proc/self/environ", &mut env[..ARG_BYTES]);
+    let mut nc = read_proc(b"/proc/self/cmdline", &mut cmd[..ARG_BYTES - 1]);
+    let mut ne = read_proc(b"/proc/self/environ", &mut env[..ARG_BYTES]);
+    if nc.is_none() || ne.is_none() {
+        // Out of descriptors (the failure itself may be that): close 3 and up, which execve closes
+        // anyway (everything here is opened close-on-exec), and read again.
+        for fd in 3..8192 {
+            let _ = sys::close(fd);
+        }
+        nc = read_proc(b"/proc/self/cmdline", &mut cmd[..ARG_BYTES - 1]);
+        ne = read_proc(b"/proc/self/environ", &mut env[..ARG_BYTES]);
+    }
     let (Some(nc), Some(ne)) = (nc, ne) else {
         crate::fmt::eprint(&[b"rt: cannot read /proc/self/cmdline or environ\n"]);
         sys::exit_group(71);

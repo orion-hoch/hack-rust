@@ -128,20 +128,24 @@ unsafe impl Send for V3Sink<'_, '_> {}
 unsafe impl Sync for V3Sink<'_, '_> {}
 
 impl<'a, 'b> V3Sink<'a, 'b> {
-    pub fn new(tok: &'b Tokens<'a>, ds: &'a Dataset, ctx: &'b Ctx, bits: u32, events_hint: usize) -> Self {
+    /// `w`: the pool participant index this sink is made for (its blocks are taken under it).
+    pub fn new(tok: &'b Tokens<'a>, ds: &'a Dataset, ctx: &'b Ctx, bits: u32, events_hint: usize, w: usize) -> Self {
+        use super::mem::{B256, B2K, B2M, B8K};
         let parts = 1usize << bits;
+        let _ = events_hint;
         V3Sink {
             tok,
             ds,
             ctx,
             bits,
-            // Chunks about what one sink writes to a partition: events / parts / threads.
-            short: Bins::with_chunk(parts, (events_hint / 8).clamp(1 << 14, 1 << 21), (events_hint / parts / 2).clamp(32, 512)),
-            long: Bins::with_chunk(parts, (events_hint / 32).clamp(1 << 12, 1 << 19), (events_hint / parts / 16).clamp(16, 256)),
-            pshort: Bins::with_chunk(parts, 1 << 13, (events_hint / parts / 64).clamp(8, 64)),
-            plong: Bins::with_chunk(parts, 1 << 12, (events_hint / parts / 256).clamp(4, 32)),
-            clicks: Bins::with_chunk(1, (events_hint / 4).clamp(1 << 14, 1 << 20), 1 << 14),
-            edges: Bins::with_chunk(1, (events_hint / 20).clamp(1 << 12, 1 << 19), 1 << 13),
+            // One block per chunk (v3::mem's classes): SHORT 512 x 16 B, LONG 64 x 32 B, purchases
+            // 16 x 16 B and 8 x 32 B, clicks and edges 2 MB.
+            short: Bins::from_blocks(parts, &B8K, w),
+            long: Bins::from_blocks(parts, &B2K, w),
+            pshort: Bins::from_blocks(parts, &B256, w),
+            plong: Bins::from_blocks(parts, &B256, w),
+            clicks: Bins::from_blocks(1, &B2M, w),
+            edges: Bins::from_blocks(1, &B2M, w),
             special: Vec::new(),
             bad: false,
             mode: if cfg!(feature = "measure") { std::env::var("ENGINE_SINK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 },

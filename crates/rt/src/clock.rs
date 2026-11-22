@@ -160,6 +160,16 @@ pub fn report() {
         b.s(b"  ").s(name).c(b'\n');
         prev = t;
     }
+    if crate::pool::started() {
+        let l = crate::pool::layout();
+        b.s(b"  cpus ").u(l.allowed_cpus as u64).s(b" allowed on ").u(l.allowed_cores as u64).s(b" cores (siblings ");
+        b.s(if l.known { b"read" } else { b"unknown" }).s(b"); ").u(l.workers as u64).s(b" workers, ");
+        if l.pinned {
+            b.s(b"pinned to ").u(l.worker_cores as u64).s(b" cores\n");
+        } else {
+            b.s(b"not pinned\n");
+        }
+    }
     let r = sys::getrusage(sys::RUSAGE_SELF);
     b.s(b"  user ").fix(r.user_us() as u64, 6).s(b" s, sys ").fix(r.sys_us() as u64, 6);
     b.s(b" s, minflt ").i(r.minflt).s(b", majflt ").i(r.majflt);

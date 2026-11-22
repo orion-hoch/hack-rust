@@ -21,7 +21,10 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
 
 use crate::sys::{self, Errno, HUGE, PAGE, Res, Statx};
 
-pub const MAX_FILES: usize = 4096;
+/// Regular `*.csv` files (and, apart, dotfiles) one listing can hold.
+pub const LISTING_MAX: usize = 65536;
+/// Files one `map` call can map in all (three streams of 4,096, the parser's locator limit, fit).
+pub const MAX_FILES: usize = 16384;
 pub const NAME_MAX: usize = 255;
 const BIN: usize = HUGE;
 const BIN_SHIFT: u32 = 21;
@@ -65,7 +68,7 @@ impl Listing {
     }
     /// `*.csv` files whose name starts with `.`.
     pub fn dots(&self) -> &[Entry] {
-        if self.ndots == 0 { &[] } else { unsafe { core::slice::from_raw_parts(self.ents.add(MAX_FILES), self.ndots) } }
+        if self.ndots == 0 { &[] } else { unsafe { core::slice::from_raw_parts(self.ents.add(LISTING_MAX), self.ndots) } }
     }
 }
 
@@ -77,7 +80,8 @@ pub fn scan(dir: &[u8]) -> Res<Listing> {
         Err(Errno::ENOENT) => return Ok(Listing { dirfd: -1, ents: core::ptr::null_mut(), n: 0, ndots: 0, missing: true }),
         Err(e) => return Err(e),
     };
-    let ents = sys::map_anon(2 * MAX_FILES * core::mem::size_of::<Entry>())? as *mut Entry;
+    // Address space only (NORESERVE): a listing touches 272 bytes per entry it holds.
+    let ents = sys::map_anon(2 * LISTING_MAX * core::mem::size_of::<Entry>())? as *mut Entry;
     let mut l = Listing { dirfd: fd, ents, n: 0, ndots: 0, missing: false };
     let mut buf = [0u8; 16384];
     loop {
@@ -110,8 +114,8 @@ pub fn scan(dir: &[u8]) -> Res<Listing> {
                 continue;
             }
             let dot = name[0] == b'.';
-            let (slot, count) = if dot { (MAX_FILES + l.ndots, &mut l.ndots) } else { (l.n, &mut l.n) };
-            if *count >= MAX_FILES {
+            let (slot, count) = if dot { (LISTING_MAX + l.ndots, &mut l.ndots) } else { (l.n, &mut l.n) };
+            if *count >= LISTING_MAX {
                 return Err(Errno::ERANGE);
             }
             unsafe {
@@ -126,19 +130,42 @@ pub fn scan(dir: &[u8]) -> Res<Listing> {
     }
     unsafe {
         sort(core::slice::from_raw_parts_mut(ents, l.n));
-        sort(core::slice::from_raw_parts_mut(ents.add(MAX_FILES), l.ndots));
+        sort(core::slice::from_raw_parts_mut(ents.add(LISTING_MAX), l.ndots));
     }
     Ok(l)
 }
 
-/// Insertion sort by name bytes (n is small; entries move by swapping their 272 bytes).
+/// Heapsort by name bytes, in place (O(n log n) swaps of 272-byte entries; an insertion sort
+/// spent about 0.5 s on 4,096 names per folder).
 fn sort(e: &mut [Entry]) {
-    for i in 1..e.len() {
-        let mut j = i;
-        while j > 0 && e[j - 1].name() > e[j].name() {
-            e.swap(j - 1, j);
-            j -= 1;
+    let n = e.len();
+    let p = e.as_mut_ptr();
+    // SAFETY: a and b are below n; the closures only read and swap entries of e.
+    heapsort(n, &mut |a, b| unsafe { (*p.add(a)).name() < (*p.add(b)).name() }, &mut |a, b| unsafe { core::ptr::swap(p.add(a), p.add(b)) });
+}
+
+/// In-place heapsort of `n` items through `less(i, j)` and `swap(i, j)`.
+fn heapsort(n: usize, less: &mut dyn FnMut(usize, usize) -> bool, swap: &mut dyn FnMut(usize, usize)) {
+    let sift = |less: &mut dyn FnMut(usize, usize) -> bool, swap: &mut dyn FnMut(usize, usize), mut root: usize, end: usize| loop {
+        let mut child = 2 * root + 1;
+        if child >= end {
+            break;
         }
+        if child + 1 < end && less(child, child + 1) {
+            child += 1;
+        }
+        if !less(root, child) {
+            break;
+        }
+        swap(root, child);
+        root = child;
+    };
+    for start in (0..n / 2).rev() {
+        sift(less, swap, start, n);
+    }
+    for end in (1..n).rev() {
+        swap(0, end);
+        sift(less, swap, 0, end);
     }
 }
 
@@ -150,6 +177,7 @@ fn sort(e: &mut [Entry]) {
 pub struct File {
     pub ptr: *const u8,
     pub len: usize,
+    /// Open only after `set_keep_fds(true)`; -1 otherwise.
     pub fd: i32,
     /// Which of the listings given to `map` it came from, and its position there.
     pub stream: u16,
@@ -211,6 +239,15 @@ pub(crate) fn registered() -> Option<&'static Inputs> {
     if p == 0 { None } else { Some(unsafe { &*(p as *const Inputs) }) }
 }
 
+static KEEP_FDS: AtomicU32 = AtomicU32::new(0);
+
+/// Keep each mapped file's descriptor open (`File::fd`, for the pread `Reader`). Off by default:
+/// the mapping needs no descriptor, and thousands of open files would grow the descriptor table
+/// past what `rt::init` reserved (an RCU wait) or hit a container's soft limit of 1,024.
+pub fn set_keep_fds(on: bool) {
+    KEEP_FDS.store(on as u32, Relaxed);
+}
+
 /// What to map: a listing and whether its dotfiles are included (after its regular files).
 pub struct Stream<'a> {
     pub listing: &'a Listing,
@@ -267,17 +304,17 @@ pub fn map(streams: &[Stream], out: &'static mut core::mem::MaybeUninit<Inputs>,
     let base = sys::up(raw, HUGE);
     // Largest first.
     let mut order = [0u16; MAX_FILES];
+    let keep = KEEP_FDS.load(Relaxed) != 0;
     for (i, o) in order.iter_mut().enumerate().take(n) {
         *o = i as u16;
     }
     let files = unsafe { core::slice::from_raw_parts_mut(meta, n) };
     let ord = &mut order[..n];
-    for i in 1..n {
-        let mut j = i;
-        while j > 0 && files[ord[j - 1] as usize].len < files[ord[j] as usize].len {
-            ord.swap(j - 1, j);
-            j -= 1;
-        }
+    {
+        // Largest first (a heap of "greater length sorts first"), ties by number.
+        let key = |i: u16| (core::cmp::Reverse(files[i as usize].len), i);
+        let ordp = ord.as_mut_ptr();
+        heapsort(n, &mut |a, b| unsafe { key(*ordp.add(a)) < key(*ordp.add(b)) }, &mut |a, b| unsafe { core::ptr::swap(ordp.add(a), ordp.add(b)) });
     }
     let mut at = base + HUGE;
     let mut detail = [0u64; 4];
@@ -292,9 +329,13 @@ pub fn map(streams: &[Stream], out: &'static mut core::mem::MaybeUninit<Inputs>,
         let ta = crate::clock::ticks();
         let fd = unsafe { sys::openat(l.dirfd, cname.as_ptr(), sys::O_RDONLY | sys::O_CLOEXEC, 0)? };
         let tb = crate::clock::ticks();
-        f.fd = fd;
         if f.len > 0 {
             unsafe { sys::mmap(at, f.len, sys::PROT_READ, sys::MAP_PRIVATE | sys::MAP_FIXED, fd, 0)? };
+        }
+        if keep {
+            f.fd = fd;
+        } else {
+            let _ = sys::close(fd);
         }
         let tc = crate::clock::ticks();
         detail[0] += tb - ta;

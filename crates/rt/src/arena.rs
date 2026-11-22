@@ -542,6 +542,11 @@ pub struct Blocks {
     glock: SpinLock,
     ghead: UnsafeCell<usize>,
     gcount: AtomicUsize,
+    /// Free blocks a worker keeps before moving half to the shared list.
+    local_max: AtomicUsize,
+    /// Shared-list lock acquisitions: spills (free side) and refills (alloc side).
+    spills: AtomicUsize,
+    refills: AtomicUsize,
     /// Chunks taken, for `reset`.
     log: AtomicUsize,
     log_n: AtomicUsize,
@@ -550,7 +555,11 @@ pub struct Blocks {
 
 unsafe impl Sync for Blocks {}
 
-/// A worker keeps at most this many free blocks before moving half to the shared list.
+/// A worker keeps up to this many bytes of free blocks before moving half to the shared list
+/// (at least 64 blocks; `set_local_max` overrides). Measured on box 2 with the dedup pattern at
+/// final size (8 workers): a 256-block cap cost 22 ms for 2 KB blocks and 110 ms for 256 B blocks
+/// in shared-list spills and refills; 16 MB per worker cost 3.8 and 8.5 ms (8 KB: under 1 ms).
+const LOCAL_BYTES: usize = 16 << 20;
 const LOCAL_MAX: usize = 256;
 const BATCH: usize = 64;
 
@@ -569,6 +578,9 @@ impl Blocks {
             glock: SpinLock::new(),
             ghead: UnsafeCell::new(0),
             gcount: AtomicUsize::new(0),
+            local_max: AtomicUsize::new(LOCAL_MAX),
+            spills: AtomicUsize::new(0),
+            refills: AtomicUsize::new(0),
             log: AtomicUsize::new(0),
             log_n: AtomicUsize::new(0),
             log_cap: AtomicUsize::new(0),
@@ -585,6 +597,7 @@ impl Blocks {
         self.log.store(log, Relaxed);
         self.log_cap.store(cap, Relaxed);
         self.bsize.store(bsize, Relaxed);
+        self.local_max.store((LOCAL_BYTES / bsize).clamp(64, 65536), Relaxed);
         self.region.store(r as *const Region as usize, Release);
         Ok(())
     }
@@ -620,6 +633,7 @@ impl Blocks {
         let bs = self.block_size();
         if self.gcount.load(Relaxed) != 0 {
             self.glock.lock();
+            self.refills.fetch_add(1, Relaxed);
             let mut k = 0;
             let head = &mut *self.ghead.get();
             while k < BATCH && *head != 0 {
@@ -666,7 +680,7 @@ impl Blocks {
         *(p as *mut usize) = s.free;
         s.free = p as usize;
         s.nfree += 1;
-        if s.nfree > LOCAL_MAX {
+        if s.nfree > self.local_max.load(Relaxed) {
             self.spill(w);
         }
     }
@@ -683,6 +697,7 @@ impl Blocks {
         s.free = *(last as *const usize);
         s.nfree -= k;
         self.glock.lock();
+        self.spills.fetch_add(1, Relaxed);
         let head = &mut *self.ghead.get();
         *(last as *mut usize) = *head;
         *head = first;
@@ -711,6 +726,16 @@ impl Blocks {
         self.gcount.store(0, Relaxed);
     }
 
+    /// Free blocks a worker may hold before spilling half to the shared list.
+    pub fn set_local_max(&self, blocks: usize) {
+        self.local_max.store(blocks.max(2), Relaxed);
+    }
+
+    /// Shared-list lock acquisitions so far: (spills, refills).
+    pub fn lock_ops(&self) -> (usize, usize) {
+        (self.spills.load(Relaxed), self.refills.load(Relaxed))
+    }
+
     /// (allocations, frees, blocks cut from fresh memory) summed over workers.
     pub fn stats(&self) -> (u64, u64, u64) {
         let mut t = (0, 0, 0);
@@ -737,12 +762,18 @@ pub struct HugeInfo {
     pub free_2m: i64,
     /// The same over every zone (DMA32 blocks are held back by the low-memory reserve).
     pub free_2m_all: i64,
+    /// MemFree and MemAvailable from /proc/meminfo in bytes, -1 unread.
+    pub mem_free: i64,
+    pub mem_available: i64,
     /// Whether a MADV_HUGEPAGE fault can stall in direct compaction (defrag always, madvise or
     /// defer+madvise; also when defrag is unreadable).
     pub may_stall: bool,
-    /// Use huge pages for `need` bytes: THP usable, and either faults cannot stall or the
-    /// Normal and Movable zones hold `need` + 25% in free 2 MB blocks.
+    /// Use huge pages for `need` bytes (see `huge_verdict`).
     pub use_huge: bool,
+    /// Why: b'b' enough free 2 MB blocks, b'f' plenty of free memory (compaction cheap), b'd' the
+    /// defrag mode cannot stall, b'u' nothing readable (no evidence of trouble), b't' THP never,
+    /// b'n' blocks short and free memory tight (compaction would reclaim: costly).
+    pub reason: u8,
 }
 
 fn bracketed(t: &[u8]) -> Option<&[u8]> {
@@ -751,13 +782,36 @@ fn bracketed(t: &[u8]) -> Option<&[u8]> {
     Some(&t[a + 1..b])
 }
 
-/// Reads the THP settings and /proc/buddyinfo and decides. Needs nothing initialised (three
-/// small file reads, about 20 us); all three files are visible inside Docker with the scorer's
-/// flags (checked). When a file cannot be read the answer is conservative: unknown THP mode or
-/// unknown free blocks with a stalling defrag mode gives `use_huge == false`; then
-/// `Region::probe_huge` or the `prefault` stall guard are the ways to learn more.
+/// "Key:   123 kB" from /proc/meminfo, in bytes.
+fn meminfo(t: &[u8], key: &[u8]) -> Option<i64> {
+    let at = t.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut v: i64 = 0;
+    let mut seen = false;
+    for &c in &t[at..] {
+        if c.is_ascii_digit() {
+            v = v * 10 + (c - b'0') as i64;
+            seen = true;
+        } else if seen {
+            break;
+        }
+    }
+    if seen { Some(v << 10) } else { None }
+}
+
+/// Whether to use huge pages for `need` bytes, from the THP settings, /proc/buddyinfo and
+/// /proc/meminfo (all visible inside Docker under the scorer flags; about 30 us; nothing needs to
+/// be initialised). Yes when THP is usable (always, madvise, or unreadable) and any of:
+/// - the Normal and Movable zones hold `need` + 25% in free 2 MB blocks (no compaction needed);
+/// - MemFree is at least twice `need`: blocks run short but free memory is plentiful, so
+///   compaction only moves a few pages per block (measured on box 2 with 66 GB fragmented to one
+///   page per 2 MB block: huge pages 47 to 54 ms/GB including compaction, 4 KB pages 78 to 83);
+/// - the defrag mode cannot stall (defer, never);
+/// - neither file can be read (no evidence of trouble).
+/// No when blocks are short and free memory is tight: compaction must then reclaim page cache
+/// (measured on box 1 with MemFree 2 to 3 GB: f60v5 with huge pages 3,000 to 3,850 compaction
+/// stalls and 3 to 7 s more system time per run). Then a budget of the free blocks is the rule.
 pub fn huge_verdict(need: usize) -> HugeInfo {
-    let mut info = HugeInfo { enabled: 0, defrag: 0, free_2m: -1, free_2m_all: -1, may_stall: true, use_huge: false };
+    let mut info = HugeInfo { enabled: 0, defrag: 0, free_2m: -1, free_2m_all: -1, mem_free: -1, mem_available: -1, may_stall: true, use_huge: false, reason: b'n' };
     let mut buf = [0u8; 4096];
     if let Ok(n) = sys::read_small(b"/sys/kernel/mm/transparent_hugepage/enabled", &mut buf) {
         info.enabled = match bracketed(&buf[..n]) {
@@ -804,9 +858,28 @@ pub fn huge_verdict(need: usize) -> HugeInfo {
         info.free_2m = normal;
         info.free_2m_all = all;
     }
-    let thp = matches!(info.enabled, b'a' | b'm');
-    let enough = info.free_2m >= 0 && (info.free_2m as u128) * (HUGE as u128) >= need as u128 * 5 / 4;
-    info.use_huge = thp && (!info.may_stall || enough);
+    if let Ok(n) = sys::read_small(b"/proc/meminfo", &mut buf) {
+        info.mem_free = meminfo(&buf[..n], b"MemFree:").unwrap_or(-1);
+        info.mem_available = meminfo(&buf[..n], b"MemAvailable:").unwrap_or(-1);
+    }
+    let need = need as i128;
+    let blocks = info.free_2m >= 0 && (info.free_2m as i128) * (HUGE as i128) >= need * 5 / 4;
+    let plenty = info.mem_free >= 0 && (info.mem_free as i128) >= need * 2;
+    let blind = info.free_2m < 0 && info.mem_free < 0;
+    info.reason = if info.enabled == b'n' {
+        b't'
+    } else if blocks {
+        b'b'
+    } else if plenty {
+        b'f'
+    } else if !info.may_stall {
+        b'd'
+    } else if blind {
+        b'u'
+    } else {
+        b'n'
+    };
+    info.use_huge = !matches!(info.reason, b't' | b'n');
     info
 }
 

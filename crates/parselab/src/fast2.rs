@@ -386,6 +386,285 @@ unsafe fn phase_a_avx512(p0: *const u8, nblocks: usize, pf: usize, sep: *mut u32
     }
 }
 
+/// Phase A, the same function as `phase_a_avx512` (same entries, violations and count), as one
+/// assembly loop with a register plan: two blocks per iteration with the roles of the mask
+/// registers swapped (no moves), the carry as a borrow in rcx (`sbb`: s - d - borrow equals
+/// !d + s + carry, and the borrow out is the carry out inverted), `q & !(fs ^ fe)` for the two
+/// quote-placement terms, the piece offsets from prefix popcounts, the newline and comma masks
+/// shifted in mask registers. Violations are recorded as (mask, block) pairs in `vbuf` (rare
+/// path, cursor in xmm15) and expanded in order afterwards. Reads [p0, p0 + 64 * nblocks + 64).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,bmi1,bmi2,popcnt,lzcnt")]
+#[inline(never)]
+unsafe fn phase_a_avx512_v2(p0: *const u8, nblocks: usize, pf: usize, sep: *mut u32, viol: &mut ViolList) -> usize {
+    use std::arch::x86_64::*;
+    const VB: usize = W / 64 + 8;
+    if nblocks == 0 {
+        return 0;
+    }
+    if nblocks > VB {
+        return unsafe { phase_a_avx512(p0, nblocks, pf, sep, viol) };
+    }
+    unsafe {
+        let v = _mm512_loadu_si512(p0 as *const __m512i);
+        let q0: u64 = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
+        let kn0: __mmask64 = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+        let d0: u64 = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)) | kn0;
+        let mut vbuf = [0u64; 2 * VB];
+        let vstart = vbuf.as_mut_ptr() as u64;
+        let pend = p0.add(64 * nblocks);
+        let out_end: *mut u32;
+        let cursor: __m128i;
+        std::arch::asm!(
+            "test edi, 64",
+            "jz 2f",
+            "mov r13, r8",
+            "xchg r9, r12",
+            "mov r11, r15",
+            "kmovq k2, k1",
+            "jmp 3f",
+            "2:",
+            "mov r10, r9",
+            "shld r10, r12, 1",
+            "vmovdqu64 zmm0, zmmword ptr [rsi + rdi + 64]",
+            "vpcmpeqb k2, zmm0, zmm18",
+            "vpcmpeqb k3, zmm0, zmm16",
+            "vpcmpeqb k4, zmm0, zmm17",
+            "korq k3, k3, k2",
+            "kmovq r12, k3",
+            "kmovq r13, k4",
+            "prefetcht0 byte ptr [rdx + rdi]",
+            "mov r11, r9",
+            "shrd r11, r12, 1",
+            "mov r14, r10",
+            "xor r14, r11",
+            "andn r14, r14, r8",
+            "and r10, r8",
+            "and r11, r8",
+            "lea r15, [r15 + r11*2]",
+            "neg rcx",
+            "sbb r10, r9",
+            "sbb rcx, rcx",
+            "and r10, r9",
+            "xor r10, r15",
+            "or r14, r10",
+            "jnz 4f",
+            "5:",
+            "shr r11, 63",
+            "shrd r8, r13, 1",
+            "and r8, r9",
+            "kmovq k5, r9",
+            "kmovq k6, r8",
+            "movzx r10d, r9w",
+            "popcnt r10d, r10d",
+            "mov r14d, r9d",
+            "popcnt r14d, r14d",
+            "mov r15, r9",
+            "shl r15, 16",
+            "popcnt r15, r15",
+            "popcnt r8, r9",
+            "vmovdqa64 zmm1, zmm25",
+            "vpord zmm1 {{k1}}, zmm1, zmm19",
+            "vpord zmm1 {{k6}}, zmm1, zmm20",
+            "vpcompressd zmm1 {{k5}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax], zmm1",
+            "kshiftrq k3, k1, 16",
+            "kshiftrq k4, k6, 16",
+            "kshiftrq k7, k5, 16",
+            "vpaddd zmm1, zmm25, zmm21",
+            "vpord zmm1 {{k3}}, zmm1, zmm19",
+            "vpord zmm1 {{k4}}, zmm1, zmm20",
+            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax + r10*4], zmm1",
+            "kshiftrq k3, k1, 32",
+            "kshiftrq k4, k6, 32",
+            "kshiftrq k7, k5, 32",
+            "vpaddd zmm1, zmm25, zmm22",
+            "vpord zmm1 {{k3}}, zmm1, zmm19",
+            "vpord zmm1 {{k4}}, zmm1, zmm20",
+            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax + r14*4], zmm1",
+            "kshiftrq k3, k1, 48",
+            "kshiftrq k4, k6, 48",
+            "kshiftrq k7, k5, 48",
+            "vpaddd zmm1, zmm25, zmm23",
+            "vpord zmm1 {{k3}}, zmm1, zmm19",
+            "vpord zmm1 {{k4}}, zmm1, zmm20",
+            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax + r15*4], zmm1",
+            "lea rax, [rax + r8*4]",
+            "vpaddd zmm25, zmm25, zmm24",
+            "add rdi, 64",
+            "jz 9f",
+            "3:",
+            "mov r10, r12",
+            "shld r10, r9, 1",
+            "vmovdqu64 zmm0, zmmword ptr [rsi + rdi + 64]",
+            "vpcmpeqb k1, zmm0, zmm18",
+            "vpcmpeqb k3, zmm0, zmm16",
+            "vpcmpeqb k4, zmm0, zmm17",
+            "korq k3, k3, k1",
+            "kmovq r9, k3",
+            "kmovq r8, k4",
+            "prefetcht0 byte ptr [rdx + rdi]",
+            "mov r15, r12",
+            "shrd r15, r9, 1",
+            "mov r14, r10",
+            "xor r14, r15",
+            "andn r14, r14, r13",
+            "and r10, r13",
+            "and r15, r13",
+            "lea r11, [r11 + r15*2]",
+            "neg rcx",
+            "sbb r10, r12",
+            "sbb rcx, rcx",
+            "and r10, r12",
+            "xor r10, r11",
+            "or r14, r10",
+            "jnz 6f",
+            "7:",
+            "shr r15, 63",
+            "shrd r13, r8, 1",
+            "and r13, r12",
+            "kmovq k5, r12",
+            "kmovq k6, r13",
+            "movzx r10d, r12w",
+            "popcnt r10d, r10d",
+            "mov r14d, r12d",
+            "popcnt r14d, r14d",
+            "mov r11, r12",
+            "shl r11, 16",
+            "popcnt r11, r11",
+            "popcnt r13, r12",
+            "vmovdqa64 zmm1, zmm25",
+            "vpord zmm1 {{k2}}, zmm1, zmm19",
+            "vpord zmm1 {{k6}}, zmm1, zmm20",
+            "vpcompressd zmm1 {{k5}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax], zmm1",
+            "kshiftrq k3, k2, 16",
+            "kshiftrq k4, k6, 16",
+            "kshiftrq k7, k5, 16",
+            "vpaddd zmm1, zmm25, zmm21",
+            "vpord zmm1 {{k3}}, zmm1, zmm19",
+            "vpord zmm1 {{k4}}, zmm1, zmm20",
+            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax + r10*4], zmm1",
+            "kshiftrq k3, k2, 32",
+            "kshiftrq k4, k6, 32",
+            "kshiftrq k7, k5, 32",
+            "vpaddd zmm1, zmm25, zmm22",
+            "vpord zmm1 {{k3}}, zmm1, zmm19",
+            "vpord zmm1 {{k4}}, zmm1, zmm20",
+            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax + r14*4], zmm1",
+            "kshiftrq k3, k2, 48",
+            "kshiftrq k4, k6, 48",
+            "kshiftrq k7, k5, 48",
+            "vpaddd zmm1, zmm25, zmm23",
+            "vpord zmm1 {{k3}}, zmm1, zmm19",
+            "vpord zmm1 {{k4}}, zmm1, zmm20",
+            "vpcompressd zmm1 {{k7}} {{z}}, zmm1",
+            "vmovdqu64 zmmword ptr [rax + r11*4], zmm1",
+            "lea rax, [rax + r13*4]",
+            "vpaddd zmm25, zmm25, zmm24",
+            "add rdi, 64",
+            "jnz 2b",
+            "jmp 9f",
+            "4:",
+            "vmovq r10, xmm15",
+            "mov qword ptr [r10], r14",
+            "mov qword ptr [r10 + 8], rdi",
+            "add r10, 16",
+            "vmovq xmm15, r10",
+            "jmp 5b",
+            "6:",
+            "vmovq r10, xmm15",
+            "mov qword ptr [r10], r14",
+            "mov qword ptr [r10 + 8], rdi",
+            "add r10, 16",
+            "vmovq xmm15, r10",
+            "jmp 7b",
+            "9:",
+            inout("rdi") -((64 * nblocks) as isize) => _,
+            in("rsi") pend,
+            in("rdx") pend.wrapping_add(pf),
+            inout("rax") sep => out_end,
+            inout("rcx") -1i64 => _,
+            inout("r8") q0 => _,
+            inout("r9") d0 => _,
+            inout("r12") 1u64 << 63 => _,
+            inout("r15") 0u64 => _,
+            out("r10") _,
+            out("r11") _,
+            out("r13") _,
+            out("r14") _,
+            inout("k1") kn0 => _,
+            out("k2") _,
+            out("k3") _,
+            out("k4") _,
+            out("k5") _,
+            out("k6") _,
+            out("k7") _,
+            out("zmm0") _,
+            out("zmm1") _,
+            in("zmm16") _mm512_set1_epi8(b',' as i8),
+            in("zmm17") _mm512_set1_epi8(b'"' as i8),
+            in("zmm18") _mm512_set1_epi8(b'\n' as i8),
+            in("zmm19") _mm512_set1_epi32(NL_FLAG as i32),
+            in("zmm20") _mm512_set1_epi32(Q_FLAG as i32),
+            in("zmm21") _mm512_set1_epi32(16),
+            in("zmm22") _mm512_set1_epi32(32),
+            in("zmm23") _mm512_set1_epi32(48),
+            in("zmm24") _mm512_set1_epi32(64),
+            inout("zmm25") _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) => _,
+            inout("xmm15") _mm_cvtsi64_si128(vstart as i64) => cursor,
+            options(nostack),
+        );
+        let nrec = (_mm_cvtsi128_si64(cursor) as u64 - vstart) as usize / 16;
+        for r in 0..nrec {
+            let (bad, idx) = (vbuf[2 * r], vbuf[2 * r + 1] as i64);
+            viol.push_mask(bad, (idx + (64 * nblocks) as i64) as u32);
+        }
+        out_end.offset_from(sep) as usize
+    }
+}
+
+/// Differential test of the two AVX-512 phase A versions on [wpos, wend) of `data` (which must
+/// be readable to wend + 256): None when the entries (and the 16 slots after them), the count
+/// and the violations are identical, else a description of the first difference.
+#[cfg(target_arch = "x86_64")]
+pub fn phase_a_diff(data: &[u8], wpos: usize, wend: usize) -> Option<String> {
+    if !std::is_x86_feature_detected!("avx512bw") || wend <= wpos || wend - wpos > W {
+        return None;
+    }
+    let mut a = Scratch::new();
+    let mut b = Scratch::new();
+    a.sep.fill(0xA5A5_A5A5);
+    b.sep.fill(0xA5A5_A5A5);
+    let nblocks = (wend - wpos).div_ceil(64);
+    let base = data.as_ptr();
+    let mut va = ViolList { ptr: a.viol.as_mut_ptr(), n: 0, base: wpos as u32 };
+    let mut vb = ViolList { ptr: b.viol.as_mut_ptr(), n: 0, base: wpos as u32 };
+    let na = unsafe { phase_a_avx512(base.add(wpos), nblocks, 0, a.sep.as_mut_ptr(), &mut va) };
+    let nb = unsafe { phase_a_avx512_v2(base.add(wpos), nblocks, 4096, b.sep.as_mut_ptr(), &mut vb) };
+    if na != nb {
+        return Some(format!("nsep {na} != {nb} at window {wpos}..{wend}"));
+    }
+    if va.n != vb.n || a.viol[..va.n] != b.viol[..vb.n] {
+        return Some(format!("violations differ at window {wpos}..{wend}: {} vs {}", va.n, vb.n));
+    }
+    for k in 0..(na + 16) {
+        if a.sep[k] != b.sep[k] {
+            return Some(format!("entry {k} of {na}: {:#x} != {:#x} at window {wpos}..{wend}", a.sep[k], b.sep[k]));
+        }
+    }
+    None
+}
+
+/// Which phase A the AVX-512 path runs: 2 (default) or 1 (the original), for measurement and
+/// for the differential test.
+pub static PHASE_A_V: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
 /// Violation positions (absolute), filled on the rare path.
 pub(crate) struct ViolList {
     ptr: *mut u32,
@@ -415,7 +694,11 @@ unsafe fn phase_a<const ISA: u8>(base: *const u8, wpos: usize, wend: usize, sc: 
         let nblocks = (wend - wpos).div_ceil(64);
         let pf = PREFETCH.load(std::sync::atomic::Ordering::Relaxed);
         let mut vl = ViolList { ptr: sc.viol.as_mut_ptr(), n: 0, base: wpos as u32 };
-        let nsep = unsafe { phase_a_avx512(base.add(wpos), nblocks, pf, sc.sep.as_mut_ptr(), &mut vl) };
+        let nsep = if PHASE_A_V.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            unsafe { phase_a_avx512(base.add(wpos), nblocks, pf, sc.sep.as_mut_ptr(), &mut vl) }
+        } else {
+            unsafe { phase_a_avx512_v2(base.add(wpos), nblocks, pf, sc.sep.as_mut_ptr(), &mut vl) }
+        };
         unsafe { *sc.viol.as_mut_ptr().add(vl.n) = u32::MAX };
         sc.nviol = vl.n;
         sc.nsep = nsep;

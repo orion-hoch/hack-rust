@@ -333,11 +333,13 @@ fn run(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
-/// Huge pages for the allocator as far as the machine can give them without compaction: rt's
-/// verdict for about 0.7 times the input bytes (the measured peak of anonymous memory is 0.57 to
-/// 0.65 times the input). Enough free 2 MB blocks, or a defrag mode that cannot stall: every
-/// mapping. Fewer: a budget of 80% of the free blocks, first come first served (the token table
-/// and the parse buffers come first). RT_HUGE=on|off|<MB> overrides (measurements).
+/// Huge pages for the allocator unless compaction would be costly: rt's verdict for about 0.7
+/// times the input bytes (the measured peak of anonymous memory is 0.57 to 0.65 times the input)
+/// says yes when the free 2 MB blocks cover it, when MemFree is at least twice it (compaction
+/// cheap), when the defrag mode cannot stall, or when nothing can be read; then every mapping.
+/// Otherwise (blocks short and free memory tight) a budget of 80% of the free blocks, first come
+/// first served (the token table and the parse buffers come first). THP never: none.
+/// RT_HUGE=on|off|<MB> overrides (measurements).
 fn huge_pages(cfg: &Config) {
     use std::os::unix::ffi::OsStrExt;
     let budget = match env::var("RT_HUGE").as_deref() {
@@ -352,7 +354,7 @@ fn huge_pages(cfg: &Config) {
                 }
             }
             let v = rt::arena::huge_verdict((bytes as usize) / 10 * 7);
-            if !matches!(v.enabled, b'a' | b'm') {
+            if v.enabled == b'n' {
                 0
             } else if v.use_huge {
                 usize::MAX
@@ -362,6 +364,23 @@ fn huge_pages(cfg: &Config) {
         }
     };
     alloc::set_thp_budget(budget);
+}
+
+/// PROBE build (not for the trunk): sleeps just before exit so the scorer's time reports two
+/// facts about its machine. Probe 1: 100 ms x A + 400 ms x B.
+fn probe_ms(cfg: &Config) -> u64 {
+    let _ = cfg;
+    // A: distinct cores under the allowed CPUs (0 unreadable, 1 four, 2 eight, 3 other).
+    let set = rt::cpu::affinity();
+    let t = rt::cpu::topology(&set, b"/sys/devices/system/cpu");
+    let a = if !t.known { 0 } else if t.cores == 4 { 1 } else if t.cores == 8 { 2 } else { 3 };
+    // B: THP enabled mode (0 unreadable, 1 never, 2 madvise, 3 always).
+    let b = match rt::arena::huge_verdict(0).enabled { b'n' => 1, b'm' => 2, b'a' => 3, _ => 0 };
+    100 * a + 400 * b
+}
+
+fn probe_sleep(cfg: &Config) {
+    std::thread::sleep(std::time::Duration::from_millis(probe_ms(cfg)));
 }
 
 fn main() {
@@ -393,7 +412,10 @@ fn main() {
         let why = match fast {
             // Done: release input and memory in parallel, then exit_group (no destructors); with
             // everything still mapped the kernel's single-thread teardown took 80 to 90 ms.
-            Ok(fast::Outcome::Done) => rt::exit::leave(0, &rt::exit::Release::ALL),
+            Ok(fast::Outcome::Done) => {
+                probe_sleep(&cfg);
+                rt::exit::leave(0, &rt::exit::Release::ALL)
+            }
             Ok(fast::Outcome::Fallback(why)) => why,
             Err(e) => format!("I/O error: {e}"),
         };
@@ -416,4 +438,5 @@ fn main() {
         eprintln!("engine: {e}");
         std::process::exit(1);
     }
+    probe_sleep(&cfg);
 }

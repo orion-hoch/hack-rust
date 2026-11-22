@@ -88,13 +88,23 @@ impl Clock {
 /// The inputs through rt: events, clicks and links mapped into one reservation (zero pages
 /// around every file), registered for release-behind and for the parallel release at exit. The
 /// same files as `Dataset::open` (regular `*.csv`, not starting with '.', in name order).
-fn open_rt(dir: &Path) -> io::Result<(Dataset, &'static rt::input::Inputs)> {
+/// Err(why) when a folder holds more files than the parser's locator can number (named refusal,
+/// decided before anything is mapped).
+fn open_rt(dir: &Path) -> io::Result<Result<(Dataset, &'static rt::input::Inputs), String>> {
     use std::os::unix::ffi::OsStrExt;
     let errno = |e: rt::sys::Errno| io::Error::from_raw_os_error(e.0);
     let subs = ["events", "clicks", "links"];
     let mut ls = Vec::with_capacity(3);
     for sub in subs {
-        ls.push(rt::input::scan(dir.join(sub).as_os_str().as_bytes()).map_err(errno)?);
+        let l = match rt::input::scan(dir.join(sub).as_os_str().as_bytes()) {
+            Ok(l) => l,
+            Err(rt::sys::Errno::ERANGE) => return Ok(Err(format!("more than {} *.csv files in {sub}/", rt::input::LISTING_MAX))),
+            Err(e) => return Err(errno(e)),
+        };
+        if l.files().len() > parselab::Locator::MAX_FILES {
+            return Ok(Err(format!("{} files in {sub}/, over the {} a locator numbers", l.files().len(), parselab::Locator::MAX_FILES)));
+        }
+        ls.push(l);
     }
     let ls: &'static [rt::input::Listing] = Box::leak(ls.into_boxed_slice());
     let streams: Vec<rt::input::Stream> = ls.iter().map(|l| rt::input::Stream { listing: l, dots: false }).collect();
@@ -114,14 +124,17 @@ fn open_rt(dir: &Path) -> io::Result<(Dataset, &'static rt::input::Inputs)> {
     });
     let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_default();
     let ds = Dataset { dir: dir.to_path_buf(), files, products: read("products.csv"), campaigns: read("campaigns.csv"), manifest: read("manifest.json") };
-    Ok((ds, inp))
+    Ok(Ok((ds, inp)))
 }
 
 pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Result<Outcome> {
     let t0 = Instant::now();
     let mut clock = Clock { on: timing, last: t0, last_use: if timing { usage() } else { (0.0, 0.0, 0, 0) } };
     crate::par::init_pool(threads);
-    let (ds, inp) = open_rt(data)?;
+    let (ds, inp) = match open_rt(data)? {
+        Ok(x) => x,
+        Err(why) => return Ok(Outcome::Fallback(why)),
+    };
     // The fast path's memory region (address space only until a stage takes from it).
     let input_bytes: u64 = [Stream::Events, Stream::Clicks, Stream::Links].iter().map(|&s| ds.bytes(s)).sum();
     if !mem::init((input_bytes as usize / 100) * 45) {
@@ -191,7 +204,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
     let sinks = crate::par::run(
         threads,
         chunks.len(),
-        |_| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread),
+        |t| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread, t),
         |s, i| parse(&chunks[i], s),
     );
     clock.mark("parse.links+clicks");
@@ -225,7 +238,7 @@ pub fn try_run(data: &Path, out: &Path, threads: usize, timing: bool) -> io::Res
             slots
                 .get(t)
                 .and_then(|m| m.lock().unwrap().take())
-                .unwrap_or_else(|| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread))
+                .unwrap_or_else(|| V3Sink::new(&tok, &ds, &ctx, p1_bits, per_thread, t))
         },
         |s, i| {
             if i == 0 {

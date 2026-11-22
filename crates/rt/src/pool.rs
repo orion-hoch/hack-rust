@@ -207,6 +207,7 @@ pub fn start(cfg: &Config) -> usize {
     let topo = cpu::topology(&set, b"/sys/devices/system/cpu");
     let quota = cpu::cgroup_quota();
     ALLOWED.store(topo.n, Relaxed);
+    ALLOWED_CORES.store(topo.cores, Relaxed);
     QUOTA.store(quota.unwrap_or(0), Relaxed);
     KNOWN_TOPO.store(topo.known as u32, Relaxed);
     let mut n = if cfg.workers > 0 { cfg.workers } else { topo.n.min(quota.unwrap_or(usize::MAX)) };
@@ -281,6 +282,47 @@ pub fn start(cfg: &Config) -> usize {
         T_LAST_RUNNING.store(ticks(), Release);
     }
     started
+}
+
+/// The machine's shape as the pool sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    /// CPUs the process may run on, and the distinct cores they cover.
+    pub allowed_cpus: usize,
+    pub allowed_cores: usize,
+    /// Whether the sibling lists were read (false: every CPU counted as its own core).
+    pub known: bool,
+    /// Workers, and whether each is pinned to one CPU (then `core_of(w)` is exact; unpinned
+    /// workers float over the allowed set and share cores at the scheduler's choice).
+    pub workers: usize,
+    pub pinned: bool,
+    /// Distinct cores the workers are pinned to (= workers when each has its own core).
+    pub worker_cores: usize,
+}
+
+static ALLOWED_CORES: AtomicUsize = AtomicUsize::new(0);
+
+/// One call for layout-dependent choices: allowed CPUs and cores, and the workers' cores.
+/// Workers sharing a core have equal `core_of(w)`.
+pub fn layout() -> Layout {
+    let n = workers();
+    let mut seen = [0u64; MAX_WORKERS / 64 * 4];
+    let mut wc = 0;
+    for w in 0..n {
+        let c = core_of(w) as usize % (seen.len() * 64);
+        if seen[c / 64] >> (c % 64) & 1 == 0 {
+            seen[c / 64] |= 1 << (c % 64);
+            wc += 1;
+        }
+    }
+    Layout {
+        allowed_cpus: ALLOWED.load(Relaxed),
+        allowed_cores: ALLOWED_CORES.load(Relaxed),
+        known: topology_known(),
+        workers: n,
+        pinned: pinned(),
+        worker_cores: if pinned() { wc } else { 0 },
+    }
 }
 
 /// Whether `start` has run.
