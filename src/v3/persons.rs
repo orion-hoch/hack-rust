@@ -82,7 +82,11 @@ impl People {
             if c.len() % 2 != 0 {
                 return None;
             }
-            for &t in c.iter() {
+            for (j, &t) in c.iter().enumerate() {
+                if let Some(&u) = c.get(j + 16) {
+                    // Address only (wrapping): a prefetch never faults.
+                    prefetch(bits.as_ptr().wrapping_add((u >> 6) as usize));
+                }
                 if t >= cap as u64 {
                     return None;
                 }
@@ -97,18 +101,17 @@ impl People {
         }
         let n = n as usize;
         let mut node_token: Buf<u32> = Buf::take(&PERS, n);
-        let mut nk: Buf<u64> = Buf::take(&PERS, n);
         let mut k = 0usize;
         for (wi, w) in bits.iter().enumerate() {
             let mut b = w[0];
             while b != 0 {
-                let t = (wi * 64 + b.trailing_zeros() as usize) as u32;
-                node_token[k] = t;
-                nk[k] = name_key(tok, t);
+                node_token[k] = (wi * 64 + b.trailing_zeros() as usize) as u32;
                 k += 1;
                 b &= b - 1;
             }
         }
+        // Per root (after the names pass): [name key, token] of its best member.
+        let mut rec: Buf<[u64; 2]> = Buf::take(&PERS, n);
         lap("keys");
         // Union-find on nodes, straight from the edges; node lookups and the first parent read
         // of edge j + EDGE_AHEAD are started early.
@@ -120,10 +123,12 @@ impl People {
             let w = &bits[(t >> 6) as usize];
             (w[1] + u64::from((w[0] & ((1u64 << (t & 63)) - 1)).count_ones())) as u32
         };
-        // Three stages: at j + 2D the mark lines of both ends are prefetched; at j + D their
-        // nodes are computed (lines now near), kept in a ring, and their parent lines
-        // prefetched; at j the edge is united.
+        // Four stages: at j + 2D the mark lines of both ends are prefetched; at j + D their nodes
+        // are computed (lines now near), kept in a ring, and their parent lines prefetched; at
+        // j + D/2 the parents are read (now near) and the grandparent lines prefetched; at j the
+        // edge is united. The early reads are hints only (unions in between may change them).
         const D: usize = 16;
+        const H: usize = D / 2;
         let mut ring = [[0u32; 2]; D];
         for c in edges {
             let pairs = c.len() / 2;
@@ -134,6 +139,11 @@ impl People {
                 if j + 2 * D < pairs {
                     prefetch(&bits[(c[2 * (j + 2 * D)] >> 6) as usize]);
                     prefetch(&bits[(c[2 * (j + 2 * D) + 1] >> 6) as usize]);
+                }
+                if j + H < pairs {
+                    let [x, y] = ring[(j + H) % D];
+                    prefetch(&parent[parent[x as usize] as usize]);
+                    prefetch(&parent[parent[y as usize] as usize]);
                 }
                 let [a, b] = ring[j % D];
                 if j + D < pairs {
@@ -156,44 +166,37 @@ impl People {
             parent[i] = parent[p];
         }
         lap("union");
-        // Names: the smallest member per root. The root is its component's smallest index, so it
-        // is met first and starts the component's best.
+        // Names: the smallest member per root, kept in the root's own record (the root is its
+        // component's smallest index, so it is met first and its key is read before it changes).
         const AHEAD: usize = 64;
-        let mut best: Buf<u32> = Buf::take(&PERS, n);
         let mut roots = 0usize;
+        // The keys are made here, in node (= token) order: the token table is read forward.
         for i in 0..n {
-            if i + 2 * AHEAD < n {
-                prefetch(&best[parent[i + 2 * AHEAD] as usize]);
-            }
             if i + AHEAD < n {
-                let r = parent[i + AHEAD] as usize;
-                if r < i {
-                    prefetch(&nk[best[r] as usize]);
-                }
+                prefetch(&rec[parent[i + AHEAD] as usize]);
             }
+            if let Some(&u) = node_token.get(i + 16) {
+                tok.prefetch_key(u);
+            }
+            let t = node_token[i];
+            let mine = [name_key(tok, t), u64::from(t)];
             let r = parent[i] as usize;
             if r == i {
-                best[i] = i as u32;
+                rec[i] = mine;
                 roots += 1;
                 continue;
             }
-            let cur = best[r] as usize;
-            if name_less(tok, &nk, &node_token, i, cur) {
-                best[r] = i as u32;
+            if name_less(tok, mine, rec[r]) {
+                rec[r] = mine;
             }
         }
-        drop(nk);
         lap("names");
         // Person map, written once per node in token order.
         for i in 0..n {
-            if i + 2 * AHEAD < n {
-                prefetch(&best[parent[i + 2 * AHEAD] as usize]);
-            }
             if i + AHEAD < n {
-                prefetch(&node_token[best[parent[i + AHEAD] as usize] as usize]);
+                prefetch(&rec[parent[i + AHEAD] as usize]);
             }
-            let r = parent[i] as usize;
-            person[node_token[i] as usize] = node_token[best[r] as usize] + 1;
+            person[node_token[i] as usize] = rec[parent[i] as usize][1] as u32 + 1;
         }
         lap("map");
         Some(People { person, linked: n, persons: roots })
@@ -240,14 +243,13 @@ fn name_key(tok: &Tokens, t: u32) -> u64 {
     }
 }
 
-/// Byte order of nodes i and j's IDs (i != j, distinct IDs): the keys, then the exact rules.
+/// Byte order of two distinct IDs given as [name key, token]: the keys, then the exact rules.
 #[inline(always)]
-fn name_less(tok: &Tokens, nk: &[u64], node_token: &[u32], i: usize, j: usize) -> bool {
-    let (ki, kj) = (nk[i], nk[j]);
-    if (ki | kj) & OTHER == 0 && ki != kj {
-        return ki < kj;
+fn name_less(tok: &Tokens, x: [u64; 2], y: [u64; 2]) -> bool {
+    if (x[0] | y[0]) & OTHER == 0 && x[0] != y[0] {
+        return x[0] < y[0];
     }
-    name_less_slow(tok, node_token[i], node_token[j])
+    name_less_slow(tok, x[1] as u32, y[1] as u32)
 }
 
 #[cold]

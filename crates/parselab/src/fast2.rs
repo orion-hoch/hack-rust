@@ -919,7 +919,29 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
     let mut ts_fast = [false; LANES];
     let mut ingest = [0i64; LANES];
     let mut ing_fast = [false; LANES];
+    #[cfg(target_arch = "x86_64")]
+    let vec2k = ISA == fast::ISA_AVX2;
+    #[cfg(not(target_arch = "x86_64"))]
+    let vec2k = false;
+    let mut kshort = [[0u64; LANES]; 2];
+    let mut klong = [[false; LANES]; 2];
+    let mut ka = [[0u64; LANES]; 2];
+    let mut kb = [[0u64; LANES]; 2];
+    #[cfg(target_arch = "x86_64")]
+    if vec2k {
+        let mut lens = [[0u32; LANES]; 2];
+        for l in 0..LANES {
+            lens[0][l] = ln.ve[0][l] - ln.vs[0][l];
+            lens[1][l] = ln.ve[1][l] - ln.vs[1][l];
+        }
+        unsafe { crate::avx2::keys(&lens, &[pre, pre_u], [b'e', b'u'], [&w_e, &w_u], [&le_w, &lu_w], &mut kshort, &mut klong, &mut ka, &mut kb) };
+        x_e = kshort[0];
+        x_u = kshort[1];
+    }
     for l in 0..LANES {
+        if vec2k {
+            break;
+        }
         let le = (ln.ve[0][l] - ln.vs[0][l]) as u64;
         x_e[l] = id_from(w_e[l], le.wrapping_sub(1), pre[l] == b'e');
         let lu = (ln.ve[1][l] - ln.vs[1][l]) as u64;
@@ -929,7 +951,26 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
         std::hint::black_box((&x_e, &x_u, &t_hi, &t_mid, &t_16, &t_17, &i_hi, &i_mid, &i_16, &tw));
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    let vec2 = ISA == fast::ISA_AVX2;
+    #[cfg(not(target_arch = "x86_64"))]
+    let vec2 = false;
+    #[cfg(target_arch = "x86_64")]
+    if vec2 {
+        let mut tlen = [0u32; LANES];
+        let mut ilen = [0u32; LANES];
+        for l in 0..LANES {
+            tlen[l] = ln.ve[2][l] - ln.vs[2][l];
+            ilen[l] = ln.ve[3][l] - ln.vs[3][l];
+        }
+        unsafe {
+            crate::avx2::ts_ingest(f, dates, &tlen, &t_hi, &t_mid, &t_16, &t_17, &ilen, &i_hi, &i_mid, &i_16, &mut ts_rel, &mut ts_fast, &mut ingest, &mut ing_fast)
+        };
+    }
     for l in 0..LANES {
+        if vec2 {
+            break;
+        }
         let len = ln.ve[2][l] - ln.vs[2][l];
         let (day, date_ok) = date_of(dates, t_hi[l], t_mid[l]);
         let t_ok = ((t_mid[l] >> 16) & 0xFF) == b'T' as u64;
@@ -953,6 +994,9 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
         return;
     }
     for l in 0..LANES {
+        if vec2 {
+            break;
+        }
         let len = ln.ve[3][l] - ln.vs[3][l];
         let (day, date_ok) = date_of(dates, i_hi[l], i_mid[l]);
         let t_ok = ((i_mid[l] >> 16) & 0xFF) == b'T' as u64;
@@ -972,7 +1016,18 @@ unsafe fn batch<'b, S: Sink, const ISA: u8>(
     let mut u_long = [false; LANES];
     let mut u_la = [0u64; LANES];
     let mut u_lb = [0u64; LANES];
+    if vec2k {
+        e_long = klong[0];
+        u_long = klong[1];
+        e_la = ka[0];
+        e_lb = kb[0];
+        u_la = ka[1];
+        u_lb = kb[1];
+    }
     for l in 0..LANES {
+        if vec2k {
+            break;
+        }
         let (a0, k0) = fast::hex8(le_w[0][l]);
         let (a1, k1) = fast::hex8(le_w[1][l]);
         let (b0, k2) = fast::hex8(le_w[2][l]);

@@ -11,6 +11,8 @@ pub mod dataset;
 pub mod equiv;
 pub mod fast;
 pub mod fast2;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod avx2;
 pub mod fast3;
 pub mod ids;
 pub mod mutate;
